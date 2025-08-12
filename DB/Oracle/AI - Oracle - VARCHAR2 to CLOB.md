@@ -1,4 +1,4 @@
-Prompt
+# Prompt  
 Atue como Software Engineer. Sua tarefa é avaliar ajustes necessários em aplicativos .Net e Java, que se conectam com banco de dados Oracle. Foi identificado o limite de 4000 caracteres de um campo VARCHAR2 e precisaremos alterar esse campo para CLOB. Avalie os ajustes necessários, caso sejam necessários, nesses aplicativos.
 
 Certo — vamos analisar isso de forma sistemática, como um engenheiro de software que precisa avaliar e mitigar impactos antes da alteração.
@@ -123,7 +123,7 @@ Se quiser, posso montar **um checklist de impacto e teste específico para .NET 
 
 Quer que eu já prepare esse checklist?
 
-Prompt
+# Prompt  
 Sim
 
 Perfeito — vou preparar dois checklists separados, um para **.NET** e outro para **Java**, cobrindo análise, ajustes e testes necessários após a mudança do campo `VARCHAR2` para `CLOB` no Oracle.
