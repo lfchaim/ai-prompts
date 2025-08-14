@@ -2,22 +2,15 @@
 Quais soluções podem ser utilizadas para substituir o uso do OIC Function, a fim de contornar os limites e fazer buscas com grande volume de dados?
 
 # Prompt - Adapta.org
-Aqui está o prompt melhorado:
+Aqui está o prompt melhorado:  
+"Quais são as principais alternativas ao OIC (Oracle Integration Cloud) Function para realizar buscas com grande volume de dados, considerando requisitos de desempenho e escalabilidade? Especifique:
 
-"Quais soluções alternativas podem ser implementadas para substituir o uso do OIC Function e superar os limites de processamento de grande volume de dados em buscas, considerando requisitos de desempenho, escalabilidade e segurança? Inclua exemplos de tecnologias e estratégias que possam ser utilizadas para otimizar a busca e processamento de dados em larga escala."
+1. Tecnologias ou serviços que oferecem funcionalidades similares.
+2. Critérios de comparação em termos de desempenho e escalabilidade.
+3. Exemplos de casos de uso ou implementações bem-sucedidas.
+4. Considerações importantes para migração ou integração com sistemas existentes.
 
-Mas se você quiser uma versão mais sucinta e direta:
-
-"Quais são as alternativas ao OIC Function para realizar buscas com grande volume de dados, considerando desempenho e escalabilidade?"
-
-Ou na estrutura original solicitada:
-
-"Identifique soluções para substituir o OIC Function e realizar buscas com grande volume de dados, abordando:
-
-Tecnologias alternativas para processamento de dados em larga escala.
-Estratégias de otimização para melhorar o desempenho das buscas.
-Requisitos de segurança e conformidade para o processamento de grandes volumes de dados.
-Forneça exemplos práticos e considere as limitações do OIC Function."
+Forneça uma análise comparativa detalhada das alternativas, destacando suas vantagens e desvantagens em relação ao OIC Function, e discuta as implicações para o desempenho e a escalabilidade em cenários de grande volume de dados."
 
 # Answer
 Seguindo sua solicitação, aqui está uma resposta estruturada e detalhada que cobre diferentes aspectos mencionados no prompt, atendendo tanto à versão mais sucinta quanto à mais detalhada. Vou abordar **tecnologias alternativas**, **estratégias de otimização** e **requisitos de segurança** com exemplos práticos e limitações do *OIC Function*.
