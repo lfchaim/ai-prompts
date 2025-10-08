@@ -478,3 +478,366 @@ app.Run();
   ]
 }
 ```
+# Criando projeto - by ChatGPT
+Excelente! Vamos montar um **projeto base completo** em **.NET 8** com a arquitetura **Clean Architecture**, incluindo o endpoint `POST /api/import` que recebe um arquivo CSV, processa em paralelo e faz inserts otimizados com **BulkInsert**.
+
+A seguir, você terá:
+
+* Estrutura de pastas
+* Arquivos principais (`.csproj`, `Program.cs`, `Controller`, `Command`, `Service`, etc.)
+* Dependências
+* Passos para build e execução
+
+---
+
+## 🧱 Estrutura do Projeto
+
+```
+CsvImporter/
+ ├── Api/
+ │    ├── Controllers/
+ │    │     └── ImportController.cs
+ │    ├── Program.cs
+ │    ├── Api.csproj
+ │
+ ├── Application/
+ │    ├── Commands/
+ │    │     └── ImportCsv/
+ │    │           ├── ImportCsvCommand.cs
+ │    │           └── ImportCsvCommandHandler.cs
+ │    ├── DTOs/
+ │    │     ├── ImportCsvResultDto.cs
+ │    │     └── ErrorRecord.cs
+ │    ├── Interfaces/
+ │    │     └── IImportService.cs
+ │    ├── Services/
+ │    │     └── ImportService.cs
+ │    ├── Application.csproj
+ │
+ ├── Domain/
+ │    ├── Entities/
+ │    │     └── Order.cs
+ │    └── Domain.csproj
+ │
+ ├── Infrastructure/
+ │    ├── Persistence/
+ │    │     ├── AppDbContext.cs
+ │    │     └── AppDbContextFactory.cs
+ │    ├── Infrastructure.csproj
+ │
+ ├── CsvImporter.sln
+ └── docker-compose.yml
+```
+
+---
+
+## 🧰 Passo 1: Criar a Solution e Projetos
+
+Execute no terminal:
+
+```bash
+dotnet new sln -n CsvImporter
+mkdir Api Application Domain Infrastructure
+cd Api && dotnet new webapi -n Api && cd ..
+cd Application && dotnet new classlib -n Application && cd ..
+cd Domain && dotnet new classlib -n Domain && cd ..
+cd Infrastructure && dotnet new classlib -n Infrastructure && cd ..
+```
+
+Adicionar referências:
+
+```bash
+dotnet sln add Api/Api.csproj Application/Application.csproj Domain/Domain.csproj Infrastructure/Infrastructure.csproj
+dotnet add Api/Api.csproj reference Application/Application.csproj Infrastructure/Infrastructure.csproj Domain/Domain.csproj
+dotnet add Application/Application.csproj reference Domain/Domain.csproj
+dotnet add Infrastructure/Infrastructure.csproj reference Domain/Domain.csproj
+```
+
+---
+
+## ⚙️ Passo 2: Dependências Principais
+
+No **Api.csproj**:
+
+```xml
+<ItemGroup>
+  <PackageReference Include="MediatR.Extensions.Microsoft.DependencyInjection" Version="12.1.1" />
+  <PackageReference Include="CsvHelper" Version="30.0.1" />
+  <PackageReference Include="EFCore.BulkExtensions" Version="7.7.3" />
+  <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="8.0.6" />
+  <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.6" />
+  <PackageReference Include="FluentValidation" Version="11.7.1" />
+  <PackageReference Include="Serilog.AspNetCore" Version="8.0.1" />
+  <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
+</ItemGroup>
+```
+
+---
+
+## 🧠 Passo 3: `Program.cs` (API)
+
+```csharp
+using Application;
+using Infrastructure.Persistence;
+using MediatR;
+using Microsoft.EntityFrameworkCore;
+
+var builder = WebApplication.CreateBuilder(args);
+
+// DbContext
+builder.Services.AddDbContext<AppDbContext>(options =>
+    options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
+
+// MediatR
+builder.Services.AddMediatR(typeof(Application.AssemblyMarker).Assembly);
+
+// Services
+builder.Services.AddScoped<IImportService, ImportService>();
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+var app = builder.Build();
+
+app.UseSwagger();
+app.UseSwaggerUI();
+
+app.MapControllers();
+
+app.Run();
+```
+
+---
+
+## 🧠 Passo 4: `ImportController.cs`
+
+```csharp
+using Application.Commands.ImportCsv;
+using MediatR;
+using Microsoft.AspNetCore.Mvc;
+
+namespace Api.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public class ImportController : ControllerBase
+{
+    private readonly IMediator _mediator;
+    public ImportController(IMediator mediator) => _mediator = mediator;
+
+    [HttpPost]
+    public async Task<IActionResult> Import([FromForm] IFormFile file)
+    {
+        if (file == null || file.Length == 0)
+            return BadRequest("Arquivo CSV inválido.");
+
+        var command = new ImportCsvCommand(file);
+        var result = await _mediator.Send(command);
+        return Ok(result);
+    }
+}
+```
+
+---
+
+## 🧠 Passo 5: Command e Handler
+
+**ImportCsvCommand.cs**
+
+```csharp
+using Application.DTOs;
+using MediatR;
+using Microsoft.AspNetCore.Http;
+
+namespace Application.Commands.ImportCsv;
+
+public record ImportCsvCommand(IFormFile File) : IRequest<ImportCsvResultDto>;
+```
+
+**ImportCsvCommandHandler.cs**
+
+```csharp
+using Application.DTOs;
+using Application.Interfaces;
+using MediatR;
+
+namespace Application.Commands.ImportCsv;
+
+public class ImportCsvCommandHandler : IRequestHandler<ImportCsvCommand, ImportCsvResultDto>
+{
+    private readonly IImportService _importService;
+
+    public ImportCsvCommandHandler(IImportService importService)
+    {
+        _importService = importService;
+    }
+
+    public async Task<ImportCsvResultDto> Handle(ImportCsvCommand request, CancellationToken ct)
+        => await _importService.ProcessCsvAsync(request.File, ct);
+}
+```
+
+---
+
+## 🧠 Passo 6: DTOs
+
+**ImportCsvResultDto.cs**
+
+```csharp
+namespace Application.DTOs;
+
+public class ImportCsvResultDto
+{
+    public int TotalRecords { get; set; }
+    public int Inserted { get; set; }
+    public List<ErrorRecord> Errors { get; set; } = new();
+}
+```
+
+**ErrorRecord.cs**
+
+```csharp
+namespace Application.DTOs;
+
+public class ErrorRecord
+{
+    public int Line { get; set; }
+    public string Message { get; set; } = string.Empty;
+}
+```
+
+---
+
+## 🧠 Passo 7: Serviço
+
+**IImportService.cs**
+
+```csharp
+using Application.DTOs;
+using Microsoft.AspNetCore.Http;
+
+namespace Application.Interfaces;
+
+public interface IImportService
+{
+    Task<ImportCsvResultDto> ProcessCsvAsync(IFormFile file, CancellationToken ct);
+}
+```
+
+**ImportService.cs**
+
+```csharp
+using Application.DTOs;
+using Application.Interfaces;
+using CsvHelper;
+using Domain.Entities;
+using Infrastructure.Persistence;
+using Microsoft.EntityFrameworkCore;
+using System.Collections.Concurrent;
+using System.Globalization;
+
+namespace Application.Services;
+
+public class ImportService : IImportService
+{
+    private readonly AppDbContext _db;
+
+    public ImportService(AppDbContext db) => _db = db;
+
+    public async Task<ImportCsvResultDto> ProcessCsvAsync(IFormFile file, CancellationToken ct)
+    {
+        var errors = new ConcurrentBag<ErrorRecord>();
+        var records = new ConcurrentBag<Order>();
+
+        using var reader = new StreamReader(file.OpenReadStream());
+        using var csv = new CsvReader(reader, CultureInfo.InvariantCulture);
+
+        var index = 1;
+        await foreach (var record in csv.GetRecordsAsync<Order>())
+        {
+            index++;
+            try
+            {
+                records.Add(record);
+            }
+            catch (Exception ex)
+            {
+                errors.Add(new ErrorRecord { Line = index, Message = ex.Message });
+            }
+        }
+
+        await _db.BulkInsertAsync(records.ToList(), cancellationToken: ct);
+
+        return new ImportCsvResultDto
+        {
+            TotalRecords = records.Count + errors.Count,
+            Inserted = records.Count,
+            Errors = errors.ToList()
+        };
+    }
+}
+```
+
+---
+
+## 🧠 Passo 8: Entidade e DbContext
+
+**Order.cs**
+
+```csharp
+namespace Domain.Entities;
+
+public class Order
+{
+    public int Id { get; set; }
+    public string CustomerName { get; set; } = string.Empty;
+    public DateTime OrderDate { get; set; }
+    public decimal TotalAmount { get; set; }
+}
+```
+
+**AppDbContext.cs**
+
+```csharp
+using Domain.Entities;
+using Microsoft.EntityFrameworkCore;
+
+namespace Infrastructure.Persistence;
+
+public class AppDbContext : DbContext
+{
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+    public DbSet<Order> Orders => Set<Order>();
+}
+```
+
+---
+
+## 🧠 Passo 9: Connection String
+
+No **appsettings.json** da API:
+
+```json
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Server=localhost;Database=CsvImporter;User Id=sa;Password=YourPassword123;TrustServerCertificate=True"
+  }
+}
+```
+
+---
+
+## 🧠 Passo 10: Executar
+
+```bash
+dotnet build
+dotnet ef database update
+dotnet run --project Api
+```
+
+Acesse:
+🔹 Swagger: `http://localhost:5000/swagger`
+
+---
+
