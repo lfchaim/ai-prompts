@@ -499,3 +499,135 @@ Há mais tópicos a serem avaliados (ex.: **Metodologia**, **Suporte**, **Orçam
 Há mais tópicos a serem avaliados (ex.: **Metodologia**, **Suporte**, **Orçamento**, **Gestão de Projetos**)?  
 *(Responda com "não há mais tópicos" quando terminar)*.
 
+### **Questões: SSO, IAM, SAML e OAuth 2.0**  
+*(Continuação do questionário RFP)*  
+
+116. **Experiência com SSO**:  
+    Quantos projetos de SSO a consultoria já implementou? Podem detalhar os protocolos utilizados (ex.: SAML, OAuth 2.0, OpenID Connect) e os provedores de identidade (IdP) integrados (ex.: Azure AD, Okta, Ping Identity, Keycloak)?  
+
+117. **Estratégia de IAM**:  
+    Qual é a experiência da equipe com frameworks/ferramentas de IAM (Identity and Access Management)? Utilizam soluções personalizadas ou plataformas como **Keycloak**, **Auth0**, **AWS IAM** ou **Azure AD B2C**? Como gerenciam papéis (*roles*), permissões (*policies*) e políticas de acesso (*RBAC/ABAC*)?  
+
+118. **Integração SAML**:  
+    Como a consultoria aborda a integração de **SAML 2.0**? Vocês têm experiência com fluxos **SP-initiated** (Service Provider) e **IdP-initiated** (Identity Provider)? Como gerenciam o intercâmbio de metadados (*SAML metadata files*) e a rotação de certificados?  
+
+119. **Implementação OAuth 2.0**:  
+    Qual é a experiência com **OAuth 2.0**? Quais tipos de *grant types* já implementaram (ex.: **authorization code**, **client credentials**, **password**, **PKCE**)? Como lidam com **refresh tokens**, **token revocation** e limites de taxa (*rate limiting*)?  
+
+120. **Segurança em SSO/OAuth 2.0**:  
+    Como garantem a segurança na implementação? Quais medidas adotam para evitar:  
+    - **Token interception** (ex.: uso de HTTPS, *state parameter*)?  
+    - **Replay attacks** (ex.: *nonce*, *timestamps*)?  
+    - **CSRF** (ex.: *CSRF tokens* em redirecionamentos)?  
+    Como configuram **CORS** e **cookies seguros**?  
+
+121. **Integração com Spring Boot**:  
+    Como a consultoria integra SSO/OAuth 2.0 com **Spring Boot**? Utilizam bibliotecas como **Spring Security OAuth2**, **Spring Security SAML** ou **Micronaut Security**? Como configuram:  
+    - Comunicação entre *backend* (Java) e *frontend* (Angular)?  
+    - Mapeamento de *claims* (ex.: `sub`, `email`, `roles`) para autorização?  
+    - Tratamento de *error responses* (ex.: `401 Unauthorized`, `403 Forbidden`)?  
+
+122. **Integração com Angular**:  
+    No *frontend* (Angular), qual é a estratégia para:  
+    - Armazenamento e proteção de tokens (ex.: **HttpOnly cookies**, **sessionStorage**, **secure localStorage**)?  
+    - Tratamento de redirecionamentos (ex.: *redirect_uri*, *post_login_uri*)?  
+    - Recuperação de tokens expirados (ex.: *refresh token flow*)?  
+    - Uso de bibliotecas (ex.: **angular-oauth2-oidc**, **ngx-auth0**)?  
+
+123. **Provisionamento de Usuários**:  
+    Como a consultoria lida com **provisionamento/desprovisionamento** de usuários (ex.: **SCIM**, **LDAP**, APIs de IdP)? Podem compartilhar um exemplo de integração com um sistema de diretório (ex.: Active Directory, OpenLDAP)?  
+
+124. **Personalização de Fluxos**:  
+    Qual é a abordagem para personalização de fluxos de autenticação (ex.: *branding*, campos adicionais, *multi-factor authentication*)? Como lidam com requisitos específicos do cliente (ex.: *custom login pages*)?  
+
+125. **Conformidade Regulatória**:  
+    Como garantem a conformidade com regulamentações (ex.: **GDPR**, **LGPD**) em implementações de IAM/SSO? Como gerenciam:  
+    - Dados sensíveis (ex.: CPF, e-mail)?  
+    - *Right to be forgotten* (ex.: exclusão de tokens/registros)?  
+    - Auditoria de acesso (ex.: *audit logs*)?  
+
+126. **Testes de Autenticação**:  
+    Como a consultoria testa implementações de SSO/OAuth 2.0? Utilizam ferramentas específicas (ex.: **Postman**, **curl**, **tests automatizados com Selenium/Cypress**)? Como validam cenários como:  
+    - Expiração de token?  
+    - Acesso não autorizado?  
+    - Fluxos com múltiplos IdPs?  
+
+127. **Gestão de Múltiplos IdPs**:  
+    Como lidam com a integração de **vários provedores de identidade** (ex.: Azure AD para clientes corporativos, Google/Facebook para usuários externos)? Qual é a arquitetura proposta para escalabilidade (ex.: *dynamic client registration*)?  
+
+128. **Recuperação de Conta**:  
+    Como a consultoria aborda a **recuperação de conta** (ex.: *reset de senha*) em sistemas com SSO? Como é integrado ao fluxo do IdP (ex.: *password reset endpoint*)?  
+
+129. **OpenID Connect (OIDC)**:  
+    Qual é a experiência com **OpenID Connect** (camada sobre OAuth 2.0)? Como utilizam *claims* para autorização (ex.: *scopes*, *permissions*)? Como validam a integridade dos *ID tokens*?  
+
+130. **Monitoramento e Diagnóstico**:  
+    Como a consultoria monitora e diagnostica problemas em implementações de SSO/OAuth 2.0? Quais métricas ou logs são coletados (ex.: *token issuance rate*, *failure rates*)? Como integram com ferramentas de observabilidade (ex.: **Prometheus**, **ELK Stack**)?  
+
+---
+
+**Total de questões geradas até o momento: 130**  
+
+👉 **Pergunta para você**:  
+Há mais tópicos a serem avaliados (ex.: **Metodologia**, **Suporte**, **Orçamento**, **Gestão de Projetos**)?  
+*(Responda com "não há mais tópicos" quando terminar)*.
+
+### **Questões: Resiliência, Escalabilidade e Event Driven**  
+*(Continuação do questionário RFP)*  
+
+131. **Estratégias de Resiliência**:  
+    Como a consultoria implementa estratégias de resiliência (ex.: *circuit breakers*, *retries*, *timeouts*)? Podem compartilhar exemplos de uso de bibliotecas como **Resilience4j**, **Hystrix** ou **Spring Cloud Circuit Breaker**? Como definem *fallbacks* e *bulkheads* para evitar *cascading failures*?  
+
+132. **Engenharia do Caos**:  
+    Vocês têm experiência com *chaos engineering* (ex.: **Chaos Monkey**, **Gremlin**)? Como são planejados e executados *chaos experiments* para testar a resiliência do sistema? Podem compartilhar um exemplo de *experiment* realizado e os aprendizados obtidos?  
+
+133. **Tolerância a Falhas em Microsserviços**:  
+    Como garantem a tolerância a falhas em arquiteturas de microsserviços? Como lidam com falhas em chamadas inter-serviços (ex.: *idempotency*, *distributed tracing*)? Como são gerenciados *timeouts* e *retries* com *exponential backoff*?  
+
+134. **Gestão de Serviços com Estado**:  
+    Como são projetados e escalados serviços com estado (ex.: *stateful services*)? Utilizam técnicas como *session affinity* (sticky sessions), *state replication* ou *distributed state stores* (ex.: **Redis Cluster**)? Como lidam com *failover* em serviços com estado?  
+
+135. **Abordagem de Escalabilidade**:  
+    Qual é a estratégia preferida para escalabilidade (horizontal vs. vertical)? Como decidem quando adotar cada uma? Podem explicar como equilibraram essa escolha em um projeto anterior (ex.: custos, complexidade, requisitos)?  
+
+136. **Configuração de Auto-Scaling**:  
+    Como configuram o *auto-scaling* em ambientes de nuvem (ex.: **AWS Auto Scaling Groups**, **Kubernetes HPA**)? Quais métricas são utilizadas para acionar o *scaling* (ex.: CPU, memória, filas de mensagens, *latency*)? Como evitam *thrashing* (escalonamento excessivo)?  
+
+137. **Gerenciamento de Picos de Tráfego**:  
+    Como lidam com picos de tráfego inesperados (ex.: *load balancing*, *cache*, *rate limiting*)? Podem compartilhar um exemplo de projeto onde isso foi crítico (ex.: Black Friday, eventos sazonais)? Como configuram *queues* para *backpressure*?  
+
+138. **Escalabilidade de Bancos de Dados**:  
+    Quais estratégias são adotadas para escalar bancos de dados (ex.: *sharding*, *replication*, *read replicas*)? Como lidam com *transações distribuídas* durante a escalabilidade? Como garantem *data consistency* em sistemas *sharded*?  
+
+139. **Experiência com Arquitetura Event-Driven**:  
+    Quantos projetos com arquitetura *event-driven* a consultoria já implementou? Podem descrever um exemplo (ex.: uso de *events* para integração entre serviços, *real-time analytics*)? Como decidiram adotar essa abordagem em vez de *request-response*?  
+
+140. **Message Brokers Utilizados**:  
+    Quais *message brokers* são especializados (ex.: **Apache Kafka**, **RabbitMQ**, **Amazon SQS**, **Google Pub/Sub**)? Como configuram *topics*, *queues*, *durability* (ex.: *persistence*), *message retention* e *ordering guarantees*? Como lidam com *message duplication*?  
+
+141. **Event Sourcing e CQRS**:  
+    Possuem experiência com *Event Sourcing* ou *CQRS* (Command Query Responsibility Segregation)? Como são implementados (ex.: *event store*, *projections*) e como garantem a consistência dos dados? Como lidam com *versioning* de eventos?  
+
+142. **Estratégias de Consistência de Eventos**:  
+    Como lidam com *eventual consistency* em sistemas *event-driven*? Utilizam padrões como *Sagas* (compensating transactions), *Idempotency Keys* ou *Outbox Pattern*? Como garantem que *events* não sejam perdidos durante falhas?  
+
+143. **Monitoramento de Resiliência e Escalabilidade**:  
+    Quais métricas são monitoradas para garantir resiliência e escalabilidade (ex.: *error rates*, *latency*, *throughput*, *queue depth*)? Como são integradas às ferramentas de observabilidade (ex.: **Prometheus**, **Grafana**, **Datadog**)? Como configuram *alerts* críticos?  
+
+144. **Recuperação de Desastres em Sistemas Event-Driven**:  
+    Como são planejados cenários de *disaster recovery* para sistemas *event-driven*? Como garantem que *events* não sejam perdidos durante falhas (ex.: *exactly-once processing*, *dead-letter queues*)? Como são testados os cenários de *DR*?  
+
+145. **Exemplos Práticos**:  
+    Podem compartilhar exemplos *anônimos* ou *com confidencialidade mantida* de projetos anteriores que tenham envolvido resiliência, escalabilidade ou arquitetura *event-driven*? Inclua:  
+    - Tecnologias utilizadas.  
+    - Desafios específicos (ex.: *high throughput*, *low latency*).  
+    - Métricas de sucesso (ex.: redução de *downtime*, aumento de *throughput*).  
+
+---
+
+**Total de questões geradas até o momento: 145**  
+
+👉 **Pergunta para você**:  
+Há mais tópicos a serem avaliados (ex.: **Metodologia**, **Suporte**, **Orçamento**, **Gestão de Projetos**)?  
+*(Responda com "não há mais tópicos" quando terminar)*.
+
