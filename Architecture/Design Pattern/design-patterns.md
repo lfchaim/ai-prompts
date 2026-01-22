@@ -1,5 +1,16 @@
+# Design Patterns
 
-## Design Patterns
+## Prompt
+Dada a seguinte lista inicial de Design Patterns, expandir a lista para todos os conhecidos e apresentar uma breve descrição e utilização.
+Lista inicial:
+- Strangler Fig
+- CDC + Outbox
+- Parallel Run
+- ACL - Anti Corruption Layer
+- CQRS
+- Saga
+
+## Adapta (DeepSeek R1)
 
 ### **Design Patterns para Migração, Integração e Arquitetura Corporativa**
 
@@ -82,3 +93,202 @@ Esses padrões ajudam a construir sistemas que podem se recuperar de falhas e ma
 16. **Idempotent Consumer / Idempotent Receiver (Consumidor Idempotente)**
     *   **Descrição:** Garante que o processamento de uma mensagem ou evento mais de uma vez não produza efeitos colaterais indesejados. Ou seja, aplicar a mesma operação várias vezes tem o mesmo efeito que aplicá-la uma única vez.
     *   **Utilização:** Crítico em sistemas de mensageria onde a entrega "at least once" (pelo menos uma vez) é comum. Garante que se um evento for entregue duas vezes, o S/4HANA ou outro sistema receptor não criará dados duplicados ou processará a mesma lógica de negócio duas vezes.
+
+## Abacus
+Aqui está uma lista **ampliada** dos principais **Design Patterns de Arquitetura e Padrões de Integração/Distribuição**, incluindo os que você já trouxe.  
+Organizei em categorias para facilitar consulta. Cada item contém **breve descrição + utilização típica**.
+
+---
+
+### 🍃 **Padrões de Modernização / Migração**
+#### • **Strangler Fig**
+Desacopla gradualmente um sistema legado, substituindo partes com novas implementações sem interrupção.  
+**Uso:** Transição segura para novas plataformas; migração incremental.
+
+#### • **Parallel Run**
+Executa simultaneamente o sistema antigo e o novo para comparar resultados.  
+**Uso:** Corte controlado; validar precisão antes de desligar o legado.
+
+#### • **Blue-Green Deployment**
+Dois ambientes idênticos: um ativo, um em preparo.  
+**Uso:** Deploy sem downtime e rollback imediato.
+
+#### • **Canary Release**
+Libera nova versão para um pequeno subconjunto de usuários.  
+**Uso:** Detectar falhas antes do rollout completo.
+
+#### • **Branch by Abstraction**
+Introduz uma camada de abstração para permitir refatorações profundas de forma incremental.  
+**Uso:** Refatoração simultânea com desenvolvimento contínuo.
+
+---
+
+### 🔄 **Padrões de Comunicação e Integração (Enterprise Integration Patterns)**
+#### • **CDC + Outbox**
+“Change Data Capture” combinado com tabela outbox para garantir publicação confiável de eventos.  
+**Uso:** Integrações event-driven sem inconsistencia; evitar "dual write".
+
+#### • **ACL – Anti-Corruption Layer**
+Camada que isola seu domínio de sistemas externos incompatíveis.  
+**Uso:** Evitar poluir seu domínio com modelos estranhos; integração com legados.
+
+#### • **CQRS (Command Query Responsibility Segregation)**
+Separa operações de leitura e escrita em modelos diferentes.  
+**Uso:** Escalabilidade, performance, modelos otimizados para leitura.
+
+#### • **Saga**
+Coordena transações distribuídas usando eventos ou orquestração.  
+**Uso:** Garantir consistência eventual em processos multi-serviço.
+
+#### • **Event Sourcing**
+Armazena mudanças como eventos, não como estado atual.  
+**Uso:** Auditoria, reconstrução de estado, integração event-driven.
+
+#### • **Event Carried State Transfer**
+Serviços propagam dados relevantes nos eventos.  
+**Uso:** Evitar consultas síncronas entre microsserviços.
+
+#### **• Publish/Subscribe**
+Produtores emitem eventos que consumidores recebem assíncronamente.  
+**Uso:** Desacoplamento, escalabilidade.
+
+#### **• Circuit Breaker**
+Interrompe chamadas para serviços instáveis para evitar cascata de falhas.  
+**Uso:** Resiliência, fail-fast.
+
+#### **• Retry / Backoff**
+Tenta novamente operações com falha com atraso incremental.  
+**Uso:** Falhas temporárias em redes e serviços remotos.
+
+#### **• Bulkhead**
+Isola recursos para evitar que uma falha derrube o sistema inteiro.  
+**Uso:** Contenção de falhas, multi-tenancy.
+
+#### **• API Gateway**
+Ponto único de entrada para múltiplos serviços.  
+**Uso:** Roteamento, autenticação, agregação de respostas.
+
+#### **• Idempotency**
+Requisições podem ser repetidas sem efeito colateral.  
+**Uso:** Garantias em sistemas distribuídos, mensageria.
+
+#### **• Message Queue / Message Bus**
+Canal assíncrono para comunicação entre sistemas.  
+**Uso:** Desacoplamento temporal; absorção de picos.
+
+---
+
+### 🧩 **Padrões de Arquitetura de Microsserviços**
+#### • **Backend for Frontend (BFF)**
+Backend dedicado para um tipo de cliente (mobile, web).  
+**Uso:** Otimizar payloads e interações.
+
+#### • **Service Mesh**
+Infraestrutura para observabilidade, roteamento e segurança entre serviços.  
+**Uso:** Governança e controle sem poluir código dos serviços.
+
+#### **• Sidecar**
+Responsabilidade técnica em container separado (logging, proxy).  
+**Uso:** Implementar cross-cutting concerns de forma padronizada.
+
+#### **• Distributed Cache**
+Caching coordenado entre instâncias de um serviço.  
+**Uso:** Performance, redução de latência.
+
+#### **• Sharding**
+Particionar dados entre múltiplos nós.  
+**Uso:** Escalabilidade horizontal.
+
+#### **• API Composition**
+Agrega dados de múltiplos serviços em uma única resposta.  
+**Uso:** Consultas complexas em sistemas distribuídos.
+
+#### **• Database per Service**
+Cada serviço tem seu próprio banco para evitar acoplamento.  
+**Uso:** Autonomia total entre microsserviços.
+
+---
+
+### 📦 **Padrões de Domínio (DDD)**
+#### **• Aggregate**
+Agrupa entidades de forma transacional e coerente.  
+**Uso:** Garantir invariantes e consistência.
+
+#### **• Value Object**
+Objetos imutáveis que representam conceitos do domínio.  
+**Uso:** Clareza e segurança após validação inicial.
+
+#### **• Domain Events**
+Capturam eventos significativos do domínio.  
+**Uso:** Comunicação interna e integração externa.
+
+#### **• Domain Service**
+Regras de negócio não pertencentes a entidades.  
+**Uso:** Comportamento complexo e sem estado.
+
+#### **• Repository**
+Acesso abstrato ao armazenamento de agregados.  
+**Uso:** Desacoplar domínio da persistência.
+
+---
+
+### 🏗️ **Padrões de Arquitetura Gerais**
+#### **• Layered Architecture**
+Divisão em camadas (UI, domain, data).  
+**Uso:** Simplicidade, separação de responsabilidades.
+
+#### **• Hexagonal Architecture (Ports & Adapters)**
+Domínio central cercado por portas e adaptadores.  
+**Uso:** Testabilidade, isolamento de tecnologia.
+
+#### **• Clean Architecture**
+Arquitetura em círculos concêntricos, domínio no centro.  
+**Uso:** Independência de frameworks e bancos.
+
+#### **• Microkernel**
+Núcleo mínimo com plugins externos.  
+**Uso:** Sistemas extensíveis (IDE, gateways).
+
+#### **• Event-Driven Architecture**
+Fluxo controlado por eventos.  
+**Uso:** Assíncrono, escalável, reativo.
+
+#### **• Serverless Architecture**
+Funções sob demanda.  
+**Uso:** Elasticidade automática, custos variáveis.
+
+---
+
+### 🧪 **Padrões de Observabilidade & Resiliência**
+#### **• Health Check**
+Serviços respondem estado básico.  
+**Uso:** Orquestração e load balancing corretos.
+
+#### **• Throttling / Rate Limiting**
+Limita requisições simultâneas.  
+**Uso:** Evitar sobrecarga.
+
+#### **• Dead Letter Queue**
+Mensagens que não puderam ser processadas vão para fila separada.  
+**Uso:** Diagnóstico e resiliência da mensageria.
+
+#### **• Logs Correlation / Trace ID**
+Cada requisição recebe um ID único para rastreamento distribuído.  
+**Uso:** Observabilidade em microsserviços.
+
+---
+
+### ⚙️ **Padrões de Deploy e Infraestrutura**
+#### **• Infrastructure as Code**
+Infra como código declarativo.  
+**Uso:** Reprodutibilidade, automação.
+
+#### **• Immutable Infrastructure**
+Servidores não são alterados; sempre substituídos.  
+**Uso:** Consistência e segurança.
+
+#### **• Autoscaling**
+Criação automática de instâncias.  
+**Uso:** Manter performance sob variação de carga.
+
+---
