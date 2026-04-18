@@ -605,3 +605,607 @@ Não poupe recursos para definir os Business Capability e suas dependências.
 ---
 
 *Gerado com foco em Manufacturing 4.0 para indústria de motocicletas. Compatível com LeanIX, Ardoq, BizzDesign e demais ferramentas de EA.*
+
+# English
+# Business Capability Map — Motorcycle Industry / Manufacturing 4.0
+
+> Business Capability Map structured across 3 hierarchical levels, focused on Manufacturing 4.0, for use in LeanIX or equivalent EA (Enterprise Architecture) tooling.
+
+---
+
+## Domain 1 — Core Manufacturing
+
+### 1.1 Production Planning & Scheduling
+> Orchestration of all manufacturing output, from the master plan through to line sequencing.
+> **4.0:** AI-powered APS, capacity digital twin
+> **Dependencies:** Supply Chain (1.1), Digital & M4.0 (1.1), Quality (1.1)
+
+- 1.1.1 Master Production Schedule (MPS)
+- 1.1.2 Fine-grain Scheduling (APS/MRP)
+- 1.1.3 AI-driven line sequencing
+- 1.1.4 Machine load balancing
+- 1.1.5 Production scenario simulation
+- 1.1.6 Constraint management (Theory of Constraints — TOC)
+
+### 1.2 Factory Operations Management
+> Real-time shop-floor control and execution via MES and IoT.
+> **4.0:** Integrated MES, real-time OEE, IoT
+> **Dependencies:** Digital & M4.0 (1.2, 1.3)
+
+- 1.2.1 Production order execution (MES)
+- 1.2.2 Real-time OEE monitoring
+- 1.2.3 Downtime and loss management
+- 1.2.4 Lot and part traceability
+- 1.2.5 Operator and workstation management
+- 1.2.6 Work-in-process (WIP) control
+
+### 1.3 Manufacturing Process Engineering
+> Definition, standardisation, and continuous improvement of production processes.
+> **4.0:** Digital simulation, process digital twin
+> **Dependencies:** Product & Eng. (1.1), Quality (1.2)
+
+- 1.3.1 Manufacturing routing definition
+- 1.3.2 Time and motion studies (MTM)
+- 1.3.3 Process FMEA
+- 1.3.4 Standard Operating Procedures (SOP)
+- 1.3.5 Line simulation (Discrete Event Simulation — DES)
+- 1.3.6 Engineering change management
+
+### 1.4 Automation & Robotics Management
+> Operation and evolution of automated systems, cobots, and robotic cells.
+> **4.0:** Collaborative cobots, AMR, offline programming
+> **Dependencies:** Digital & M4.0 (1.4), Maintenance (1.1)
+
+- 1.4.1 Industrial robot programming and operation
+- 1.4.2 Collaborative robots (cobots)
+- 1.4.3 Autonomous vehicles (AGV/AMR)
+- 1.4.4 Machine vision systems
+- 1.4.5 PLCs and SCADA systems
+- 1.4.6 Offline robotic simulation
+
+### 1.5 Final Assembly Management
+> Control of motorcycle assembly lines, from the frame to the finished product.
+> **4.0:** Pick-to-light, AR-assisted assembly
+> **Dependencies:** Supply Chain (1.2), Quality (1.3)
+
+- 1.5.1 Mixed-model sequencing
+- 1.5.2 Kit and sub-assembly management
+- 1.5.3 Traceable critical torques and fastenings
+- 1.5.4 Assisted in-line inspection
+- 1.5.5 Finished product functional testing
+- 1.5.6 Finished product packaging and dispatch
+
+### 1.6 Tooling & Mould Management
+> Lifecycle control of tools, moulds, stampings, and fixtures.
+> **4.0:** Additive manufacturing of tooling, RFID
+> **Dependencies:** Maintenance (1.1)
+
+- 1.6.1 Tool service life tracking
+- 1.6.2 Injection mould management
+- 1.6.3 Fixture and jig calibration
+- 1.6.4 Additive manufacturing of inserts and prototypes
+- 1.6.5 Sharpening and rework control
+- 1.6.6 RFID tagging of critical tooling
+
+---
+
+## Domain 2 — Digital & Manufacturing 4.0
+
+### 2.1 Digital Twin & Simulation
+> Digital replica of products, processes, and the factory to support real-time decision-making.
+> **4.0:** Industry 4.0 core enabler
+> **Dependencies:** Core Manufacturing (1.1), Digital M4.0 (2.4)
+
+- 2.1.1 Product digital twin (kinematic/FEA)
+- 2.1.2 Production process digital twin
+- 2.1.3 Factory digital twin (3D layout)
+- 2.1.4 Material flow simulation
+- 2.1.5 PLM–MES integration via digital twin
+- 2.1.6 Real-time IoT-driven twin updates
+
+### 2.2 Industrial IoT (IIoT)
+> Connectivity of machines, sensors, and plant assets for data collection and analysis.
+> **4.0:** Edge computing, OPC-UA, MQTT
+> **Dependencies:** Core Manufacturing (1.2), Digital M4.0 (2.5)
+
+- 2.2.1 Machine connectivity (OPC-UA/MQTT)
+- 2.2.2 Process parameter sensing
+- 2.2.3 Edge computing and fog computing
+- 2.2.4 Industrial gateways and legacy protocols
+- 2.2.5 Energy and utilities monitoring
+- 2.2.6 Real-time operational dashboards
+
+### 2.3 Industrial Analytics & AI
+> Transformation of operational data into intelligence for prediction and optimisation.
+> **4.0:** ML for quality, computer vision
+> **Dependencies:** Digital M4.0 (2.2), Quality (1.1)
+
+- 2.3.1 ML-based predictive maintenance
+- 2.3.2 Process anomaly detection
+- 2.3.3 Computer vision for inspection
+- 2.3.4 Process parameter optimisation (DOE/ML)
+- 2.3.5 Automated root cause analysis
+- 2.3.6 AI-driven demand forecasting
+
+### 2.4 Intelligent Automation & Systems Integration
+> Vertical and horizontal integration of IT and OT systems across the plant.
+> **4.0:** IT/OT convergence, ISA-95
+> **Dependencies:** Core Manufacturing (1.4), Digital M4.0 (2.2)
+
+- 2.4.1 ERP–MES–SCADA integration (ISA-95)
+- 2.4.2 Industrial data bus and APIs
+- 2.4.3 Advanced SCADA and DCS
+- 2.4.4 PID loop control and supervision
+- 2.4.5 RPA for plant administrative processes
+- 2.4.6 OT cybersecurity (ICS/SCADA)
+
+### 2.5 Data Platform & Data Governance
+> Integrated data infrastructure for analytical and regulatory support.
+> **4.0:** Industrial data lake, DataOps
+> **Dependencies:** Digital M4.0 (2.2, 2.3)
+
+- 2.5.1 Industrial data lake
+- 2.5.2 Data catalogue and data dictionary
+- 2.5.3 Data quality and data lineage
+- 2.5.4 Master Data Management (MDM)
+- 2.5.5 Data consumption APIs
+- 2.5.6 Data privacy and regulatory compliance (GDPR/LGPD)
+
+### 2.6 Augmented Reality & Wearables
+> Immersive technologies to support operations, training, and maintenance.
+> **4.0:** Guided AR, smart glasses, XR
+> **Dependencies:** Core Manufacturing (1.5), Maintenance (2.2)
+
+- 2.6.1 AR-guided assembly
+- 2.6.2 Interactive digital manuals in AR
+- 2.6.3 Smart glasses for remote maintenance
+- 2.6.4 Virtual reality (VR) training
+- 2.6.5 Digital work instructions with video
+- 2.6.6 Remote inspection by drone
+
+---
+
+## Domain 3 — Supply Chain & Logistics
+
+### 3.1 Demand Planning & S&OP
+> Integrated sales and operations planning process with predictive intelligence.
+> **4.0:** AI-powered forecasting, digital S&OP
+> **Dependencies:** Commercial (1.1), Core Manufacturing (1.1)
+
+- 3.1.1 AI and ML-based forecasting
+- 3.1.2 Demand consensus (S&OP)
+- 3.1.3 Long-range capacity planning
+- 3.1.4 Portfolio and product mix management
+- 3.1.5 Plan sensitivity analysis
+- 3.1.6 Integration with distributor sell-in/sell-out data
+
+### 3.2 Procurement & Sourcing Management
+> Strategy and operations for acquiring raw materials, components, and services.
+> **4.0:** e-Procurement, digital SRM
+> **Dependencies:** Supply Chain (3.3), Quality (1.2)
+
+- 3.2.1 Sourcing strategy and dual sourcing
+- 3.2.2 Supplier qualification and approval
+- 3.2.3 Contract and SLA management
+- 3.2.4 e-Procurement and digital quoting
+- 3.2.5 Supply risk analysis
+- 3.2.6 Commodity pricing and index management
+
+### 3.3 Supplier Relationship Management (SRM)
+> Strategic relationship and collaborative development of the supplier base.
+> **4.0:** Supplier portal, digital VMI
+> **Dependencies:** Supply Chain (3.2)
+
+- 3.3.1 Integrated supplier portal
+- 3.3.2 Performance evaluation (scorecard)
+- 3.3.3 Local supplier development
+- 3.3.4 Vendor Managed Inventory (VMI)
+- 3.3.5 Supplier quality audits
+- 3.3.6 Supply chain sustainability management
+
+### 3.4 Inventory & Warehouse Management
+> Intelligent stock control across the chain, from the warehouse to WIP.
+> **4.0:** WMS with RFID/RTLS, just-in-sequence
+> **Dependencies:** Core Manufacturing (1.2), Digital M4.0 (2.2)
+
+- 3.4.1 Advanced WMS with RFID/barcode
+- 3.4.2 Dynamic safety stock management
+- 3.4.3 Drone-automated cycle counting
+- 3.4.4 Supermarkets and electronic kanban
+- 3.4.5 Hazardous materials management
+- 3.4.6 Lot and expiry date control
+
+### 3.5 Inbound & Outbound Logistics
+> Material flow within the plant and distribution to market.
+> **4.0:** AGV/AMR, digital milk run
+> **Dependencies:** Core Manufacturing (1.5), Supply Chain (3.4)
+
+- 3.5.1 Internal milk run with AGV/AMR
+- 3.5.2 Line replenishment sequencing
+- 3.5.3 Returnable packaging management
+- 3.5.4 Cross-docking and transit points
+- 3.5.5 Fleet management and TMS
+- 3.5.6 Spare parts last-mile delivery
+
+### 3.6 Supply Chain Risk & Resilience Management
+> Identification, monitoring, and mitigation of supply chain risks.
+> **4.0:** Digital control tower, AI-driven risk management
+> **Dependencies:** Supply Chain (3.1), Digital M4.0 (2.5)
+
+- 3.6.1 Supply chain control tower
+- 3.6.2 Supply risk mapping
+- 3.6.3 Contingency plans and BCP
+- 3.6.4 ESG monitoring across the supply chain
+- 3.6.5 Origin management and traceability
+- 3.6.6 Geographic diversification of sourcing
+
+---
+
+## Domain 4 — Product & Engineering
+
+### 4.1 Product Lifecycle Management (PLM)
+> Integrated product governance from concept through to end-of-life.
+> **4.0:** PLM with digital twin, MBSE
+> **Dependencies:** Digital M4.0 (2.1), Core Manufacturing (1.3)
+
+- 4.1.1 BOM management (Engineering and Manufacturing BoM)
+- 4.1.2 Revision control and ECN/ECO management
+- 4.1.3 Technical documentation management
+- 4.1.4 PLM–ERP–MES integration
+- 4.1.5 Product configuration and variant management
+- 4.1.6 End-of-life and replacement management
+
+### 4.2 Product Development (R&D)
+> Innovation and development process for new motorcycle models.
+> **4.0:** Integrated CAD/CAE/CAM, 3D printing
+> **Dependencies:** Product & Eng. (4.1), Quality (1.2)
+
+- 4.2.1 Conceptualisation and styling (industrial design)
+- 4.2.2 Parametric 3D CAD (CATIA/NX)
+- 4.2.3 CAE and structural/CFD/crash simulation
+- 4.2.4 Rapid prototyping and additive manufacturing
+- 4.2.5 Validation and homologation testing
+- 4.2.6 Virtual Product Development (VPD)
+
+### 4.3 Portfolio & Roadmap Management
+> Strategic decisions on model portfolio and future technologies.
+> **4.0:** Electric vehicles, connectivity, motorcycle ADAS
+> **Dependencies:** Strategy (1.1), Commercial (1.1)
+
+- 4.3.1 Development stage-gate process
+- 4.3.2 Technical and commercial feasibility analysis
+- 4.3.3 Product and technology roadmap (EV/hybrid)
+- 4.3.4 Intellectual property management (IP/patents)
+- 4.3.5 Competitive product benchmarking
+- 4.3.6 Regional and regulatory model management
+
+### 4.4 Homologation & Regulatory Compliance
+> Product certification with national and international regulatory bodies.
+> **4.0:** Virtual homologation simulation
+> **Dependencies:** Product & Eng. (4.2), Quality (1.3)
+
+- 4.4.1 Type approval (DENATRAN/SENATRAN equivalent)
+- 4.4.2 Emissions compliance (PROCONVE/Euro 5)
+- 4.4.3 Active/passive safety (ABNT/ECE standards)
+- 4.4.4 Electric motorcycle certification
+- 4.4.5 Post-approval change management
+- 4.4.6 Export compliance documentation
+
+### 4.5 Spare Parts Management (Aftermarket)
+> Strategy and management of the genuine parts portfolio in the after-sales channel.
+> **4.0:** Demand sensing, interactive digital catalogue
+> **Dependencies:** Supply Chain (3.5), Commercial (1.3)
+
+- 4.5.1 Parts demand planning (POS-driven)
+- 4.5.2 Obsolescence and supersession management
+- 4.5.3 Digital parts catalogue (EPC)
+- 4.5.4 Genuine parts programme
+- 4.5.5 Aftermarket pricing and margin management
+- 4.5.6 Legacy parts supply
+
+---
+
+## Domain 5 — Quality & Compliance
+
+### 5.1 Quality Management System (QMS)
+> Integrated quality management framework aligned with international standards.
+> **4.0:** eQMS, digitalised IATF 16949
+> **Dependencies:** Core Manufacturing (1.2), Digital M4.0 (2.5)
+
+- 5.1.1 IATF 16949 / ISO 9001 certification
+- 5.1.2 Digital APQP and PPAP
+- 5.1.3 Business process management (BPM)
+- 5.1.4 Internal and external audits
+- 5.1.5 Non-conformance management (NCRs)
+- 5.1.6 Quality KPIs and QMS indicators
+
+### 5.2 Quality by Design (QbD)
+> Quality engineering integrated into the product development process.
+> **4.0:** FEA/reliability simulation
+> **Dependencies:** Product & Eng. (4.2), Core Manufacturing (1.3)
+
+- 5.2.1 Design FMEA (DFMEA)
+- 5.2.2 Process FMEA (PFMEA)
+- 5.2.3 Control plans and Measurement System Analysis (MSA)
+- 5.2.4 Reliability engineering (DRBFM)
+- 5.2.5 Design Verification Plan and Report (DVP&R)
+- 5.2.6 Lessons learned management
+
+### 5.3 In-Process Quality Inspection & Control
+> Statistical control and automated inspection at every production stage.
+> **4.0:** Computer vision, automated CMM, SPC
+> **Dependencies:** Core Manufacturing (1.2), Digital M4.0 (2.3)
+
+- 5.3.1 Statistical Process Control (SPC)
+- 5.3.2 Computer vision inspection
+- 5.3.3 Coordinate Measuring Machine (CMM) and 3D scanning
+- 5.3.4 Weld inspection by X-ray/ultrasound
+- 5.3.5 Non-Destructive Testing (NDT)
+- 5.3.6 Incoming material inspection
+
+### 5.4 Warranty & Field Quality Management
+> Monitoring and resolution of quality issues reported from the market.
+> **4.0:** Connected telematics, field predictive analytics
+> **Dependencies:** Commercial (1.3), Digital M4.0 (2.3)
+
+- 5.4.1 Warranty and recall management
+- 5.4.2 Field failure analysis (8D/MASP)
+- 5.4.3 Telematics-based quality monitoring
+- 5.4.4 Customer complaint management
+- 5.4.5 Field quality benchmarking
+- 5.4.6 Early warning system for field failures
+
+### 5.5 Metrology & Laboratory
+> Metrological traceability and laboratory analysis of materials and products.
+> **4.0:** Digital metrology, Laboratory 4.0
+> **Dependencies:** Quality (5.3)
+
+- 5.5.1 Measurement instrument management
+- 5.5.2 Calibration and traceability (national standards body)
+- 5.5.3 Materials and metallurgy laboratory
+- 5.5.4 Emissions and noise testing
+- 5.5.5 Reliability laboratory (accelerated life testing)
+- 5.5.6 Sample and results management
+
+---
+
+## Domain 6 — Maintenance & Facilities
+
+### 6.1 Maintenance Management (CMMS/EAM)
+> Maintenance strategies and systems to maximise asset availability.
+> **4.0:** ML-based predictive maintenance, connected CMMS
+> **Dependencies:** Digital M4.0 (2.3, 2.2)
+
+- 6.1.1 Preventive and predictive maintenance
+- 6.1.2 CMMS/EAM integrated with the shop floor
+- 6.1.3 Total Productive Maintenance (TPM)
+- 6.1.4 Critical spare parts management
+- 6.1.5 Equipment reliability analysis (RCM)
+- 6.1.6 Maintenance KPIs (MTBF/MTTR/OEE)
+
+### 6.2 Industrial Asset Management
+> Full lifecycle management of productive assets, from acquisition to disposal.
+> **4.0:** Asset Performance Management (APM)
+> **Dependencies:** Maintenance (6.1), Digital M4.0 (2.4)
+
+- 6.2.1 Asset registry and records (EAM)
+- 6.2.2 Financial asset management (depreciation)
+- 6.2.3 Asset renewal planning
+- 6.2.4 Asset Performance Management (APM)
+- 6.2.5 Maintenance contract management
+- 6.2.6 Sustainability and asset disposal
+
+### 6.3 Utilities & Energy Management
+> Efficient management of electricity, gas, water, and building systems.
+> **4.0:** ISO 50001, intelligent monitoring
+> **Dependencies:** Digital M4.0 (2.2), Sustainability (1.1)
+
+- 6.3.1 Energy Management System (EMS / ISO 50001)
+- 6.3.2 Real-time consumption monitoring
+- 6.3.3 Energy efficiency projects
+- 6.3.4 Boiler and steam utilities management
+- 6.3.5 Effluent and industrial waste management
+- 6.3.6 Renewable energy (solar/biomass)
+
+---
+
+## Domain 7 — Commercial, Marketing & CX
+
+### 7.1 Commercial & Sales Management
+> Sales strategy and execution across dealers, distributors, and direct channels.
+> **4.0:** Integrated CRM, sell-out analytics
+> **Dependencies:** Supply Chain (3.1), Product & Eng. (4.3)
+
+- 7.1.1 Dealer network management
+- 7.1.2 Sales planning and quota setting
+- 7.1.3 Sell-in / sell-out analytics
+- 7.1.4 Contract and consortium management
+- 7.1.5 Trade marketing and network incentives
+- 7.1.6 Motorcycle e-commerce (D2C)
+
+### 7.2 Marketing & Brand Management
+> Brand positioning, communication, and management in the two-wheeler market.
+> **4.0:** Digital marketing, influence and community
+> **Dependencies:** Product & Eng. (4.3)
+
+- 7.2.1 Brand management (brand equity)
+- 7.2.2 Digital marketing, SEO/SEM
+- 7.2.3 Riding community and enthusiast management
+- 7.2.4 Product launches and events
+- 7.2.5 Market research and Voice of Customer (VOC)
+- 7.2.6 Partnerships and co-branding
+
+### 7.3 After-Sales Services & CX
+> Customer experience throughout the motorcycle's lifecycle.
+> **4.0:** Connected app, telematics, digital services
+> **Dependencies:** Product & Eng. (4.5), Quality (5.4)
+
+- 7.3.1 Authorised service network management
+- 7.3.2 Motorcycle connectivity and telematics app
+- 7.3.3 Customer satisfaction management (NPS/CSAT)
+- 7.3.4 Loyalty programme and community
+- 7.3.5 Customer relations centre (CRM)
+- 7.3.6 Financial services and insurance (F&I)
+
+### 7.4 Channel & Pricing Management
+> Pricing strategy, discount management, and distribution channel governance.
+> **4.0:** Dynamic revenue management
+> **Dependencies:** Commercial (7.1)
+
+- 7.4.1 Pricing strategy and policy
+- 7.4.2 Discount and commercial incentive management
+- 7.4.3 Price elasticity analysis
+- 7.4.4 Physical and digital distribution channel management
+- 7.4.5 Competitive price analysis
+- 7.4.6 Revenue management and dynamic pricing
+
+---
+
+## Domain 8 — Sustainability & ESG
+
+### 8.1 Environmental Management & Decarbonisation
+> Environmental strategy and operations to reduce impact and ensure legal compliance.
+> **4.0:** Real-time carbon monitoring
+> **Dependencies:** Maintenance (6.3), Digital M4.0 (2.5)
+
+- 8.1.1 GHG emissions inventory and tracking (Scope 1/2/3)
+- 8.1.2 Waste management and reverse logistics
+- 8.1.3 Environmental compliance (national regulations)
+- 8.1.4 Carbon reduction and net zero projects
+- 8.1.5 Environmental certifications (ISO 14001)
+- 8.1.6 GRI reporting and sustainability disclosures
+
+### 8.2 Health, Safety & Ergonomics (HSE)
+> Accident prevention, occupational health, and ergonomics in the industrial environment.
+> **4.0:** Safety wearables, AI-driven prevention
+> **Dependencies:** Core Manufacturing (1.2)
+
+- 8.2.1 HSE management system (ISO 45001)
+- 8.2.2 Ergonomic workstation analysis
+- 8.2.3 Risk management and hazard assessment plans
+- 8.2.4 Wearables for fatigue monitoring
+- 8.2.5 PPE management and regulatory compliance
+- 8.2.6 Accident investigation and analysis
+
+### 8.3 Circular Economy & Sustainable Product
+> Integration of circular economy principles into design and operations.
+> **4.0:** Design for disassembly, bio-materials
+> **Dependencies:** Product & Eng. (4.2), Sustainability (8.1)
+
+- 8.3.1 Design for sustainability (eco-design)
+- 8.3.2 Critical material traceability (lithium, copper)
+- 8.3.3 Recycling and take-back programme
+- 8.3.4 Hazardous material reduction (REACH/RoHS)
+- 8.3.5 Eco-design for electric vehicles
+- 8.3.6 Product Life Cycle Assessment (LCA)
+
+---
+
+## Domain 9 — Corporate Support
+
+### 9.1 Financial Management & Controlling
+> Financial planning, control, and managerial and statutory accounting.
+> **4.0:** Automated FP&A, cloud finance
+> **Dependencies:** Strategy (1.1)
+
+- 9.1.1 Budgeting and forecasting (FP&A)
+- 9.1.2 Industrial cost accounting (ABC)
+- 9.1.3 Cash and treasury management
+- 9.1.4 Financial reporting (IFRS)
+- 9.1.5 Internal controls and financial compliance
+- 9.1.6 Internal and external audit
+
+### 9.2 People Management & Development
+> Attracting, developing, and retaining talent for the factory of the future.
+> **4.0:** Digital upskilling, learning management platforms
+
+- 9.2.1 Recruitment and selection
+- 9.2.2 Training and development (L&D)
+- 9.2.3 Performance management and meritocracy
+- 9.2.4 Job grading and compensation structure
+- 9.2.5 Occupational safety and employee wellbeing
+- 9.2.6 Workforce planning and capacity management
+
+### 9.3 Legal & Compliance Management
+> Legal conformance, contract management, and corporate legal protection.
+> **4.0:** LegalTech, smart contracts
+
+- 9.3.1 Contract and SLA management
+- 9.3.2 Regulatory compliance (antitrust, GDPR/LGPD)
+- 9.3.3 Intellectual property and patents
+- 9.3.4 Litigation and dispute management
+- 9.3.5 Due diligence and M&A
+- 9.3.6 Corporate insurance management
+
+### 9.4 Information Technology (IT)
+> Corporate and industrial IT infrastructure, systems, and information security.
+> **4.0:** Hybrid cloud, IT/OT cybersecurity, private 5G
+> **Dependencies:** Digital M4.0 (2.4, 2.5)
+
+- 9.4.1 ERP (integrated management system)
+- 9.4.2 Cloud and on-premise infrastructure
+- 9.4.3 Cybersecurity and identity management
+- 9.4.4 OT networks and private 5G in-plant
+- 9.4.5 Service desk and end-user support
+- 9.4.6 Project management and enterprise architecture
+
+---
+
+## Domain 10 — Strategy & Governance
+
+### 10.1 Strategic Planning
+> Defining the long-term vision, corporate strategy, and resource allocation.
+> **4.0:** Future mobility scenarios, EV strategy
+
+- 10.1.1 Strategic planning cycle (BSC/OKR)
+- 10.1.2 Market analysis and competitive scenario planning
+- 10.1.3 Initiative portfolio management
+- 10.1.4 M&A and strategic partnerships
+- 10.1.5 Corporate performance management (KPIs)
+- 10.1.6 Corporate governance and strategic ESG
+
+### 10.2 Innovation & R&D
+> Management of technological innovation and applied research in the mobility sector.
+> **4.0:** Open innovation, connected vehicles, EV
+> **Dependencies:** Product & Eng. (4.2), Digital M4.0 (2.1)
+
+- 10.2.1 Innovation pipeline management
+- 10.2.2 Open innovation and startup ecosystem
+- 10.2.3 Electric and hybrid propulsion research
+- 10.2.4 R&D centres and internal laboratories
+- 10.2.5 Government R&D tax incentive capture
+- 10.2.6 Emerging intellectual property management
+
+### 10.3 Government Affairs & Regulatory Relations
+> Engagement with government, industry bodies, and management of the regulatory environment.
+> **4.0:** Regulation of autonomous and connected vehicles
+> **Dependencies:** Product & Eng. (4.4)
+
+- 10.3.1 Engagement with transport authorities and industry associations
+- 10.3.2 Public policy monitoring and influence
+- 10.3.3 Tax incentive management (IPI, free trade zones)
+- 10.3.4 Trade union and labour relations
+- 10.3.5 Participation in standardisation committees
+- 10.3.6 International regulatory approval management
+
+---
+
+## Executive Summary
+
+| # | Domain | L1 Capabilities | L3 Capabilities (total) | Type |
+|---|--------|:-:|:-:|---|
+| 1 | Core Manufacturing | 6 | 36 | Core |
+| 2 | Digital & Manufacturing 4.0 | 6 | 36 | Digital |
+| 3 | Supply Chain & Logistics | 6 | 36 | Core |
+| 4 | Product & Engineering | 5 | 30 | Core |
+| 5 | Quality & Compliance | 5 | 30 | Core |
+| 6 | Maintenance & Facilities | 3 | 18 | Core |
+| 7 | Commercial, Marketing & CX | 4 | 24 | Support |
+| 8 | Sustainability & ESG | 3 | 18 | Strategic |
+| 9 | Corporate Support | 4 | 24 | Support |
+| 10 | Strategy & Governance | 3 | 18 | Strategic |
+| **Total** | | **45** | **270** | |
+
+---
+
+*Generated with a Manufacturing 4.0 focus for the motorcycle industry. Compatible with LeanIX, Ardoq, BizzDesign, and other EA tooling.*
