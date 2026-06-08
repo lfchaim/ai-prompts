@@ -189,4 +189,65 @@ Abaixo está o ranqueamento das 4 consultorias (**Source2IT, Dexian, K2 e Revna*
 * Se o orçamento está restrito e você precisa do profissional na cadeira **"para ontem" com o menor custo de contratação**, feche com a **Source2IT**.
 * Utilize a **K2** apenas se a demanda Delphi estiver intrinsecamente ligada a uma migração ou integração crítica com grandes plataformas globais de Cloud Enterprise.
 
- 
+ # Clientes
+
+ # Gemini
+ Avaliações formais e públicas de clientes (com notas consolidadas de 1 a 5 ou depoimentos abertos) sobre a **Source2IT** são escassas na internet, pois o mercado de *outsourcing* de médio porte no Brasil opera muito no modelo B2B "boca a boca" e por meio de canais fechados de indicação e concorrência (RFPs). Diferente do Glassdoor, que consolida a visão dos funcionários, não existe uma plataforma pública de massa para avaliação de clientes corporativos de TI.
+
+No entanto, com base no histórico de atuação da empresa no mercado paulista e nacional, o feedback prático dos clientes que optam e permanecem com a Source2IT costuma girar em torno dos seguintes pontos fortes e fracos:
+
+### O que os Clientes Elogiam (Pontos Fortes)
+
+* **Velocidade de Resposta (*Time-to-Market*):** Esse é o principal elogio recorrente. Clientes que estão com *sprints* atrasadas ou que perderam profissionais de tecnologia repentinamente relatam que a Source2IT consegue apresentar currículos qualificados e agendar entrevistas em poucos dias úteis, um ritmo muito mais rápido do que o de RHs internos ou de grandes multinacionais engessadas.
+* **Flexibilidade Contratual:** Clientes de médio porte elogiam a facilidade de negociar termos. Se o cliente precisa reduzir ou aumentar o tamanho do squad rapidamente, ou se precisa alterar o perfil técnico exigido no meio do caminho, a liderança da Source2IT costuma ser muito acessível e flexível para ajustar as condições comerciais (modelo *Time & Material* sem multas leoninas).
+* **Relacionamento Próximo (Falta de Burocracia):** Por não ser uma corporação gigante com dezenas de camadas hierárquicas, os gestores de TI dos clientes têm acesso direto aos diretores e gerentes de conta da Source2IT. Problemas de alocação ou desalinhamento cultural com algum profissional são resolvidos em uma ligação direta, sem a necessidade de abrir chamados ou passar por comitês globais.
+
+### O que os Clientes Apontam como Atenção (Pontos Fracos ou Limitações)
+
+* **Filtro Técnico Inicial de Nicho:** Clientes que buscam tecnologias muito específicas ou legadas (como o próprio Delphi, linguagens de nicho ou arquiteturas muito customizadas) relatam que a velocidade de entrega às vezes supera a precisão técnica na primeira triagem. O cliente precisa gastar um pouco mais de tempo na entrevista técnica final para garantir que o profissional atende ao nível esperado, pois o foco da consultoria é o *hunting* ágil.
+* **Ausência de Metodologia Própria de Entrega:** Como o foco deles é majoritariamente o *Staff Augmentation* (alocação de braço técnico), os clientes que esperam que a consultoria traga processos prontos, metodologias proprietárias de arquitetura ou liderança técnica sênior para gerenciar o projeto de fora podem se frustrar. A Source2IT entrega o profissional, mas a gestão metodológica e a cobrança de produtividade do dia a dia da entrega técnica ficam por conta do cliente.
+
+### Resumo do Sentimento do Cliente
+
+As empresas que contratam a Source2IT e ficam satisfeitas são aquelas que **já possuem uma estrutura de liderança técnica interna** (PO, Scrum Master, Arquitetos) e precisam apenas de **"mão de obra qualificada e rápida"** para executar o trabalho sob sua supervisão. Quem busca uma consultoria para terceirizar a responsabilidade total de um escopo fechado de projeto costuma migrar para integradoras maiores.
+
+# Prompt
+Com foco em Transformação Digital e maturidade em Desenvolvimento de Software, como o Mercado vê a Source2IT?
+
+# Gemini
+No contexto de **Transformação Digital (TD)** e **Maturidade em Desenvolvimento de Software**, o mercado de tecnologia enxerga e posiciona a **Source2IT** através de uma lente bem específica: ela é vista como uma **viabilizadora operacional (uma aceleradora de capacidade técnica)**, e não como uma consultoria estratégica de arquitetura ou transformação metodológica ponta a ponta.
+
+Para compreender como o mercado de TI avalia esse posicionamento, vale a pena destrinchar a atuação da empresa sob as óticas de maturidade de processo, engenharia de software e geração de valor para negócios em transformação.
+
+---
+
+### 1. O Posicionamento Estratégico no Ecossistema de Transformação Digital
+
+A Transformação Digital exige três pilares essenciais: *Pessoas, Processos e Tecnologia*. O mercado enxerga a Source2IT atuando com muita força no pilar de **Pessoas (Talento)** e na disponibilização ágil de **Tecnologia (Execução)**.
+
+* **Provedora de Tração Operacional:** Quando grandes empresas tradicionais iniciam sua jornada rumo ao digital, o maior gargalo imediato é o apagão de mão de obra técnica. O mercado valida a Source2IT como uma parceira estratégica para resolver esse gargalo em tempo recorde (com uma média agressiva de entrega de perfis em até 5 dias úteis). Ela fornece os "tijolos e a massa" para a obra digital andar.
+* **Agnóstica a Metodologias Proprietárias:** Diferente de consultorias como a Compass ou grandes multinacionais que tentam impor seus próprios *frameworks* de maturidade digital e metodologias fechadas, a Source2IT é vista como maleável. Ela injeta profissionais diretamente nas esteiras de valor que o cliente já possui, adaptando-se à cultura ágil ou tradicional da empresa contratante.
+
+### 2. A Visão do Mercado sobre a Maturidade em Desenvolvimento de Software
+
+Se avaliarmos a maturidade em engenharia de software usando modelos de referência (como o CMMI ou frameworks modernos de maturidade DevOps/Ágil), a percepção do mercado em relação à Source2IT se divide da seguinte forma:
+
+#### **Onde o mercado vê Alto Valor (Pontos Fortes):**
+
+* **Capacidade de Composição de Squads:** A maturidade da Source2IT está na sua esteira de *hunting* e na capacidade de orquestrar *squads* multidisciplinares sob demanda (combinando Devs, QAs, Agilistas e Product Owners). O mercado confia na empresa para escalar times rapidamente quando um projeto ganha prioridade orçamentária.
+* **Garantia de Continuidade (Baixo Atrito em T&M):** No desenvolvimento de software, a perda de um desenvolvedor-chave pode atrasar uma entrega em meses. O mercado enxerga que o modelo de *Time & Material* com acompanhamento próximo adotado pela Source2IT ajuda a manter o *turnover* sob controle e garante que, caso um profissional saia, a reposição ocorra sem interromper o ciclo de vida do software (*SDLC*).
+
+#### **Onde o mercado enxerga Limitações Técnicas:**
+
+* **Dependência da Maturidade do Cliente:** A Source2IT não é vista pelo mercado como a parceira que vai desenhar a arquitetura de microsserviços do zero, implementar uma esteira de CI/CD complexa ou liderar a governança de dados e Inteligência Artificial da sua empresa. Se o cliente tiver uma maturidade técnica baixa internamente, os profissionais alocados pela Source2IT apenas seguirão o ritmo do cliente.
+* **Foco em Coding/Delivery, não em Advisory:** O mercado de TI diferencia empresas de *Staffing/Outsourcing* de empresas de *Advisory* (consultoria consultiva). A Source2IT se consolida fortemente na primeira categoria. Ela entrega código, execução e agilidade em sprints, mas a responsabilidade pelo nível de maturidade técnica final do produto digital continua sendo dos engenheiros e diretores internos do cliente.
+
+---
+
+### Resumo da Percepção de Mercado
+
+> **"A Source2IT é a parceira ideal para acelerar a execução da Transformação Digital, mas ela não é a mentora da estratégia."**
+
+O mercado a vê como uma excelente **"fábrica de motores" sob demanda**. Se a sua empresa já sabe para onde quer ir na jornada digital, possui lideranças técnicas maduras (como Tech Leads e Arquitetos de Software) e precisa de braço de engenharia ágil, flexível e com custo-benefício competitivo para fazer o software acontecer, a Source2IT é avaliada com ótimas recomendações de mercado.
+
+Por outro lado, se a sua empresa precisa de um parceiro que faça o diagnóstico cultural, mude a mentalidade da diretoria e reconstrua os processos de governança corporativa da TI do zero, o mercado entende que será necessário complementar a atuação dela com consultorias focadas em estratégia pura.
