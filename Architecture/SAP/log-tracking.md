@@ -103,3 +103,46 @@ Implemente um **ID de correlação global** que flua por todos os sistemas:
 
 Precisa de ajuda para desenhar os grok patterns do Logstash ou scripts de injeção de correlation ID no ABAP? É só pedir!
 
+# Enhanced Prompt
+Atue como um Software Engineer especialista em observabilidade, integração de sistemas e arquitetura corporativa.
+
+Estabeleça uma estratégia especialista para atender observabilidade e tracking em uma tríplice integração entre:
+
+1. Sistema Legado — aplicações Web em .Net e Java, em ambientes On Premise e Cloud
+2. Informatica — integrador middleware
+3. SAP — ERP amplamente utilizado mundialmente
+
+Objetivos:
+- Avaliar, primeiramente, o que cada integração permite nativamente dentro da própria ferramenta.
+- Considerar, por exemplo, as capacidades de log do SAP e do Informatica.
+- Avaliar soluções externas de observabilidade e tracking, como Datadog, Zabbix, Prometheus, ELK, entre outras.
+- Ordenar as soluções pela melhor relação custo-benefício.
+- Propor a adoção de um identificador único para cada request, por exemplo, um Correlation ID, garantindo rastreabilidade ponta a ponta.
+
+Estruture sua پاسخ da seguinte forma:
+1. Diagnóstico inicial de cada plataforma
+2. Capacidades nativas de logs, métricas e tracing
+3. Limitações e riscos de observabilidade por plataforma
+4. Comparativo das ferramentas externas
+5. Ranking das soluções por custo-benefício
+6. Estratégia recomendada de implementação
+7. Padrão de Correlation ID e fluxo de propagação
+8. Boas práticas de monitoração, auditoria e troubleshooting
+9. Conclusão com recomendação prática
+
+Requisitos:
+- Seja técnico, objetivo e prático
+- Considere cenários On Premise e Cloud
+- Leve em conta complexidade de integração, escalabilidade, manutenção e custo
+- Diferencie claramente logging, metrics e tracing
+- Se houver lacunas de informação, explicite as premissas adotadas
+- Priorize uma abordagem que maximize rastreabilidade e reduza custo operacional
+
+Se possível, apresente também uma tabela comparativa com:
+- Ferramenta/Solução
+- Tipo de observabilidade suportado
+- Facilidade de implementação
+- Custo estimado
+- Escalabilidade
+- Adequação ao cenário descrito
+
