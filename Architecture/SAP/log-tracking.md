@@ -325,6 +325,8 @@ Sistema com capacidade nativa de auditoria robusta via SM20/SM21 (system log), S
 
 A arquitetura proposta é em camadas, combinando open-source como backbone e integrações nativas como fontes de eventos:**Roadmap de implementação em 3 fases:**
 
+![Alt Text](observability_architecture.svg)
+
 **Fase 1 — Fundação (semanas 1–6)**
 Implantar ELK Stack centralizado. Configurar Filebeat/Logstash para coletar logs do Sistema Legado e do Informatica. Criar pipeline de extração de SLG1/SM21 via report ABAP agendado exportando para Kafka ou diretamente para Logstash. Definir e implementar o padrão de Correlation ID (veja seção 7). Criar índices Elasticsearch separados por sistema com política de retenção (ex.: 30 dias hot, 90 dias warm).
 
@@ -348,6 +350,8 @@ Exemplo: LEG-1718054400123-a3f7c2d1
 Ou, mais simples e amplamente compatível: UUID v4 puro (sem prefixo), especialmente se o contexto já estiver nos logs estruturados.
 
 **Fluxo de propagação cross-system:****Implementação por sistema:**
+
+![Alt Text](correlation_id_flow.svg)
 
 **Sistema Legado (.NET / Java):** Gerar UUID v4 no entry point (controller REST, consumer Kafka, job agendado) se não houver CorrID no header de entrada. Propagar via `X-Correlation-ID` em chamadas HTTP saídas e via MDC (Java) ou `ILogger` enrichment (.NET) para que todos os logs do processo carreguem o campo automaticamente. Com OpenTelemetry, o `trace_id` pode servir diretamente como CorrID.
 
