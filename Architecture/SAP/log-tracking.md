@@ -308,6 +308,18 @@ Sistema com capacidade nativa de auditoria robusta via SM20/SM21 (system log), S
 ---
 
 ## 4 & 5. Comparativo e Ranking por Custo-Benefício---
+### Comparativo de ferramentas de observabilidade
+
+| # | Ferramenta / Solução | Tipo de observabilidade | Facilidade impl. | Custo estimado | Escalabilidade | Adequação ao cenário | Ranking CB |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | **ELK Stack** Elasticsearch + Logstash + Kibana | LoggingSearchDashboards | Média — requer infra | Open-source (infra ~$300–1k/mês self-hosted) | Alta (cluster) | Excelente para centralizar logs heterogêneos dos 3 sistemas. Logstash parseia formatos SAP/Informatica. Kibana oferece dashboards operacionais. | ★★★★★ #1 |
+| 2 | **Prometheus + Grafana** | MétricasAlertasDashboards | Alta — amplamente documentado | Open-source (infra ~$150–500/mês) | Alta | Melhor para métricas de infra/app (JVM, .NET, Informatica). Requer exporters customizados para SAP (via RFC/BAPI). Complementa ELK. | ★★★★★ #2 |
+| 3 | **OpenTelemetry** Collector + SDKs | TracingMétricasLogs | Média — requer instrumentação | Open-source (sem custo de licença) | Alta | Padrão de mercado para propagação de Correlation ID e tracing distribuído. Instrumenta Java/.NET nativamente. SAP requer adaptação. Backbone da estratégia de tracing. | ★★★★☆ #3 |
+| 4 | **Jaeger / Zipkin** | Distributed Tracing | Alta (com OTel) | Open-source (infra ~$100–300/mês) | Média-alta | Visualização de traces end-to-end quando OpenTelemetry é o coletor. Jaeger preferível para volume alto. Não cobre SAP nativamente — traces chegam via OTel bridge. | ★★★★☆ #4 |
+| 5 | **Zabbix** | MétricasAlertasInfra monitoring | Alta — interface consolidada | Open-source (infra ~$100–400/mês) | Média | Excelente para monitoração de infra On Premise (servidores, rede, JVM). Templates SAP disponíveis. Não cobre tracing distribuído. Bom complemento para ops. | ★★★☆☆ #5 |
+| 6 | **Datadog** | LogsMétricasAPM/TracingSintético | Muito alta — SaaS turnkey | $15–23/host/mês + ingestão de log (~$5k–20k/mês em escala) | Altíssima | Solução premium all-in-one. Integração SAP via plugin (limitado). Informatica integration disponível. Melhor custo-benefício apenas se já houver orçamento SaaS aprovado. Evitar como solução única por custo. | ★★★☆☆ #6 |
+| 7 | **Dynatrace** | APMAI OpsTracing | Muito alta — agente auto-instrument | ~$69/host/mês (caro para múltiplos servidores SAP) | Altíssima | Melhor APM do mercado, com suporte a SAP via extensão dedicada. Custo proibitivo para ambientes On Premise legados. Recomendado apenas se SAP BTP + budget enterprise. | ★★☆☆☆ #7 |
+| 8 | **Nativo SAP** SLG1, SM21, SXMB\_MONI, Focused Run | AuditoriaLogs SAP | Alta (já existe) | Incluso na licença SAP | Baixa (silos) | Usar como fonte de eventos/logs a serem exportados para ELK. Não substituir ferramentas externas — complementar. SLG1 é auditoria, não observabilidade operacional. | Complementar |
 
 ## 6. Estratégia recomendada de implementação
 
