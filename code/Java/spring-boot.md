@@ -45,7 +45,6 @@ Include:
 
 ## Enhanced
 Act as a Senior Spring Boot Developer. Generate an exhaustive, enterprise-ready boilerplate for a Spring Boot RESTful API application.
-
 Requirements:
 1. Create a generic REST API structure that exposes a /api/v1/[DATA_SOURCE_ID]/[TABLE_NAME] endpoint for CRUD operations for every table discovered in the database.
 2. The DATA_SOURCE_ID must represent a JDBC database configuration stored in a PostgreSQL table named data_source, with the fields key_source, url, user, and password.
