@@ -146,3 +146,101 @@ Se possível, apresente também uma tabela comparativa com:
 - Escalabilidade
 - Adequação ao cenário descrito
 
+# Adapta ONE
+Esta é uma análise técnica de arquitetura para estabelecer uma estratégia de observabilidade e rastreabilidade (tracking) ponta a ponta na integração entre sistemas Legados (.NET/Java), Informatica e SAP.
+
+---
+
+## 1. Diagnóstico Inicial das Plataformas
+
+O cenário apresenta uma arquitetura híbrida clássica de alta complexidade. O desafio reside na heterogeneidade dos protocolos (HTTP/REST, SOAP, RFC, IDoc) e na natureza distinta de cada "salto" da integração.
+
+*   **Legado (.NET/Java):** Alta flexibilidade. Permite implementação de bibliotecas modernas de telemetria.
+*   **Informatica (PowerCenter ou IICS):** Atua como o "buraco negro" da observabilidade se não for bem configurado. Foca em processamento de dados, não em tracing de mensagens individuais.
+*   **SAP:** Ambiente proprietário e robusto. O rastreio depende de transações específicas e, muitas vezes, de logs assíncronos.
+
+## 2. Capacidades Nativas de Logs, Métricas e Tracing
+
+### Sistema Legado
+*   **Logs:** Uso de frameworks como Serilog (.NET) ou Logback (Java) para logs estruturados.
+*   **Tracing:** Suporte nativo ou via SDKs para OpenTelemetry (OTel).
+
+### Informatica
+*   **Nativo:** Session Logs, Workflow Logs e Metadata Manager.
+*   **IICS (Cloud):** APIs de monitoramento e integração com CloudWatch/Azure Monitor.
+*   **PowerCenter (On-Prem):** Repositories em banco de dados SQL que podem ser consultados para extrair status de execução.
+
+### SAP
+*   **Logs Técnicos:** Transações `ST22` (Dumps), `SM21` (System Log), `SLG1` (Application Log).
+*   **Interface Tracking:** `WE02`/`WE05` (IDocs), `SRT_MONI` (Web Services), `SM59` (RFC).
+*   **Soluções SAP:** SAP Solution Manager (SolMan) e SAP Focused Run.
+
+## 3. Limitações e Riscos de Observabilidade
+
+*   **Quebra de Contexto:** O Informatica frequentemente consome uma mensagem e gera outra, perdendo o cabeçalho original se não houver mapeamento explícito.
+*   **Latência de Escrita:** Logs excessivos no SAP podem impactar a performance do banco de dados HANA.
+*   **Silos de Dados:** Cada ferramenta possui seu próprio visualizador de log, dificultando o troubleshooting em incidentes que cruzam as três camadas.
+
+## 4. Comparativo de Ferramentas Externas
+
+O foco aqui é centralizar os três pilares: **Logging, Metrics e Tracing**.
+
+|Ferramenta	|Tipo de Observabilidade	|Implementação	|Custo Estimado	|Escalabilidade	|Adequação ao Cenário|
+|----|----|-----|-----|-----|-----|
+|Datadog |Full Stack (Logs, Metrics, APM)	|Média (Possui conector SAP)	|Alto	|Excelente	|Ideal para missão crítica com SAP.|
+|ELK Stack |Logging e Search	|Alta (Complexo On-Prem)	|Médio (Infra)	|Alta	|Ótimo para análise de logs brutos.|
+|Grafana LGTM |Metrics, Logs, Tracing	|Média (Open Source/Cloud)	|Baixo/Médio	|Alta	|Melhor flexibilidade com OpenTelemetry.|
+|Zabbix |Infra e Métricas	|Baixa	|Baixo	|Média	|Limitado para tracing e logs de app.|
+|Azure Monitor|Cloud Native	|Baixa (se em Azure)	|Variável	|Alta	|Excelente para .NET/Java em Cloud.|
+
+## 5. Ranking das Soluções por Custo-Benefício
+
+1.  **Grafana LGTM Stack (Loki, Grafana, Tempo, Mimir):** **Vencedor.** Oferece a melhor flexibilidade para ambientes híbridos e suporte nativo a OpenTelemetry, permitindo unificar logs do Informatica e métricas do SAP em um único dashboard com custo de licenciamento reduzido.
+2.  **Datadog:** A melhor tecnicamente, especialmente pelo agente específico para SAP (ABAP metrics), mas o custo por host e volume de logs pode ser proibitivo em integrações de larga escala.
+3.  **ELK Stack (Elasticsearch, Logstash, Kibana):** Excelente para análise de logs, mas exige alta manutenção de infraestrutura (especialmente On-Premise) e falha em métricas de performance comparado às anteriores.
+
+---
+
+## 6. Estratégia Recomendada de Implementação
+
+A adoção do padrão **OpenTelemetry (OTel)** é a recomendação central. Ele permite que as aplicações enviem dados para um *Collector* central, que então distribui para a ferramenta de backend escolhida (Grafana, Datadog, etc.).
+
+*   **Camada Legada:** Implementar Auto-instrumentação OTel para capturar traces de entrada e saída.
+*   **Camada Informatica:** Configurar o Informatica para gravar o `Correlation ID` em tabelas de auditoria ou enviar via API para o Collector ao final de cada execução de workflow.
+*   **Camada SAP:** Utilizar o SDK de telemetria para ABAP (se disponível) ou configurar a leitura de logs via RFC/IDoc Status para alimentar o dashboard de observabilidade.
+
+---
+
+## 7. Padrão de Correlation ID e Fluxo de Propagação
+
+Para garantir a rastreabilidade ponta a ponta, deve-se adotar um identificador único universal (UUID).
+
+### Padrão de Propagação:
+1.  **Origem (Legado):** Se a requisição nasce aqui, o sistema gera um `X-Correlation-ID`.
+2.  **Middleware (Informatica):**
+    *   O Informatica deve receber este ID no cabeçalho (se REST) ou no payload (se Arquivo/DB).
+    *   **Regra de Ouro:** O ID deve ser mapeado como um campo de metadado em cada transformação.
+3.  **Destino (SAP):**
+    *   O ID deve ser persistido em um campo customizado (Z-field) nas tabelas do SAP ou incluído no campo de referência do cabeçalho do IDoc/Documento Contábil.
+
+---
+
+## 8. Boas Práticas de Monitoração e Troubleshooting
+
+*   **Logs Estruturados:** Todos os logs devem estar em formato JSON para facilitar o parsing automático.
+*   **Health Checks Ativos:** Implementar endpoints de `/health` no Legado e monitorar os serviços do Informatica e instâncias SAP via *Synthetic Monitoring*.
+*   **Alertas Inteligentes:** Configurar alertas baseados em desvios de latência (ex: Informatica levando 50% a mais de tempo que a média) em vez de apenas alertas de "erro/sucesso".
+*   **Auditoria vs Log:** Diferencie logs de depuração (técnicos) de logs de auditoria (negócio). O `Correlation ID` deve estar em ambos.
+
+---
+
+## 9. Conclusão e Recomendação Prática
+
+Para este cenário de tríplice integração, a recomendação é a **implementação de uma malha de observabilidade baseada em OpenTelemetry com visualização no Grafana**.
+
+**Passos imediatos:**
+1.  Padronizar o cabeçalho `X-Correlation-ID` em todos os contratos de interface.
+2.  Configurar um **OTel Collector** centralizado para receber dados tanto do ambiente On-Prem quanto Cloud.
+3.  Instrumentar o Informatica para que ele não apenas processe dados, mas também "noticie" o início e fim de cada tracking ID para o Collector.
+
+Essa abordagem maximiza a rastreabilidade, reduz o tempo médio de reparo (MTTR) em caso de falhas e evita o *vendor lock-in*, mantendo o custo operacional sob controle.
