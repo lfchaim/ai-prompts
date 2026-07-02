@@ -222,3 +222,231 @@ Dessa forma, no passo final de envio da Nota Fiscal, você poderá acessar os da
 
 Faz sentido essa estrutura de mapeamento local para o loop da sua engine?
 
+# Prompt
+Pode criar uma classe Java que processe essa estrutura e chamadas?  
+Utilize Map<String,Object> para manipulação dos dados.  
+O método deve receber dois JSON:  
+1. JSON com a configuração do orquestrador  
+2. JSON com o input de dados  
+
+# Gemini
+Aqui está um exemplo de implementação em Java utilizando `Map<String, Object>` para representar o contexto, os inputs e as configurações.
+
+Para manter o código limpo, focado na lógica de orquestração e independente de bibliotecas externas pesadas, utilizei a API nativa do Java (`HttpURLConnection` e `HttpClient` a partir do Java 11) e abstraí o parse inicial de JSON para `Map` (você pode usar Jackson ou Gson no seu projeto para converter as Strings JSON em `Map`).
+
+### Classe Java do Orquestrador
+
+```java
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+public class ApiOrchestrator {
+
+    private final HttpClient httpClient;
+
+    public ApiOrchestrator() {
+        this.httpClient = HttpClient.newHttpClient();
+    }
+
+    /**
+     * Método principal que processa a orquestração.
+     * @param config O JSON de configuração convertido em Map
+     * @param input O JSON de input com os dados iniciais convertido em Map
+     */
+    public Map<String, Object> execute(Map<String, Object> config, Map<String, Object> input) {
+        // Inicializa o contexto compartilhado
+        Map<String, Object> context = new HashMap<>();
+        
+        List<Map<String, Object>> steps = (List<Map<String, Object>>) config.get("steps");
+        if (steps == null) return context;
+
+        // Ordena os passos pelo step_number para garantir a sequência correta
+        steps.sort(Comparator.comparingInt(s -> (int) s.get("step_number")));
+
+        for (Map<String, Object> step : steps) {
+            String stepName = (String) step.get("name");
+            System.out.println("Executando Step: " + stepName);
+
+            Map<String, Object> requestConfig = (Map<String, Object>) step.get("request");
+            Map<String, Object> outputConfig = (Map<String, Object>) step.get("output");
+            String contextKey = (String) outputConfig.get("context_key");
+
+            // Verifica se o passo atual possui uma estrutura de Loop
+            if (step.containsKey("loop")) {
+                Map<String, Object> loopConfig = (Map<String, Object>) step.get("loop");
+                String iterablePath = (String) loopConfig.get("iterable");
+                String itemAlias = (String) loopConfig.get("item_alias");
+
+                // Resolve o array que deve ser iterado a partir do input/contexto
+                List<Map<String, Object>> itemsToIterate = (List<Map<String, Object>>) resolveTemplateString(iterablePath, input, context, null);
+                List<Map<String, Object>> aggregatedResults = new ArrayList<>();
+
+                for (Map<String, Object> currentItem : itemsToIterate) {
+                    // Executa a requisição passando o item atual do loop no escopo local
+                    Map<String, Object> response = executeHttpRequest(requestConfig, input, context, currentItem, itemAlias);
+                    aggregatedResults.add(response);
+                }
+
+                // Salva o array de resultados agregados no contexto
+                context.put(contextKey, aggregatedResults);
+            } else {
+                // Execução simples (Sem Loop)
+                Map<String, Object> response = executeHttpRequest(requestConfig, input, context, null, null);
+                context.put(contextKey, response);
+            }
+        }
+
+        return context;
+    }
+
+    /**
+     * Monta e executa a requisição HTTP substituindo as variáveis dinâmicas.
+     */
+    private Map<String, Object> executeHttpRequest(Map<String, Object> requestConfig, 
+                                                   Map<String, Object> input, 
+                                                   Map<String, Object> context, 
+                                                   Map<String, Object> currentLoopItem, 
+                                                   String itemAlias) {
+        
+        String method = (String) requestConfig.get("method");
+        String rawUrl = (String) requestConfig.get("url");
+        
+        // 1. Resolve a URL substituindo osplaceholders {{...}}
+        String resolvedUrl = (String) resolveTemplateString(rawUrl, input, context, currentLoopItem != null ? Map.of(itemAlias, currentLoopItem) : null);
+
+        // Adiciona Query Params na URL se existirem
+        if (requestConfig.containsKey("query_params")) {
+            Map<String, Object> queryParams = (Map<String, Object>) requestConfig.get("query_params");
+            StringJoiner sj = new StringJoiner("&", "?", "");
+            queryParams.forEach((k, v) -> {
+                Object resolvedVal = resolveTemplateString(v.toString(), input, context, currentLoopItem != null ? Map.of(itemAlias, currentLoopItem) : null);
+                sj.add(k + "=" + resolvedVal.toString());
+            });
+            resolvedUrl += sj.toString();
+        }
+
+        try {
+            HttpRequest.Builder requestBuilder = HttpRequest.newBuilder().uri(URI.create(resolvedUrl));
+
+            // 2. Resolve e aplica os Headers
+            if (requestConfig.containsKey("headers")) {
+                Map<String, String> headers = (Map<String, String>) requestConfig.get("headers");
+                headers.forEach((k, v) -> {
+                    String resolvedHeader = (String) resolveTemplateString(v, input, context, null);
+                    requestBuilder.header(k, resolvedHeader);
+                });
+            }
+
+            // 3. Resolve e aplica o Body (se aplicável)
+            if (Arrays.asList("POST", "PUT", "PATCH").contains(method.toUpperCase()) && requestConfig.containsKey("body")) {
+                Object bodyTemplate = requestConfig.get("body");
+                Object resolvedBody = bodyTemplate;
+                
+                // Se for uma String pura com template, resolve. Se for um mapa interno, precisaria de recursão (simplificado aqui)
+                if (bodyTemplate instanceof String) {
+                    resolvedBody = resolveTemplateString((String) bodyTemplate, input, context, currentLoopItem != null ? Map.of(itemAlias, currentLoopItem) : null);
+                } else if (bodyTemplate instanceof Map) {
+                    // Se passarmos o objeto direto ex: {"products": "{{input.items}}"}
+                    resolvedBody = resolveMapTemplates((Map<String, Object>) bodyTemplate, input, context, currentLoopItem != null ? Map.of(itemAlias, currentLoopItem) : null);
+                }
+                
+                // Aqui você converteria o 'resolvedBody' (Map ou List) para String JSON Real usando Jackson/Gson
+                String jsonBodyString = resolvedBody.toString(); 
+                requestBuilder.method(method, HttpRequest.BodyPublishers.ofString(jsonBodyString));
+            } else {
+                requestBuilder.method(method, HttpRequest.BodyPublishers.noBody());
+            }
+
+            // 4. Dispara a chamada HTTP
+            HttpResponse<String> response = httpClient.send(requestBuilder.build(), HttpResponse.BodyHandlers.ofString());
+
+            // Mock de conversão da resposta para o mapa do contexto
+            Map<String, Object> responseMap = new HashMap<>();
+            responseMap.put("status_code", response.statusCode());
+            // Nota: Em produção, faça o parse do response.body() de String para Map/List aqui
+            responseMap.put("body", response.body()); 
+
+            return responseMap;
+
+        } catch (Exception e) {
+            throw new RuntimeException("Falha ao executar step HTTP para a URL: " + resolvedUrl, e);
+        }
+    }
+
+    /**
+     * Mecanismo simples de Regex para varrer e substituir as tags {{input.xx}}, {{context.xx}} ou {{loop.xx}}
+     */
+    private Object resolveTemplateString(String template, Map<String, Object> input, Map<String, Object> context, Map<String, Object> loopScope) {
+        if (template == null) return null;
+        
+        // Atalho caso a string seja EXATAMENTE uma referência de objeto/array completo (ex: "{{input.items}}")
+        if (template.startsWith("{{") && template.endsWith("}}") && template.indexOf("}}") == template.length() - 2) {
+            String path = template.substring(2, template.length() - 2).trim();
+            return getValueByPath(path, input, context, loopScope);
+        }
+
+        // Caso seja um texto misto com variáveis na URL (ex: "/api/v1/customer/{{input.customer.id_customer}}")
+        Pattern pattern = Pattern.compile("\\{\\{([^}]+)\\}\\}");
+        Matcher matcher = pattern.matcher(template);
+        StringBuilder sb = new StringBuilder();
+
+        while (matcher.find()) {
+            String path = matcher.group(1).trim();
+            Object value = getValueByPath(path, input, context, loopScope);
+            matcher.appendReplacement(sb, value != null ? value.toString() : "");
+        }
+        matcher.appendTail(sb);
+        return sb.toString();
+    }
+
+    private Map<String, Object> resolveMapTemplates(Map<String, Object> sourceMap, Map<String, Object> input, Map<String, Object> context, Map<String, Object> loopScope) {
+        Map<String, Object> resolved = new HashMap<>();
+        for (Map.Entry<String, Object> entry : sourceMap.entrySet()) {
+            if (entry.getValue() instanceof String) {
+                resolved.put(entry.getKey(), resolveTemplateString((String) entry.getValue(), input, context, loopScope));
+            } else {
+                resolved.put(entry.getKey(), entry.getValue());
+            }
+        }
+        return resolved;
+    }
+
+    /**
+     * Navega recursivamente nos Maps baseando-se no path separado por pontos (Ex: input.customer.id_customer)
+     */
+    private Object getValueByPath(String path, Map<String, Object> input, Map<String, Object> context, Map<String, Object> loopScope) {
+        String[] parts = path.split("\\.");
+        Map<String, Object> currentScope;
+
+        // Identifica a raiz do escopo
+        if ("input".equals(parts[0])) currentScope = input;
+        else if ("context".equals(parts[0])) currentScope = context;
+        else if ("loop".equals(parts[0]) && loopScope != null) currentScope = loopScope;
+        else return null;
+
+        Object currentObj = currentScope;
+        for (int i = 1; i < parts.length; i++) {
+            if (currentObj instanceof Map) {
+                currentObj = ((Map<String, Object>) currentObj).get(parts[i]);
+            } else {
+                return null; // Caminho quebrado ou índice de array não tratado nesta versão simplificada
+            }
+        }
+        return currentObj;
+    }
+}
+
+```
+
+---
+
+### Principais Destaques da Implementação:
+
+1. **Separação de Escopo**: O método `getValueByPath` quebra strings como `input.customer.id_customer` e vai navegando de mapa em mapa (`map.get("customer")` -> `map.get("id_customer")`).
+2. **Suporte nativo ao Loop**: Se a tag `"loop"` for detectada na configuração do passo, ele captura o array do input, cria uma subiteração isolada e injeta o objeto atual sob o rótulo configurado (`item_alias: "current_item"`), permitindo que expressões do tipo `loop.current_item.id_product` funcionem em tempo de execução.
+3. **Estratégia de Agregação automática**: Caso o passo use loops, o retorno gerado não sobrepõe a chave do contexto; em vez disso, o motor cria um `ArrayList<Map<String, Object>>` acumulando as respostas de cada ciclo do loop para que fiquem disponíveis nos próximos passos.
