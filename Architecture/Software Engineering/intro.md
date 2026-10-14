@@ -90,7 +90,7 @@ Antes de qualquer padrão ou framework, o time deve dominar:
 Para facilitar a navegação do time, vou gerar um mapa mental com a estrutura completa dos tópicos:O mapa mental com os 7 eixos e seus subtópicos foi gerado — o time pode explorá-lo interativamente como referência rápida.
 
 ## Mapa Mental 
-```mermaid
+```mindmap
 {
   "colorOverridesByNodeId": {},
   "mindmap": {
