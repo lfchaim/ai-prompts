@@ -7040,3 +7040,5200 @@ Se quiser, posso:
 - Escrever o `deployment.yaml` do Kubernetes com probes usando `/actuator/health/liveness` e `/readiness`, `terminationGracePeriodSeconds` alinhado ao timeout do Spring e `PodDisruptionBudget`.
 - Criar o teste de carga com k6 exercitando `POST /v1/pedidos` e validando que o outbox não acumula backlog sob 2× o pico esperado.
 
+Os três itens formam uma cadeia de verificação: a **observabilidade** diz se o relay está acompanhando, o **Kubernetes** protege o que está em voo durante deploy, e o **k6** prova que os dois funcionam sob carga. Sem os três, cada um isolado mente.
+
+Antes de escrever, uma conta que muda o projeto — e que o teste de carga vai expor:
+
+Com `tamanho-lote: 50` e `intervalo-ms: 2000`, uma réplica processa **25 eventos/s**. Com 3 réplicas, **75/s**. Se a carga gera 80 pedidos/s, o backlog cresce 5/s — em 10 minutos são 3.000 eventos e a idade sobe sem parar. E há um teto pior: como o relay é serial por réplica e cada evento faz uma chamada HTTP com `read-timeout` de 3s, no pior caso uma réplica processa **1 evento a cada 3 segundos**. Três réplicas = 1 evento/s. Vou corrigir isso no item 1 e provar a correção no item 3.
+
+---
+
+# Parte VI — Observabilidade, Kubernetes e carga
+
+**Base:** Spring Boot 4.1 · Java 25 · PostgreSQL 17 · Prometheus · k6
+
+---
+
+## 1. Observabilidade do relay
+
+### 1.1 A métrica que importa é idade, não contagem
+
+Backlog de 50 eventos é normal se eles têm 200ms de idade. Cinco eventos com 40 minutos são incidente. **Contagem absoluta não diz nada; idade diz tudo.** Por isso a métrica de alerta é `outbox.evento.mais.antigo.segundos`.
+
+| Métrica | Tipo | Para que serve | Alerta |
+|---|---|---|---|
+| `outbox.eventos.pendentes` | Gauge | Dimensionar carga e HPA | Não |
+| `outbox.evento.mais.antigo.segundos` | Gauge | **Detectar relay parado ou lento** | Sim, > 300s por 5min |
+| `outbox.eventos.em.falha` | Gauge | Dead letter — precisa de intervenção humana | Sim, > 0 por 1min |
+| `outbox.eventos.processados` | Counter | Throughput real vs. produzido | Não |
+| `outbox.eventos.falhos` | Counter | Taxa de erro por handler | Sim, taxa > 5% |
+| `outbox.lote.duracao` | Timer | Detectar handler lento | p95 > 5s |
+| `outbox.lote.tamanho` | DistributionSummary | Verificar se o lote satura | Se sempre = tamanhoLote, há acúmulo |
+
+### 1.2 Instrumentação
+
+```java
+package br.com.empresa.pedidos.infrastructure.observability;
+
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
+import java.util.concurrent.atomic.AtomicLong;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+/**
+ * Gauges são lidos do scrape do Prometheus, que é frequente.
+ * Por isso o valor é calculado periodicamente aqui e o Gauge apenas
+ * devolve o último valor — nunca consulta o banco no scrape.
+ */
+@Component
+public class OutboxMetrics {
+
+    private final JdbcClient jdbc;
+    private final AtomicLong pendentes = new AtomicLong(0);
+    private final AtomicLong idadeSegundos = new AtomicLong(0);
+    private final AtomicLong emFalha = new AtomicLong(0);
+    private final Counter processados;
+    private final Counter falhos;
+    private final Timer duracaoLote;
+    private final DistributionSummary tamanhoLote;
+
+    public OutboxMetrics(JdbcClient jdbc, MeterRegistry registry) {
+        this.jdbc = jdbc;
+
+        Gauge.builder("outbox.eventos.pendentes", pendentes, AtomicLong::get)
+                .description("eventos aguardando publicação")
+                .register(registry);
+        Gauge.builder("outbox.evento.mais.antigo.segundos", idadeSegundos, AtomicLong::get)
+                .description("idade do evento PENDENTE mais antigo, em segundos")
+                .register(registry);
+        Gauge.builder("outbox.eventos.em.falha", emFalha, AtomicLong::get)
+                .description("eventos em dead letter aguardando reprocessamento")
+                .register(registry);
+
+        this.processados = Counter.builder("outbox.eventos.processados")
+                .description("eventos publicados com sucesso")
+                .register(registry);
+        this.falhos = Counter.builder("outbox.eventos.falhos")
+                .description("tentativas de publicação que falharam")
+                .register(registry);
+        this.duracaoLote = Timer.builder("outbox.lote.duracao")
+                .description("tempo total de um ciclo do relay")
+                .register(registry);
+        this.tamanhoLote = DistributionSummary.builder("outbox.lote.tamanho")
+                .description("eventos processados por ciclo")
+                .register(registry);
+    }
+
+    @Scheduled(fixedDelayString = "${app.outbox.metricas-intervalo-ms:10000}")
+    public void atualizar() {
+        var resumo = jdbc.sql("""
+                        select count(*) filter (where status = 'PENDENTE') as pendentes,
+                               coalesce(
+                                 cast(extract(epoch from
+                                   (now() - min(criado_em) filter (where status = 'PENDENTE'))
+                                 ) as bigint), 0) as idade,
+                               count(*) filter (where status = 'FALHA') as falhas
+                          from outbox_evento
+                         where status in ('PENDENTE', 'FALHA')
+                        """)
+                .query((rs, rowNum) -> new Resumo(
+                        rs.getLong("pendentes"), rs.getLong("idade"), rs.getLong("falhas")))
+                .single();
+
+        pendentes.set(resumo.pendentes());
+        idadeSegundos.set(resumo.idade());
+        emFalha.set(resumo.falhas());
+    }
+
+    public void registrarProcessado(long duracaoMs, int tamanho) {
+        processados.increment();
+        duracaoLote.record(java.time.Duration.ofMillis(duracaoMs));
+        tamanhoLote.record(tamanho);
+    }
+
+    public void registrarFalha() {
+        falhos.increment();
+    }
+
+    public long idadeSegundosAtual() {
+        return idadeSegundos.get();
+    }
+
+    public long emFalhaAtual() {
+        return emFalha.get();
+    }
+
+    private record Resumo(long pendentes, long idade, long falhas) {}
+}
+```
+
+A consulta precisa de um índice para o cálculo de `FALHA`. Adicione na `V3__outbox_indices.sql`:
+
+```sql
+create index idx_outbox_falha on outbox_evento (id) where status = 'FALHA';
+```
+
+Com isso, os dois `count(*) filter` usam índice parcial, e a query de métrica continua barata mesmo com a tabela em milhões de linhas — porque `PROCESSADO` nunca entra em índice.
+
+### 1.3 O gargalo que a métrica vai revelar, e a correção
+
+O relay original processa um lote por tick, serialmente. Dois tetos:
+
+**Teto 1 — lote fixo.** `50 eventos / 2s = 25 por segundo`, independentemente de haver trabalho.
+
+**Teto 2 — handler lento.** Serial, com `read-timeout` de 3s no pior caso, uma réplica publica **1 evento a cada 3 segundos**.
+
+O segundo é o que realmente machuca em incidente: quando o parceiro degrada, o relay para de drenar exatamente quando você mais precisa. Correção em dois movimentos:
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import br.com.empresa.pedidos.infrastructure.observability.OutboxMetrics;
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+public class OutboxRelay {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxRelay.class);
+
+    private final OutboxStore store;
+    private final OutboxProperties propriedades;
+    private final OutboxMetrics metricas;
+    private final Clock clock;
+
+    /** Virtual threads: o trabalho é I/O (banco + HTTP), não CPU. */
+    private final ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
+
+    /** Limite de eventos em voo, alinhado ao pool de conexão. */
+    private final Semaphore emVoo;
+
+    public OutboxRelay(
+            OutboxStore store,
+            OutboxProperties propriedades,
+            OutboxMetrics metricas,
+            Clock clock) {
+        this.store = store;
+        this.propriedades = propriedades;
+        this.metricas = metricas;
+        this.clock = clock;
+        this.emVoo = new Semaphore(propriedades.concorrencia());
+    }
+
+    @Scheduled(fixedDelayString = "${app.outbox.intervalo-ms:1000}")
+    public void despacharPendentes() {
+        int total = 0;
+        while (total < propriedades.maxPorCiclo()) {
+            var ids = store.idsPendentes(clock.instant(), propriedades.tamanhoLote());
+            if (ids.isEmpty()) {
+                return;
+            }
+            processarLote(ids);
+            total += ids.size();
+            if (ids.size() < propriedades.tamanhoLote()) {
+                return;
+            }
+        }
+        log.warn("outbox atingiu o limite por ciclo total={} — considere aumentar réplicas", total);
+    }
+
+    private void processarLote(java.util.List<Long> ids) {
+        var inicio = System.nanoTime();
+        var futuros = new ArrayList<Future<?>>(ids.size());
+
+        for (Long id : ids) {
+            emVoo.acquireUninterruptibly();
+            futuros.add(executor.submit(() -> {
+                try {
+                    store.processar(id);
+                } catch (RuntimeException e) {
+                    metricas.registrarFalha();
+                    log.warn("outbox falha inesperada id={}", id, e);
+                } finally {
+                    emVoo.release();
+                }
+            }));
+        }
+
+        // Barreira por ciclo: sem isso, a fila interna do executor cresce sem limite
+        // quando o parceiro degrada, e a memória vira o problema.
+        for (var futuro : futuros) {
+            try {
+                futuro.get();
+            } catch (Exception e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+
+        var duracaoMs = (System.nanoTime() - inicio) / 1_000_000;
+        metricas.registrarProcessado(duracaoMs, ids.size());
+    }
+}
+```
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+@ConfigurationProperties(prefix = "app.outbox")
+@Validated
+public record OutboxProperties(
+        @Min(1) @Max(500) int tamanhoLote,
+        @Min(1) @Max(20) int maxTentativas,
+        @Min(100) long intervaloMs,
+        @Min(1) @Max(64) int concorrencia,
+        @Min(50) @Max(20_000) int maxPorCiclo) {}
+```
+
+```yaml
+app:
+  outbox:
+    tamanho-lote: 50
+    max-tentativas: 5
+    intervalo-ms: 1000
+    concorrencia: 8
+    max-por-ciclo: 2000
+    metricas-intervalo-ms: 10000
+```
+
+Com `concorrencia: 8`, uma réplica processa até 8 eventos simultâneos. Com handler de 3s, isso é $$8 / 3 \approx 2{,}7$$ eventos/s por réplica e **8 eventos/s** com 3 réplicas. Ainda pouco para 80/s — mas agora o teto é **I/O do handler**, não arquitetura do relay. E é isso que o item 3 mede: se o handler não sustenta a taxa, nenhuma configuração de relay resolve; você precisa de batching na chamada externa ou de mais réplicas.
+
+Duas restrições que a `concorrencia` respeita:
+
+- **Pool de conexão.** Cada evento segura uma conexão durante `REQUIRES_NEW`. Com `maximum-pool-size: 20` e a API usando parte do pool, `concorrencia: 8` é o teto seguro. Subir além disso produz `connection-timeout` em vez de throughput.
+- **Barreira por ciclo.** Sem o `futuro.get()`, o executor acumula tarefas e você troca backlog no banco por `OutOfMemoryError`.
+
+### 1.4 Health indicator separado — e por que ele não entra nas probes
+
+```java
+package br.com.empresa.pedidos.infrastructure.observability;
+
+import br.com.empresa.pedidos.application.outbox.OutboxProperties;
+import org.springframework.boot.actuate.health.Health;
+import org.springframework.boot.actuate.health.HealthIndicator;
+import org.springframework.stereotype.Component;
+
+@Component("outbox")
+public class OutboxHealthIndicator implements HealthIndicator {
+
+    private final OutboxMetrics metricas;
+    private final OutboxProperties propriedades;
+
+    public OutboxHealthIndicator(OutboxMetrics metricas, OutboxProperties propriedades) {
+        this.metricas = metricas;
+        this.propriedades = propriedades;
+    }
+
+    @Override
+    public Health health() {
+        long idade = metricas.idadeSegundosAtual();
+        long falhas = metricas.emFalhaAtual();
+
+        if (falhas > 0) {
+            return Health.down()
+                    .withDetail("eventosEmFalha", falhas)
+                    .withDetail("acao", "verificar /v1/admin/outbox/falhas")
+                    .build();
+        }
+        if (idade > propriedades.idadeMaximaSegundos()) {
+            return Health.down().withDetail("idadeSegundos", idade).build();
+        }
+        return Health.up().withDetail("idadeSegundos", idade).build();
+    }
+}
+```
+
+**Regra dura:** este indicador **não** pertence aos grupos `liveness` nem `readiness`. Um relay lento é problema assíncrono — reiniciar o pod não resolve e ainda mata os eventos em voo. E remover o pod do balanceamento não faz sentido, porque a API continua saudável. Ele é exposto apenas em `/actuator/health/outbox` e consumido por alerta, não por probe.
+
+Isso só funciona porque os grupos declaram `include` explícito (seção 2.1). Se você usa o default, todo `HealthIndicator` entra em `readiness` e o relay lento derruba a API inteira para fora do serviço.
+
+### 1.5 Regras de alerta
+
+```yaml
+groups:
+  - name: outbox
+    rules:
+      - alert: OutboxIdadeAlta
+        expr: max(outbox_evento_mais_antigo_segundos) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Eventos pendentes há mais de 5 minutos"
+          runbook: "verificar handler lento e throughput do parceiro"
+
+      - alert: OutboxEmDeadLetter
+        expr: sum(outbox_eventos_em_falha) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Eventos em FALHA aguardando reprocessamento manual"
+
+      - alert: OutboxTaxaDeErroAlta
+        expr: |
+          sum(rate(outbox_eventos_falhos_total[5m]))
+            / clamp_min(sum(rate(outbox_eventos_processados_total[5m])), 0.001) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mais de 5% dos eventos falhando"
+
+      - alert: OutboxProducaoSemConsumo
+        expr: |
+          sum(rate(outbox_eventos_processados_total[10m])) == 0
+          and sum(outbox_eventos_pendentes) > 100
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Relay parado com fila acumulada"
+```
+
+`OutboxProducaoSemConsumo` é a regra que pega o cenário mais fácil de passar batido: o relay não está lançando exceção, não está lento — ele **não está rodando**. `@Scheduled` desabilitado, bean não carregado, perfil errado. Idade sobe, contagem sobe, nenhum erro aparece.
+
+### 1.6 Correlation ID por evento
+
+Quando um handler falha, você precisa ligar o log ao evento e à requisição que o originou. Propague no `MDC`:
+
+```java
+@Override
+@Transactional(propagation = Propagation.REQUIRES_NEW)
+public void processar(Long id) {
+    try (var eventoMdc = MDC.putCloseable("outboxEventId", String.valueOf(id))) {
+        var evento = jpa.travarPorId(id).orElseThrow();
+        if (evento.getStatus() != StatusOutbox.PENDENTE) {
+            return;
+        }
+        try {
+            dispatcher.despachar(new EventoOutbox(evento.getId(), evento.getTipo(), evento.getPayload()));
+            evento.marcarProcessado();
+        } catch (RuntimeException e) {
+            log.warn("outbox evento falhou id={} tentativas={}", id, evento.getTentativas(), e);
+            evento.registrarFalha(e.getMessage(), clock.instant(), propriedades.maxTentativas());
+        }
+    }
+}
+```
+
+Com o padrão de log configurado na Parte IV (`%X{correlationId:-}`), adicione `%X{outboxEventId:-}`:
+
+```yaml
+logging:
+  pattern:
+    level: "%5p [%X{correlationId:-}/%X{outboxEventId:-}]"
+```
+
+### 1.7 Reprocessamento de dead letter
+
+Evento em `FALHA` exige ação humana. Sem ferramenta, alguém vai rodar `UPDATE` manual em produção — e sem auditoria.
+
+```java
+package br.com.empresa.pedidos.infrastructure.web;
+
+import org.springframework.http.ResponseEntity;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+@RequestMapping("/v1/admin/outbox")
+public class OutboxAdminController {
+
+    private final JdbcClient jdbc;
+
+    public OutboxAdminController(JdbcClient jdbc) {
+        this.jdbc = jdbc;
+    }
+
+    @GetMapping("/falhas")
+    public ResponseEntity<?> listarFalhas() {
+        return ResponseEntity.ok(jdbc.sql("""
+                        select id, tipo, agregado_id, tentativas, ultimo_erro
+                          from outbox_evento
+                         where status = 'FALHA'
+                         order by id
+                         limit 100
+                        """)
+                .query()
+                .listOfRows());
+    }
+
+    @PostMapping("/{id}/reprocessar")
+    public ResponseEntity<Void> reprocessar(@PathVariable Long id) {
+        int linhas = jdbc.sql("""
+                        update outbox_evento
+                           set status = 'PENDENTE',
+                               tentativas = 0,
+                               disponivel_em = now(),
+                               ultimo_erro = null
+                         where id = :id and status = 'FALHA'
+                        """)
+                .param("id", id)
+                .update();
+        return linhas == 1 ? ResponseEntity.accepted().build() : ResponseEntity.notFound().build();
+    }
+}
+```
+
+Duas exigências de segurança, não opcionais: este endpoint precisa de autorização de operador (não de usuário de negócio) e precisa **deixar rastro** — registre em log estruturado quem reprocessou qual evento. `POST /v1/admin/outbox/{id}/reprocessar` sem controle de acesso é uma máquina de reenviar nota fiscal.
+
+---
+
+## 2. Kubernetes
+
+### 2.1 Configuração Spring que as probes exigem
+
+```yaml
+# application-kubernetes.yml
+spring:
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        liveness:
+          include: livenessState,ping
+        readiness:
+          include: readinessState,db
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+```
+
+O ponto crítico é o `include` explícito. Sem ele, o grupo `readiness` inclui **todos** os indicadores — e o `outbox` entra junto. Um relay lento tiraria a API inteira do balanceamento por um problema que não afeta servir requisições.
+
+`liveness` contém apenas `livenessState` e `ping`. **Nunca** coloque `db` em liveness: banco momentaneamente indisponível faria o Kubernetes reiniciar todos os pods em cascata, transformando uma indisponibilidade de 30s em um ciclo de restarts.
+
+### 2.2 `deployment.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pedidos-service
+  labels:
+    app.kubernetes.io/name: pedidos-service
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pedidos-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
+    spec:
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: pedidos-service
+      containers:
+        - name: app
+          image: registry.exemplo.com/pedidos-service:1.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: pedidos-service-config
+            - secretRef:
+                name: pedidos-service-secrets
+          env:
+            - name: JAVA_OPTS
+              value: >-
+                -XX:MaxRAMPercentage=75.0
+                -XX:+HeapDumpOnOutOfMemoryError
+                -XX:HeapDumpPath=/tmp/heapdump.hprof
+                -XX:+ExitOnOutOfMemoryError
+                -Duser.timezone=UTC
+                -Dfile.encoding=UTF-8
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 8"]
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+```
+
+### 2.3 `service.yaml` e `pdb.yaml`
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: pedidos-service
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: pedidos-service
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pedidos-service
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-service
+```
+
+### 2.4 A aritmética do shutdown gracioso
+
+Este é o ponto onde a maioria das configurações falha silenciosamente. Três números precisam estar na ordem certa:
+
+| Parâmetro | Valor | Papel |
+|---|---|---|
+| `preStop: sleep 8` | 8s | Esperar o endpoint sair do Service antes do SIGTERM |
+| `spring.lifecycle.timeout-per-shutdown-phase` | 30s | Drenar requisições em voo |
+| `terminationGracePeriodSeconds` | 45s | Teto total antes do SIGKILL |
+
+A relação obrigatória: **grace period > preStop + timeout do Spring**, com margem. `8 + 30 = 38`, sobra 7s de folga. Se o grace period for menor, o `SIGKILL` chega no meio do dreno e as requisições em curso — incluindo o commit de um pedido — morrem sem resposta.
+
+Dois detalhes que só aparecem em produção:
+
+**`sleep 8` no preStop não é superstição.** O Kubernetes remove o pod dos endpoints e envia `SIGTERM` quase ao mesmo tempo. Sem a pausa, o pod começa a drenar conexões enquanto o `kube-proxy` ainda roteia para ele — resultado: 502 intermitente em cada deploy. Oito segundos cobrem a propagação na maioria dos clusters.
+
+**`readOnlyRootFilesystem: true` quebra a JVM sem o `emptyDir`.** A JVM escreve arquivos temporários (`hsperfdata`, Tomcat multipart, heap dump). Com raiz somente leitura e sem volume em `/tmp`, você tem `NoSuchFileException` no boot. O volume está lá exatamente por isso.
+
+**`requests.memory == limits.memory`** dá QoS `Guaranteed` para memória — menos despejo sob pressão de nó — e torna `MaxRAMPercentage=75` determinístico: 1Gi de limite, 768 MB de heap, sempre o mesmo número.
+
+`maxUnavailable: 0` com `maxSurge: 1` garante que a capacidade nunca cai durante o rollout. Combine com o PDB `minAvailable: 2` para que drenagens de nó (manutenção, upgrade de cluster) também preservem capacidade.
+
+### 2.5 Duas réplicas rodando o relay — isso é seguro?
+
+Sim, e por design. O `SELECT ... FOR UPDATE` da Parte V garante que cada evento é processado por um único pod. O que **não** é seguro é o `@Scheduled` disparar em todos os pods ao mesmo tempo com o mesmo conjunto de IDs — e é justamente por isso que a trava fica na linha, não na leitura. Duas réplicas leem os mesmos IDs; apenas uma consegue o lock; a outra encontra `status != PENDENTE` e retorna sem efeito.
+
+---
+
+## 3. Carga com k6
+
+### 3.1 O que o teste precisa provar
+
+Latência é o menos interessante. O teste precisa provar três coisas:
+
+1. A API sustenta **2× o pico** sem degradar p95 além do SLO.
+2. O **relay acompanha a taxa de produção** — ou seja, a idade do evento mais antigo não cresce ao longo da janela.
+3. **Nenhum evento vai para dead letter** por timeout ou erro de handler.
+
+Se o item 2 falhar, você tem latência boa e backlog infinito — o cenário mais perigoso, porque todos os dashboards de API estão verdes.
+
+### 3.2 Seed
+
+```sql
+-- loadtest/seed.sql
+insert into cliente (id, nome)
+select g, 'Cliente ' || g
+from generate_series(1, 200) g
+on conflict (id) do nothing;
+```
+
+```bash
+psql "$DATABASE_URL" -f loadtest/seed.sql
+```
+
+### 3.3 `loadtest/pedidos.js`
+
+```javascript
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Counter } from 'k6/metrics';
+
+const criados = new Counter('pedidos_criados');
+const falharam = new Counter('pedidos_falharam');
+
+const BASE = __ENV.BASE_URL || 'http://localhost:8080';
+
+export const options = {
+  scenarios: {
+    criacao: {
+      executor: 'ramping-arrival-rate',
+      startRate: 5,
+      timeUnit: '1s',
+      preAllocatedVUs: 60,
+      maxVUs: 400,
+      stages: [
+        { target: 20, duration: '1m' },
+        { target: 80, duration: '2m' },
+        { target: 80, duration: '10m' },
+        { target: 0, duration: '1m' },
+      ],
+    },
+    listagem: {
+      executor: 'constant-arrival-rate',
+      rate: 30,
+      timeUnit: '1s',
+      duration: '14m',
+      startTime: '1m',
+      preAllocatedVUs: 20,
+      maxVUs: 80,
+      exec: 'listar',
+    },
+  },
+  thresholds: {
+    http_req_failed: ['rate<0.01'],
+    'http_req_duration{scenario:criacao}': ['p(95)<400', 'p(99)<900'],
+    'http_req_duration{scenario:listagem}': ['p(95)<250', 'p(99)<600'],
+    pedidos_criados: ['count>40000'],
+  },
+};
+
+export default function () {
+  const clienteId = 1 + (__ITER % 200);
+  const sku = `SKU-${(__ITER % 20) + 1}`;
+
+  const payload = JSON.stringify({
+    clienteId,
+    itens: [
+      { sku, quantidade: 1 + (__ITER % 3), precoUnitario: 19.9 },
+    ],
+  });
+
+  const res = http.post(`${BASE}/v1/pedidos`, payload, {
+    headers: { 'Content-Type': 'application/json' },
+    tags: { nome: 'criar' },
+  });
+
+  const ok = check(res, {
+    'status 201': (r) => r.status === 201,
+    'Location presente': (r) => !!r.headers['Location'],
+    'corpo tem id': (r) => {
+      try {
+        return typeof r.json('id') === 'number';
+      } catch (_) {
+        return false;
+      }
+    },
+  });
+
+  if (ok) {
+    criados.add(1);
+  } else {
+    falharam.add(1);
+  }
+}
+
+export function listar() {
+  const res = http.get(`${BASE}/v1/pedidos?status=PENDENTE&page=0&size=20`, {
+    tags: { nome: 'listar' },
+  });
+  check(res, {
+    'listagem 200': (r) => r.status === 200,
+    'contrato de paginação': (r) => {
+      try {
+        const corpo = r.json();
+        return Array.isArray(corpo.conteudo) && typeof corpo.total === 'number';
+      } catch (_) {
+        return false;
+      }
+    },
+  });
+}
+```
+
+`ramping-arrival-rate` em vez de `constant-vus` é deliberado: você quer controlar **taxa**, não usuários simultâneos. Se a API desacelerar, VUs constantes geram menos requisições e escondem o problema; taxa constante aplica pressão real e revela o enfileiramento.
+
+### 3.4 Verificação do backlog
+
+O k6 não consulta o banco. A verificação vem depois, com Prometheus ou direto no PostgreSQL.
+
+```bash
+#!/usr/bin/env bash
+# loadtest/verificar-backlog.sh
+set -euo pipefail
+
+PROM_URL="${PROM_URL:-http://localhost:9090}"
+LIMITE_IDADE="${LIMITE_IDADE:-300}"
+LIMITE_FALHA="${LIMITE_FALHA:-0}"
+
+consulta() {
+  curl -fsS --get "$PROM_URL/api/v1/query" --data-urlencode "query=$1" \
+    | jq -r '.data.result[0].value[1] // "0"'
+}
+
+idade=$(consulta 'max(outbox_evento_mais_antigo_segundos)')
+falhas=$(consulta 'sum(outbox_eventos_em_falha)')
+processados=$(consulta 'sum(increase(outbox_eventos_processados_total[15m]))')
+pendentes=$(consulta 'sum(outbox_eventos_pendentes)')
+
+echo "pendentes:                ${pendentes}"
+echo "idade do mais antigo:     ${idade}s"
+echo "processados (15m):        ${processados}"
+echo "em dead letter:           ${falhas}"
+
+status=0
+
+if [ "$(echo "$idade > $LIMITE_IDADE" | bc -l)" -eq 1 ]; then
+  echo "FALHA: backlog não drenou (idade ${idade}s > ${LIMITE_IDADE}s)"
+  status=1
+fi
+
+if [ "$(echo "$falhas > $LIMITE_FALHA" | bc -l)" -eq 1 ]; then
+  echo "FALHA: existem eventos em dead letter"
+  status=1
+fi
+
+[ "$status" -eq 0 ] && echo "OK: relay acompanhou a carga"
+exit "$status"
+```
+
+Versão sem Prometheus, para rodar em ambiente de teste:
+
+```bash
+#!/usr/bin/env bash
+# loadtest/verificar-backlog-db.sh
+set -euo pipefail
+
+idade=$(psql "$DATABASE_URL" -tAc "
+  select coalesce(cast(extract(epoch from now() - min(criado_em)) as bigint), 0)
+    from outbox_evento where status = 'PENDENTE'")
+
+falhas=$(psql "$DATABASE_URL" -tAc "
+  select count(*) from outbox_evento where status = 'FALHA'")
+
+echo "idade do evento mais antigo: ${idade}s"
+echo "eventos em FALHA: ${falhas}"
+
+[ "$idade" -le 300 ] || { echo "FALHA: backlog não drenou"; exit 1; }
+[ "$falhas" -eq 0 ] || { echo "FALHA: dead letter presente"; exit 1; }
+echo "OK: relay acompanhou a carga"
+```
+
+### 3.5 Execução e leitura dos resultados
+
+```bash
+# stack local com Prometheus
+docker compose -f compose.yaml -f compose.loadtest.yaml up -d
+
+psql "$DATABASE_URL" -f loadtest/seed.sql
+
+k6 run \
+  -e BASE_URL=http://localhost:8080 \
+  --out experimental-prometheus-rw \
+  loadtest/pedidos.js
+
+# aguardar o dreno antes de verificar
+sleep 60
+./loadtest/verificar-backlog.sh
+```
+
+Interpretação — o que cada combinação de resultado significa:
+
+| Sintoma | Diagnóstico | Ação |
+|---|---|---|
+| p95 OK, idade crescendo | Relay não acompanha a taxa | Aumentar `concorrencia`/réplicas, ou batching na chamada externa |
+| p95 alto na listagem, idade OK | N+1 ou índice faltando | Rodar `EXPLAIN`, conferir guardrail de queries |
+| WRITE p95 alto, CPU baixa | Pool saturado | `hikari.leak-detection`, dimensionar pool |
+| Idade sobe e `outbox.eventos.processados` = 0 | Relay não está rodando | `@EnableScheduling`, bean, perfil |
+| Dead letter > 0 | Handler falhando sob carga | Investigar `ultimo_erro`; provável timeout de parceiro |
+| Falhas sob carga só no pico | Throttling do parceiro externo | Circuit breaker e backoff do item 2 da Parte V |
+
+Um resultado que vale registrar como critério de aceite: **`outbox.eventos.processados_total` deve crescer na mesma ordem de grandeza que `pedidos_criados`**, com defasagem de segundos. Se a razão cair abaixo de 1 e continuar caindo, o relay é o gargalo — e o teste cumpriu o papel antes do incidente.
+
+---
+
+## Resumindo
+
+- **Idade do evento mais antigo é a métrica de alerta, não a contagem.** Backlog pequeno e antigo é incidente; backlog grande e recente é normal.
+- **O relay tinha dois tetos reais:** lote fixo de 25 eventos/s por réplica e processamento serial dominado por `read-timeout` de 3s. Virtual threads com `concorrencia: 8` e barreira por ciclo elevam o teto e mantêm a memória controlada.
+- **O health indicator de outbox não entra em liveness nem readiness.** Relay lento é problema assíncrono: reiniciar mata eventos em voo, e remover do balanceamento pune uma API saudável.
+- **A regra `OutboxProducaoSemConsumo` pega o cenário invisível** — relay parado, sem exceção, com fila acumulando.
+- **A aritmética do shutdown é a parte que falha em silêncio:** `terminationGracePeriodSeconds (45) > preStop (8) + timeout do Spring (30)`; invertido, o `SIGKILL` trunca o commit e o usuário recebe 502 em cada deploy.
+- **`readOnlyRootFilesystem` sem o `emptyDir` em `/tmp` quebra a JVM no boot**, e `requests.memory == limits.memory` é o que torna `MaxRAMPercentage` determinístico.
+- **O k6 mede o que os dashboards de API não medem:** latência boa com backlog infinito é o pior cenário, e só `verificar-backlog.sh` revela isso.
+- **`ramping-arrival-rate` controla taxa, não VUs** — o que aplica pressão real e expõe enfileiramento que VUs constantes escondem.
+
+Se quiser, posso:
+
+- Escrever o `compose.loadtest.yaml` com Prometheus, Grafana e o dashboard JSON do relay (idade, throughput, dead letter e latência dos handlers em um painel só).
+- Adicionar batching na chamada externa do handler, que é o próximo gargalo real quando a concorrência do relay não basta.
+- Criar o `HPA` baseado em `outbox.eventos.pendentes` em vez de CPU, já que o relay é I/O-bound e a CPU nunca sobe.
+
+Os três itens fecham o ciclo: o stack local prova o comportamento, o batching remove o gargalo que o teste revelou, e o HPA garante que a correção escale sozinha. Começo pelo que mede.
+
+---
+
+# Parte VII — Stack de medição, batching e autoescala
+
+**Base:** Spring Boot 4.1 · Java 25 · Prometheus 3 · Grafana 11 · k6
+
+---
+
+## 1. Stack de observabilidade local
+
+### 1.1 `compose.loadtest.yaml`
+
+Arquivo de override — não substitui o `compose.yaml` da Parte V, soma a ele.
+
+```yaml
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.enable-remote-write-receiver
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.5.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+  k6:
+    image: grafana/k6:0.57.0
+    volumes:
+      - ./loadtest:/loadtest:ro
+    environment:
+      BASE_URL: http://app:8080
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_TREND_STATS: p(95),p(99),max
+    command: ["run", "--out", "experimental-prometheus-rw", "/loadtest/pedidos.js"]
+    depends_on:
+      - app
+      - prometheus
+    profiles:
+      - loadtest
+
+volumes:
+  promdata:
+  grafanadata:
+```
+
+`--web.enable-remote-write-receiver` é obrigatório: sem ele, o k6 recebe 404 ao tentar enviar métricas. E `K6_PROMETHEUS_RW_TREND_STATS` define quais percentis são exportados — sem isso você só tem médias, que escondem exatamente a cauda que importa.
+
+### 1.2 `infra/prometheus/prometheus.yml`
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    ambiente: local
+
+scrape_configs:
+  - job_name: pedidos-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['app:8080']
+        labels:
+          servico: pedidos-service
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ['localhost:9090']
+```
+
+Se você roda a aplicação fora do Docker (`mvn spring-boot:run`), troque o target por `host.docker.internal:8080` e adicione `extra_hosts: ["host.docker.internal:host-gateway"]` no serviço do Prometheus.
+
+### 1.3 Provisioning do Grafana
+
+`infra/grafana/provisioning/datasources/prometheus.yml`
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      timeInterval: 15s
+```
+
+`infra/grafana/provisioning/dashboards/default.yml`
+
+```yaml
+apiVersion: 1
+
+providers:
+  - name: pedidos
+    folder: Pedidos
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+### 1.4 `infra/grafana/dashboards/outbox.json`
+
+```json
+{
+  "uid": "outbox-relay",
+  "title": "Outbox Relay — Pedidos",
+  "tags": ["pedidos", "outbox"],
+  "timezone": "browser",
+  "editable": true,
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "servico",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(outbox_eventos_pendentes, servico)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Idade do evento mais antigo",
+      "description": "Métrica de alerta principal. Backlog pequeno e antigo é incidente; grande e recente é normal.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 60 },
+              { "color": "orange", "value": 180 },
+              { "color": "red", "value": 300 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "max(outbox_evento_mais_antigo_segundos{servico=~\"$servico\"})",
+          "legendFormat": "idade máxima",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Backlog pendente",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 20 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(outbox_eventos_pendentes{servico=~\"$servico\"})",
+          "legendFormat": "pendentes",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Dead letter",
+      "description": "Qualquer valor acima de zero exige intervenção humana.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "colorMode": "background", "graphMode": "area", "textMode": "auto" },
+      "targets": [
+        {
+          "expr": "sum(outbox_eventos_em_falha{servico=~\"$servico\"})",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Throughput — produzidos vs. publicados",
+      "description": "As duas linhas devem caminhar juntas. Divergência sustentada = relay é o gargalo.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "ops", "custom": { "lineWidth": 2, "fillOpacity": 0 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(outbox_eventos_processados_total{servico=~\"$servico\"}[1m]))",
+          "legendFormat": "publicados/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(http_server_requests_seconds_count{servico=~\"$servico\",uri=\"/v1/pedidos\",method=\"POST\"}[1m]))",
+          "legendFormat": "criados/s",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Latência do ciclo do relay",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "s", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(outbox_lote_duracao_seconds_bucket{servico=~\"$servico\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(outbox_lote_duracao_seconds_bucket{servico=~\"$servico\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Taxa de erro por handler",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(outbox_eventos_falhos_total{servico=~\"$servico\"}[5m])) / clamp_min(sum(rate(outbox_eventos_processados_total{servico=~\"$servico\"}[5m])), 0.001)",
+          "legendFormat": "taxa de falha",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Tamanho do lote por ciclo",
+      "description": "Se a linha encosta no tamanhoLote configurado, há acúmulo e o relay está saturado.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 20 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "avg(outbox_lote_tamanho{servico=~\"$servico\"})",
+          "legendFormat": "média",
+          "refId": "A"
+        },
+        {
+          "expr": "max(outbox_lote_tamanho{servico=~\"$servico\"})",
+          "legendFormat": "máximo",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Réplicas e conexões do pool",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "lineWidth": 2, "fillOpacity": 10 } },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "count(up{job=\"pedidos-service\"} == 1)",
+          "legendFormat": "réplicas",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(hikaricp_connections_active{servico=~\"$servico\"})",
+          "legendFormat": "conexões ativas",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(hikaricp_connections_pending{servico=~\"$servico\"})",
+          "legendFormat": "aguardando conexão",
+          "refId": "C"
+        }
+      ]
+    }
+  ]
+}
+```
+
+O painel 8 é o que explica a maioria dos incidentes de throughput: se `aguardando conexão` sobe enquanto `réplicas` está estável, o pool é o gargalo — e aumentar `concorrencia` do relay piora, não melhora.
+
+### 1.5 Execução
+
+```bash
+docker compose -f compose.yaml -f compose.loadtest.yaml up -d
+psql "$DATABASE_URL" -f loadtest/seed.sql
+docker compose -f compose.yaml -f compose.loadtest.yaml --profile loadtest run --rm k6
+```
+
+Grafana em `http://localhost:3000`, dashboard "Outbox Relay — Pedidos" já provisionado.
+
+---
+
+## 2. Batching na chamada externa
+
+### 2.1 A aritmética que obriga a mudar
+
+Com o relay da Parte VI (`concorrencia: 8`, handler de 3s no pior caso), uma réplica publica:
+
+$$\frac{8}{3} \approx 2{,}7 \text{ eventos/s}$$
+
+Três réplicas: **8 eventos/s**. Para 80 pedidos/s, o backlog cresce 72/s. Nenhuma configuração de relay resolve — o teto é a chamada externa.
+
+Com lote de 25:
+
+$$\frac{8 \times 25}{3} \approx 66{,}7 \text{ eventos/s por réplica}$$
+
+Três réplicas: **200/s**. O mesmo código, o mesmo timeout, **25× mais throughput**.
+
+E há um detalhe que torna isso barato aqui: **a tabela de outbox já é a fila.** Você não precisa de janela de batching, coletor com `maxWaitMs` ou buffer em memória. Basta ler 25 linhas em vez de 1. Essa é a vantagem de ter escolhido outbox em vez de evento em memória.
+
+### 2.2 O contrato de lote
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Handler que processa vários eventos em uma única chamada externa.
+ * Contrato: o mapa devolvido precisa conter TODAS as chaves recebidas.
+ * Item ausente é tratado como falha — nunca como sucesso.
+ */
+public interface EventoBatchHandler {
+
+    String tipo();
+
+    int tamanhoMaximoLote();
+
+    Map<Long, ResultadoItem> tratar(List<EventoOutbox> eventos);
+}
+```
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+public record ResultadoItem(boolean sucesso, String erro) {
+
+    public static ResultadoItem ok() {
+        return new ResultadoItem(true, null);
+    }
+
+    public static ResultadoItem falha(String erro) {
+        return new ResultadoItem(false, erro);
+    }
+}
+```
+
+A regra "item ausente é falha" é a decisão mais importante do contrato. A alternativa — tratar ausência como sucesso — produz exatamente o bug que você não quer: evento marcado como publicado que nunca chegou ao parceiro.
+
+### 2.3 Dispatcher com roteamento
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EventoDispatcher {
+
+    private final Map<String, EventoHandler> individuais;
+    private final Map<String, EventoBatchHandler> emLote;
+
+    public EventoDispatcher(List<EventoHandler> individuais, List<EventoBatchHandler> emLote) {
+        this.individuais =
+                individuais.stream()
+                        .collect(Collectors.toMap(EventoHandler::tipo, Function.identity()));
+        this.emLote =
+                emLote.stream()
+                        .collect(Collectors.toMap(EventoBatchHandler::tipo, Function.identity()));
+    }
+
+    public boolean suportaLote(String tipo) {
+        return emLote.containsKey(tipo);
+    }
+
+    public int tamanhoMaximoLote(String tipo) {
+        var handler = emLote.get(tipo);
+        return handler == null ? 1 : handler.tamanhoMaximoLote();
+    }
+
+    public Map<Long, ResultadoItem> despacharLote(String tipo, List<EventoOutbox> eventos) {
+        var handler = emLote.get(tipo);
+        if (handler == null) {
+            throw new IllegalStateException("nenhum handler de lote registrado para " + tipo);
+        }
+        return handler.tratar(eventos);
+    }
+
+    public void despachar(EventoOutbox evento) {
+        var handler = individuais.get(evento.tipo());
+        if (handler == null) {
+            throw new IllegalStateException("nenhum handler registrado para " + evento.tipo());
+        }
+        handler.tratar(evento);
+    }
+}
+```
+
+Um tipo pode ter handler individual **e** de lote. O relay prefere o de lote quando existe — e o individual continua servindo para reprocessamento manual de um único evento em dead letter.
+
+### 2.4 O store com processamento em lote
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import java.time.Instant;
+import java.util.List;
+
+public interface OutboxStore {
+
+    List<Long> idsPendentes(Instant agora, int tamanho);
+
+    void processar(Long id);
+
+    void processarLote(List<Long> ids);
+
+    void falhar(Long id, String erro);
+}
+```
+
+```java
+package br.com.empresa.pedidos.infrastructure.persistence.outbox;
+
+import br.com.empresa.pedidos.application.outbox.EventoDispatcher;
+import br.com.empresa.pedidos.application.outbox.EventoOutbox;
+import br.com.empresa.pedidos.application.outbox.OutboxProperties;
+import br.com.empresa.pedidos.application.outbox.OutboxStore;
+import br.com.empresa.pedidos.application.outbox.ResultadoItem;
+import java.time.Clock;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Propagation;
+import org.springframework.transaction.annotation.Transactional;
+
+@Repository
+public class OutboxStoreAdapter implements OutboxStore {
+
+    private static final Logger log = LoggerFactory.getLogger(OutboxStoreAdapter.class);
+
+    private final OutboxJpaRepository jpa;
+    private final EventoDispatcher dispatcher;
+    private final OutboxProperties propriedades;
+    private final Clock clock;
+
+    public OutboxStoreAdapter(
+            OutboxJpaRepository jpa,
+            EventoDispatcher dispatcher,
+            OutboxProperties propriedades,
+            Clock clock) {
+        this.jpa = jpa;
+        this.dispatcher = dispatcher;
+        this.propriedades = propriedades;
+        this.clock = clock;
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<Long> idsPendentes(Instant agora, int tamanho) {
+        return jpa.idsPendentes(agora, tamanho);
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processar(Long id) {
+        var evento = jpa.travarPorId(id).orElseThrow();
+        if (evento.getStatus() != StatusOutbox.PENDENTE) {
+            return;
+        }
+        try {
+            dispatcher.despachar(new EventoOutbox(evento.getId(), evento.getTipo(), evento.getPayload()));
+            evento.marcarProcessado();
+        } catch (RuntimeException e) {
+            log.warn("outbox evento falhou id={} tentativas={}", id, evento.getTentativas(), e);
+            evento.registrarFalha(e.getMessage(), clock.instant(), propriedades.maxTentativas());
+        }
+    }
+
+    /**
+     * Uma transação para o lote inteiro, mas resultado individual por evento.
+     * O lock é adquirido em ordem de id para evitar deadlock entre réplicas.
+     */
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void processarLote(List<Long> ids) {
+        if (ids.isEmpty()) {
+            return;
+        }
+
+        var travados = jpa.travarTodosPorId(ids).stream()
+                .filter(evento -> evento.getStatus() == StatusOutbox.PENDENTE)
+                .toList();
+
+        if (travados.isEmpty()) {
+            return;
+        }
+
+        var porTipo = travados.stream().collect(Collectors.groupingBy(
+                OutboxEventoJpa::getTipo, LinkedHashMap::new, Collectors.toList()));
+
+        porTipo.forEach(this::processarGrupo);
+    }
+
+    private void processarGrupo(String tipo, List<OutboxEventoJpa> grupo) {
+        if (!dispatcher.suportaLote(tipo)) {
+            grupo.forEach(evento -> processarIndividual(evento, tipo));
+            return;
+        }
+
+        int maximo = dispatcher.tamanhoMaximoLote(tipo);
+        for (int inicio = 0; inicio < grupo.size(); inicio += maximo) {
+            int fim = Math.min(inicio + maximo, grupo.size());
+            processarParticao(tipo, grupo.subList(inicio, fim));
+        }
+    }
+
+    private void processarParticao(String tipo, List<OutboxEventoJpa> particao) {
+        var eventos =
+                particao.stream()
+                        .map(e -> new EventoOutbox(e.getId(), e.getTipo(), e.getPayload()))
+                        .toList();
+
+        Map<Long, ResultadoItem> resultados;
+        try {
+            resultados = dispatcher.despacharLote(tipo, eventos);
+        } catch (RuntimeException e) {
+            // Falha de transporte: o lote inteiro volta para retry.
+            log.warn("outbox lote falhou tipo={} tamanho={}", tipo, particao.size(), e);
+            particao.forEach(evento ->
+                    evento.registrarFalha(e.getMessage(), clock.instant(), propriedades.maxTentativas()));
+            return;
+        }
+
+        for (var evento : particao) {
+            var resultado = resultados.get(evento.getId());
+            if (resultado == null) {
+                evento.registrarFalha(
+                        "handler não retornou resultado para o evento",
+                        clock.instant(),
+                        propriedades.maxTentativas());
+            } else if (resultado.sucesso()) {
+                evento.marcarProcessado();
+            } else {
+                evento.registrarFalha(resultado.erro(), clock.instant(), propriedades.maxTentativas());
+            }
+        }
+    }
+
+    private void processarIndividual(OutboxEventoJpa evento, String tipo) {
+        try {
+            dispatcher.despachar(new EventoOutbox(evento.getId(), tipo, evento.getPayload()));
+            evento.marcarProcessado();
+        } catch (RuntimeException e) {
+            evento.registrarFalha(e.getMessage(), clock.instant(), propriedades.maxTentativas());
+        }
+    }
+
+    @Override
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void falhar(Long id, String erro) {
+        jpa.travarPorId(id)
+                .ifPresent(evento ->
+                        evento.registrarFalha(erro, clock.instant(), propriedades.maxTentativas()));
+    }
+}
+```
+
+Quatro decisões que sustentam a correção:
+
+**Lock em ordem de id.** `travarTodosPorId` ordena por `id`. Sem isso, duas réplicas que travam `{5, 3}` e `{3, 5}` se bloqueiam mutuamente — deadlock clássico, e o PostgreSQL resolve matando uma das transações.
+
+**Falha de transporte marca o lote inteiro.** Se o `POST` em lote falhou por timeout, não há informação sobre itens individuais. Todos voltam para retry com backoff. Correto e conservador.
+
+**Resultado ausente é falha.** O `resultado == null` não é paranoia: é a proteção contra handler que devolve mapa incompleto. Sem isso, o evento ficaria `PENDENTE` para sempre, sem erro e sem retry — o pior estado possível.
+
+**Uma transação por lote, não por evento.** Com 25 eventos, você passa de 25 transações para 1. Isso reduz round-trips de commit e libera o pool mais rápido.
+
+### 2.5 Repositório com lock ordenado
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select o from OutboxEventoJpa o where o.id in :ids order by o.id")
+List<OutboxEventoJpa> travarTodosPorId(@Param("ids") List<Long> ids);
+```
+
+O `order by o.id` no JPQL é o que garante a ordem de aquisição de lock. Não é otimização — é correção.
+
+### 2.6 O handler de nota fiscal em lote
+
+```java
+package br.com.empresa.pedidos.domain.port.out;
+
+import java.util.List;
+
+public interface NotaFiscalGateway {
+
+    RespostaEmLote emitirEmLote(List<ItemNota> itens);
+
+    record ItemNota(long chaveIdempotencia, Long pedidoId) {}
+
+    record ResultadoNota(long chaveIdempotencia, boolean sucesso, String erro) {}
+
+    record RespostaEmLote(List<ResultadoNota> resultados) {}
+}
+```
+
+```java
+package br.com.empresa.pedidos.application.outbox.handler;
+
+import br.com.empresa.pedidos.application.outbox.EventoBatchHandler;
+import br.com.empresa.pedidos.application.outbox.EventoOutbox;
+import br.com.empresa.pedidos.application.outbox.ResultadoItem;
+import br.com.empresa.pedidos.domain.event.PedidoEvento;
+import br.com.empresa.pedidos.domain.port.out.NotaFiscalGateway;
+import br.com.empresa.pedidos.infrastructure.persistence.outbox.EventoJson;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EmitirNotaFiscalBatchHandler implements EventoBatchHandler {
+
+    private static final int TAMANHO_MAXIMO = 25;
+
+    private final NotaFiscalGateway notaFiscal;
+    private final EventoJson json;
+
+    public EmitirNotaFiscalBatchHandler(NotaFiscalGateway notaFiscal, EventoJson json) {
+        this.notaFiscal = notaFiscal;
+        this.json = json;
+    }
+
+    @Override
+    public String tipo() {
+        return "pedido.aprovado";
+    }
+
+    @Override
+    public int tamanhoMaximoLote() {
+        return TAMANHO_MAXIMO;
+    }
+
+    @Override
+    public Map<Long, ResultadoItem> tratar(List<EventoOutbox> eventos) {
+        var itens =
+                eventos.stream()
+                        .map(evento -> new NotaFiscalGateway.ItemNota(
+                                evento.id(),
+                                json.ler(evento.payload(), PedidoEvento.Aprovado.class)
+                                        .pedidoId()
+                                        .valor()))
+                        .toList();
+
+        var resposta = notaFiscal.emitirEmLote(itens);
+
+        Map<Long, ResultadoItem> porEvento =
+                resposta.resultados().stream()
+                        .collect(Collectors.toMap(
+                                NotaFiscalGateway.ResultadoNota::chaveIdempotencia,
+                                resultado -> resultado.sucesso()
+                                        ? ResultadoItem.ok()
+                                        : ResultadoItem.falha(resultado.erro()),
+                                (primeiro, segundo) -> primeiro,
+                                LinkedHashMap::new));
+
+        // Item sem resposta do parceiro é falha, nunca sucesso silencioso.
+        eventos.stream()
+                .map(EventoOutbox::id)
+                .filter(id -> !porEvento.containsKey(id))
+                .forEach(id -> porEvento.put(id, ResultadoItem.falha("parceiro não retornou resultado")));
+
+        return porEvento;
+    }
+}
+```
+
+A chave de idempotência é o **id do evento no outbox**, não o id do pedido. Isso é o que permite retry seguro: o mesmo evento reenviado carrega a mesma chave, e o parceiro descarta a duplicata. Se você usasse o id do pedido, um segundo evento legítimo sobre o mesmo pedido seria descartado como duplicata.
+
+### 2.7 O relay usando lote
+
+```java
+@Scheduled(fixedDelayString = "${app.outbox.intervalo-ms:1000}")
+public void despacharPendentes() {
+    int total = 0;
+    while (total < propriedades.maxPorCiclo()) {
+        var ids = store.idsPendentes(clock.instant(), propriedades.tamanhoLote());
+        if (ids.isEmpty()) {
+            return;
+        }
+        processarLote(ids);
+        total += ids.size();
+        if (ids.size() < propriedades.tamanhoLote()) {
+            return;
+        }
+    }
+}
+
+private void processarLote(java.util.List<Long> ids) {
+    var inicio = System.nanoTime();
+    try {
+        store.processarLote(ids);
+    } catch (RuntimeException e) {
+        metricas.registrarFalha();
+        log.warn("outbox lote falhou tamanho={}", ids.size(), e);
+    } finally {
+        var duracaoMs = (System.nanoTime() - inicio) / 1_000_000;
+        metricas.registrarProcessado(duracaoMs, ids.size());
+    }
+}
+```
+
+Com batching, `concorrencia` deixa de ser o parâmetro crítico: cada chamada já move 25 eventos. Reduza para `4` — o pool de conexão agradece, e o throughput cai apenas de 66 para 33 eventos/s por réplica, ainda 4× o necessário para 80/s com 3 réplicas.
+
+### 2.8 Testes
+
+```java
+package br.com.empresa.pedidos.application.outbox.handler;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.BDDMockito.given;
+
+import br.com.empresa.pedidos.application.outbox.EventoOutbox;
+import br.com.empresa.pedidos.domain.port.out.NotaFiscalGateway;
+import br.com.empresa.pedidos.infrastructure.persistence.outbox.EventoJson;
+import java.util.List;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+@ExtendWith(MockitoExtension.class)
+class EmitirNotaFiscalBatchHandlerTest {
+
+    @Mock NotaFiscalGateway gateway;
+    @Mock EventoJson json;
+
+    @Test
+    void deveMarcarFalhaQuandoParceiroNaoRetornaResultadoParaItem() {
+        // given: parceiro responde apenas para o evento 1
+        given(json.ler(org.mockito.ArgumentMatchers.anyString(), org.mockito.ArgumentMatchers.eq(
+                        br.com.empresa.pedidos.domain.event.PedidoEvento.Aprovado.class)))
+                .willReturn(new br.com.empresa.pedidos.domain.event.PedidoEvento.Aprovado(
+                        new br.com.empresa.pedidos.domain.model.PedidoId(10L), java.time.Instant.now()));
+
+        given(gateway.emitirEmLote(anyList()))
+                .willReturn(new NotaFiscalGateway.RespostaEmLote(
+                        List.of(new NotaFiscalGateway.ResultadoNota(1L, true, null))));
+
+        var handler = new EmitirNotaFiscalBatchHandler(gateway, json);
+
+        // when
+        var resultado = handler.tratar(List.of(
+                new EventoOutbox(1L, "pedido.aprovado", "{}"),
+                new EventoOutbox(2L, "pedido.aprovado", "{}")));
+
+        // then
+        assertThat(resultado.get(1L).sucesso()).isTrue();
+        assertThat(resultado.get(2L).sucesso())
+                .as("item sem resposta do parceiro nunca pode ser tratado como sucesso")
+                .isFalse();
+    }
+}
+```
+
+```java
+package br.com.empresa.pedidos.infrastructure.persistence.outbox;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import br.com.empresa.pedidos.application.outbox.OutboxStore;
+import br.com.empresa.pedidos.domain.model.Status;
+import java.util.List;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+@SpringBootTest
+@Testcontainers
+class OutboxLoteFalhaParcialTest {
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
+
+    @Autowired OutboxStore store;
+    @Autowired JdbcTemplate jdbc;
+
+    @Test
+    void deveMarcarApenasOsItensQueFalharam() {
+        // given: dois eventos pendentes, o parceiro aprova só o primeiro
+        jdbc.update("""
+                insert into outbox_evento
+                  (id, tipo, agregado_id, payload, status, criado_em, disponivel_em, tentativas)
+                values
+                  (800001, 'pedido.aprovado', '1', '{"pedidoId":{"valor":1}}', 'PENDENTE', now(), now(), 0),
+                  (800002, 'pedido.aprovado', '2', '{"pedidoId":{"valor":2}}', 'PENDENTE', now(), now(), 0)
+                on conflict (id) do nothing
+                """);
+
+        // when
+        store.processarLote(List.of(800001L, 800002L));
+
+        // then
+        var statuses = jdbc.queryForList(
+                "select id, status, tentativas from outbox_evento where id in (800001, 800002) order by id",
+                Long.class,
+                String.class,
+                Integer.class);
+
+        assertThat(statuses).hasSize(2);
+        assertThat(statuses.get(0).get("status")).isIn("PROCESSADO", "PENDENTE");
+        assertThat(statuses.get(1).get("status")).isIn("PROCESSADO", "PENDENTE");
+    }
+}
+```
+
+O teste acima é um esqueleto — o valor real dele é o formato: você precisa de um stub de parceiro que aprove parcialmente para provar que o `processarLote` não marca tudo igual. Com WireMock, o stub devolve `[{"chave": 800001, "sucesso": true}, {"chave": 800002, "sucesso": false, "erro": "rejeitado"}]` e a asserção verifica `PROCESSADO` e `PENDENTE` com `tentativas = 1`.
+
+### 2.9 Configuração
+
+```yaml
+app:
+  outbox:
+    tamanho-lote: 100
+    max-tentativas: 5
+    intervalo-ms: 1000
+    concorrencia: 4
+    max-por-ciclo: 2000
+    metricas-intervalo-ms: 10000
+```
+
+`tamanho-lote: 100` com `concorrencia: 4` significa até 4 partições de 25 em voo por ciclo. O `tamanhoMaximoLote()` do handler é que define a partição real — o `tamanho-lote` só define quantas linhas o relay lê por vez.
+
+---
+
+## 3. HPA por backlog
+
+### 3.1 Por que CPU não funciona aqui
+
+O relay é I/O-bound: espera banco e HTTP. A CPU fica em 15% enquanto o backlog cresce. Um HPA com `averageUtilization: 70` **nunca** dispara — e você descobre isso no primeiro incidente de fila.
+
+### 3.2 A armadilha do gauge global
+
+`outbox.eventos.pendentes` é uma contagem do banco. **Todas as réplicas reportam o mesmo número.** Isso quebra a configuração ingênua:
+
+```yaml
+# ERRADO — não faça isso
+metrics:
+  - type: Pods
+    pods:
+      metric:
+        name: outbox_eventos_pendentes
+      target:
+        type: AverageValue
+        averageValue: "500"
+```
+
+Com `Pods` + `AverageValue`, o HPA calcula a média por pod. Como todos reportam o total, a média **é** o total. O alvo "500" passa a significar "mantenha o backlog total em 500" — e como adicionar réplicas não muda o total reportado, o HPA escala até `maxReplicas` e fica lá, mesmo com o backlog drenado.
+
+### 3.3 A configuração correta
+
+Use `Object` com o total. A política fica explícita e o loop de controle funciona: backlog acima do alvo → escala → drenagem aumenta → backlog cai → escala desce.
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: pedidos-service
+  labels:
+    app.kubernetes.io/name: pedidos-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pedidos-service
+  minReplicas: 3
+  maxReplicas: 12
+  metrics:
+    - type: Object
+      object:
+        describedObject:
+          apiVersion: apps/v1
+          kind: Deployment
+          name: pedidos-service
+        metric:
+          name: outbox_backlog_total
+        target:
+          type: Value
+          value: "500"
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 600
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+```
+
+Três decisões embutidas:
+
+**`scaleUp.stabilizationWindowSeconds: 0`** — backlog é sinal de atraso, não de ruído. Escale imediatamente. O `selectPolicy: Max` permite dobrar as réplicas em 30s ou adicionar 4 pods, o que for maior.
+
+**`scaleDown.stabilizationWindowSeconds: 600`** — dez minutos. Backlog é espigado: cai rápido e volta. Sem essa janela, você tem thrash de réplicas, e cada ciclo de scale-down reduz a taxa de drenagem exatamente quando ela é necessária.
+
+**CPU como métrica secundária** — mantém a API escalando sob carga de requisição, que o backlog não captura. As duas métricas coexistem; o HPA usa a que exigir mais réplicas.
+
+### 3.4 Expondo a métrica ao HPA
+
+O HPA não lê Prometheus diretamente. Precisa do Prometheus Adapter:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-adapter-config
+  namespace: monitoring
+data:
+  config.yaml: |
+    rules:
+      - seriesQuery: 'outbox_eventos_pendentes{namespace!="",pod!=""}'
+        resources:
+          overrides:
+            namespace:
+              resource: namespace
+            pod:
+              resource: pod
+        name:
+          matches: '^outbox_eventos_pendentes$'
+          as: 'outbox_backlog_total'
+        metricsQuery: 'max(<<.Series>>{<<.LabelMatchers>>})'
+```
+
+`max` e não `sum`: como todas as réplicas reportam o mesmo valor global, `sum` multiplicaria o backlog pelo número de pods. `max` devolve o valor real, uma vez.
+
+Instalação:
+
+```bash
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm upgrade --install prometheus-adapter prometheus-community/prometheus-adapter \
+  --namespace monitoring \
+  --set prometheus.url=http://prometheus.monitoring.svc \
+  --set prometheus.port=9090 \
+  -f infra/k8s/prometheus-adapter-values.yaml
+```
+
+### 3.5 Verificação
+
+```bash
+# a métrica está visível ao HPA?
+kubectl get --raw \
+  "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/deployments/pedidos-service/outbox_backlog_total" \
+  | jq '.items[0].value'
+
+# estado do autoscaler
+kubectl describe hpa pedidos-service
+
+# escala sob carga e observa
+kubectl get hpa pedidos-service -w
+```
+
+O `describe` mostra o histórico de decisão: `outbox_backlog_total (target value): 500 / 3200` significa que o HPA está escalando. Se aparecer `<unknown>`, o adapter não está resolvendo a métrica — verifique se o `seriesQuery` casa com os labels reais.
+
+### 3.6 O trade-off que você precisa conhecer
+
+O HPA escala o Deployment inteiro: API **e** relay juntos. Isso é aceitável porque compartilham o processo e o pool de conexão — escalar um sem o outro criaria contenção.
+
+Se você precisar desacoplar (API estável, relay elástico), o caminho é separar em dois Deployments com perfis distintos: um com `spring.main.web-application-type: none` rodando só o relay. Custo: duas imagens, dois ciclos de vida, duas configurações de probe. Só faça isso quando o custo de escalar a API junto for real — por exemplo, quando o pool de conexão do banco for o limite e você não puder ter mais de 6 réplicas totais.
+
+---
+
+## Resumindo
+
+- **O painel 8 do dashboard é o diagnóstico que faltava:** `hikaricp_connections_pending` subindo com réplicas estáveis significa pool saturado — e aumentar `concorrencia` do relay piora o problema em vez de resolver.
+- **Batching multiplica por 25 com o mesmo código:** de 8 eventos/s para 200/s em três réplicas, sem mudar timeout nem handler. E é barato porque a tabela de outbox já é a fila — não há janela de coleta a implementar.
+- **Falha parcial é o requisito central do lote:** resultado ausente do parceiro é falha, nunca sucesso. A alternativa produz evento marcado como publicado que nunca chegou.
+- **Lock em ordem de id evita deadlock** entre réplicas que travam o mesmo conjunto em ordens diferentes.
+- **Chave de idempotência é o id do evento, não o id do pedido** — senão um segundo evento legítimo sobre o mesmo pedido vira duplicata descartada.
+- **HPA por CPU nunca dispara em relay I/O-bound.** E `Pods` + `AverageValue` sobre um gauge global é armadilha: escala até o máximo e fica lá. Use `Object` com o total.
+- **`scaleDown` de 600s não é conservadorismo** — é o que evita thrash em backlog espigado, que cai rápido e volta.
+
+Se quiser, posso:
+
+- Escrever o stub WireMock do endpoint em lote com resposta parcial, fechando o teste de falha parcial de ponta a ponta.
+- Criar o segundo Deployment com perfil `relay-only` (`web-application-type: none`) para desacoplar a escala do relay da API.
+- Adicionar o `PodDisruptionBudget` e a `NetworkPolicy` do novo stack, mais o `ServiceMonitor` se você usa Prometheus Operator em vez de scrape estático.
+
+Os três itens fecham o ciclo: o stub prova a falha parcial de ponta a ponta, o Deployment separado dá orçamento de conexão próprio ao relay, e as políticas de rede e monitoramento tornam a separação real em vez de cosmética.
+
+Antes do código, um problema que a separação vai expor — e que precisa ser resolvido junto:
+
+**O orçamento de conexões não fecha.** Com API de 3 a 12 réplicas e `maximum-pool-size: 20` da Parte IV, o pico é $$12 \times 20 = 240$$ conexões. Um PostgreSQL com `max_connections = 200` recusa conexão em produção antes de o HPA chegar em 8 réplicas. Separar o relay não é luxo arquitetural: é o que permite dar a cada carga um pool explícito e caber no banco. Trato disso na seção 2.
+
+---
+
+# Parte VIII — Fechando a malha
+
+**Base:** Spring Boot 4.1 · Java 25 · PostgreSQL 17 · Prometheus Operator
+
+---
+
+## 1. Falha parcial de ponta a ponta
+
+### 1.1 O que faltava
+
+Na Parte VII eu entreguei o `EmitirNotaFiscalBatchHandler` e um teste de unidade que provava a regra "resultado ausente é falha". Mas três elos nunca foram exercitados juntos: o handler, o adapter HTTP real, o `processarLote` gravando status diferentes na mesma transação, e o parceiro respondendo parcialmente.
+
+Enquanto esse caminho não roda de ponta a ponta, a garantia é teórica. E o elo mais frágil é justamente o adapter HTTP: ele decide se uma resposta 503 vira falha de lote inteiro ou falha por item.
+
+### 1.2 `EventoJson` — o elo que estava implícito
+
+Referenciado desde a Parte V e nunca definido. Fechando agora:
+
+```java
+package br.com.empresa.pedidos.infrastructure.persistence.outbox;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.stereotype.Component;
+
+@Component
+public class EventoJson {
+
+    private final ObjectMapper mapper;
+
+    public EventoJson(ObjectMapper mapper) {
+        this.mapper = mapper;
+    }
+
+    public String serializar(Object evento) {
+        try {
+            return mapper.writeValueAsString(evento);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("falha ao serializar evento", e);
+        }
+    }
+
+    public <T> T ler(String payload, Class<T> tipo) {
+        try {
+            return mapper.readValue(payload, tipo);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("payload de evento inválido", e);
+        }
+    }
+}
+```
+
+Requisito não óbvio: o `ObjectMapper` precisa serializar `Instant` como ISO-8601, não como epoch. O Spring Boot já configura `WRITE_DATES_AS_TIMESTAMPS=false` por padrão — mas se alguém customizar o `ObjectMapper` no projeto, isso quebra silenciosamente e os payloads antigos no banco deixam de ser legíveis. Fixe explicitamente:
+
+```yaml
+spring:
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+```
+
+Payload resultante para `PedidoEvento.Aprovado`:
+
+```json
+{"pedidoId":{"valor":1},"ocorridoEm":"2026-01-15T10:00:00Z"}
+```
+
+`tipo()` não aparece porque é método, não componente do record. Correto: o tipo já está na coluna `tipo` da tabela, duplicar no payload só cria duas fontes de verdade.
+
+### 1.3 O adapter HTTP do lote
+
+```java
+package br.com.empresa.pedidos.infrastructure.client;
+
+import br.com.empresa.pedidos.domain.exception.GatewayIndisponivelException;
+import br.com.empresa.pedidos.domain.port.out.NotaFiscalGateway;
+import java.util.List;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.ResourceAccessException;
+import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
+
+@Component
+public class NotaFiscalGatewayHttp implements NotaFiscalGateway {
+
+    private final RestClient client;
+
+    public NotaFiscalGatewayHttp(RestClient notaFiscalRestClient) {
+        this.client = notaFiscalRestClient;
+    }
+
+    @Override
+    public RespostaEmLote emitirEmLote(List<ItemNota> itens) {
+        try {
+            var resposta = client.post()
+                    .uri("/v1/notas/em-lote")
+                    .body(new Requisicao(itens))
+                    .retrieve()
+                    .body(Resposta.class);
+
+            if (resposta == null || resposta.resultados() == null) {
+                throw new GatewayIndisponivelException(
+                        "NOTAFISCAL_RESPOSTA_VAZIA", "parceiro devolveu resposta vazia", null);
+            }
+            return new RespostaEmLote(resposta.resultados());
+
+        } catch (ResourceAccessException e) {
+            throw new GatewayIndisponivelException(
+                    "NOTAFISCAL_INDISPONIVEL", "falha de transporte ao emitir notas", e);
+        } catch (RestClientResponseException e) {
+            throw new GatewayIndisponivelException(
+                    "NOTAFISCAL_HTTP_" + e.getStatusCode().value(),
+                    "parceiro respondeu " + e.getStatusCode(),
+                    e);
+        }
+    }
+
+    record Requisicao(List<ItemNota> itens) {}
+
+    record Resposta(List<ResultadoNota> resultados) {}
+}
+```
+
+A distinção que importa: **`ResourceAccessException` é falha de transporte; `RestClientResponseException` é resposta HTTP de erro.** Capturar apenas a primeira — erro comum — deixa um 503 do parceiro escapar como exceção crua, e o `processarParticao` a trata como falha genérica. Funciona por acidente, mas perde o código de erro e a classificação. Capturar as duas mantém `ultimo_erro` auditável.
+
+```java
+package br.com.empresa.pedidos.infrastructure.client;
+
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotNull;
+import java.net.URI;
+import java.time.Duration;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
+
+@ConfigurationProperties(prefix = "app.notafiscal")
+@Validated
+public record NotaFiscalProperties(
+        @NotNull URI baseUrl,
+        @NotNull Duration connectTimeout,
+        @NotNull Duration readTimeout,
+        @Min(1) @Max(100) int tamanhoMaximoLote) {}
+```
+
+```java
+package br.com.empresa.pedidos.infrastructure.client;
+
+import java.net.http.HttpClient;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
+
+@Configuration
+public class NotaFiscalClientConfig {
+
+    @Bean
+    RestClient notaFiscalRestClient(NotaFiscalProperties propriedades) {
+        var httpClient = HttpClient.newBuilder()
+                .connectTimeout(propriedades.connectTimeout())
+                .build();
+
+        var factory = new JdkClientHttpRequestFactory(httpClient);
+        factory.setReadTimeout(propriedades.readTimeout());
+
+        return RestClient.builder()
+                .baseUrl(propriedades.baseUrl().toString())
+                .requestFactory(factory)
+                .build();
+    }
+}
+```
+
+### 1.4 O teste que fecha o caminho
+
+```java
+package br.com.empresa.pedidos.infrastructure.persistence.outbox;
+
+import static com.github.tomakehurst.wiremock.client.WireMock.aResponse;
+import static com.github.tomakehurst.wiremock.client.WireMock.post;
+import static com.github.tomakehurst.wiremock.client.WireMock.postRequestedFor;
+import static com.github.tomakehurst.wiremock.client.WireMock.urlEqualTo;
+import static com.github.tomakehurst.wiremock.client.WireMock.verify;
+import static org.assertj.core.api.Assertions.assertThat;
+
+import br.com.empresa.pedidos.application.outbox.OutboxStore;
+import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+@SpringBootTest
+@Testcontainers
+class OutboxFalhaParcialTest {
+
+    private static final String PAYLOAD_1 =
+            "{\"pedidoId\":{\"valor\":1},\"ocorridoEm\":\"2026-01-15T10:00:00Z\"}";
+    private static final String PAYLOAD_2 =
+            "{\"pedidoId\":{\"valor\":2},\"ocorridoEm\":\"2026-01-15T10:00:00Z\"}";
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
+
+    static final WireMockServer NOTAFISCAL =
+            new WireMockServer(WireMockConfiguration.options().dynamicPort());
+
+    static {
+        NOTAFISCAL.start();
+    }
+
+    @DynamicPropertySource
+    static void propriedades(DynamicPropertyRegistry registry) {
+        registry.add("app.notafiscal.base-url", NOTAFISCAL::baseUrl);
+        registry.add("app.notafiscal.connect-timeout", () -> "1s");
+        registry.add("app.notafiscal.read-timeout", () -> "2s");
+        registry.add("app.notafiscal.tamanho-maximo-lote", () -> "25");
+    }
+
+    @AfterAll
+    static void encerrar() {
+        NOTAFISCAL.stop();
+    }
+
+    @Autowired OutboxStore store;
+    @Autowired JdbcTemplate jdbc;
+
+    @BeforeEach
+    void preparar() {
+        NOTAFISCAL.resetAll();
+        jdbc.update("delete from outbox_evento where id in (800001, 800002)");
+        inserirPendentes();
+    }
+
+    @Test
+    void deveMarcarProcessadoApenasOEventoAceitoPeloParceiro() {
+        // given: parceiro aceita o primeiro item e rejeita o segundo
+        NOTAFISCAL.stubFor(post(urlEqualTo("/v1/notas/em-lote"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("""
+                                {"resultados": [
+                                  {"chaveIdempotencia": 800001, "sucesso": true,  "erro": null},
+                                  {"chaveIdempotencia": 800002, "sucesso": false,
+                                   "erro": "rejeitado: CNPJ irregular"}
+                                ]}
+                                """)));
+
+        // when
+        store.processarLote(List.of(800001L, 800002L));
+
+        // then
+        var linhas = linhas();
+
+        assertThat(linhas.get(800001L).status()).isEqualTo("PROCESSADO");
+        assertThat(linhas.get(800001L).tentativas()).isZero();
+        assertThat(linhas.get(800001L).ultimoErro()).isNull();
+
+        assertThat(linhas.get(800002L).status()).isEqualTo("PENDENTE");
+        assertThat(linhas.get(800002L).tentativas()).isEqualTo(1);
+        assertThat(linhas.get(800002L).ultimoErro()).contains("rejeitado");
+
+        // e o parceiro recebeu os dois itens em uma única chamada
+        verify(1, postRequestedFor(urlEqualTo("/v1/notas/em-lote")));
+    }
+
+    @Test
+    void deveDevolverLoteInteiroParaRetryQuandoTransporteFalha() {
+        // given: parceiro responde 503, sem informação por item
+        NOTAFISCAL.stubFor(post(urlEqualTo("/v1/notas/em-lote"))
+                .willReturn(aResponse().withStatus(503)));
+
+        // when
+        store.processarLote(List.of(800001L, 800002L));
+
+        // then: ninguém foi marcado como publicado
+        var linhas = linhas();
+
+        assertThat(linhas.values()).allSatisfy(linha -> {
+            assertThat(linha.status()).isEqualTo("PENDENTE");
+            assertThat(linha.tentativas()).isEqualTo(1);
+            assertThat(linha.ultimoErro()).contains("503");
+        });
+    }
+
+    @Test
+    void deveMarcarFalhaQuandoParceiroOmiteUmDosItens() {
+        // given: resposta válida, mas só com o primeiro item
+        NOTAFISCAL.stubFor(post(urlEqualTo("/v1/notas/em-lote"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("""
+                                {"resultados": [
+                                  {"chaveIdempotencia": 800001, "sucesso": true, "erro": null}
+                                ]}
+                                """)));
+
+        // when
+        store.processarLote(List.of(800001L, 800002L));
+
+        // then: o item omitido nunca vira sucesso silencioso
+        var linhas = linhas();
+
+        assertThat(linhas.get(800001L).status()).isEqualTo("PROCESSADO");
+        assertThat(linhas.get(800002L).status()).isEqualTo("PENDENTE");
+        assertThat(linhas.get(800002L).ultimoErro()).contains("não retornou resultado");
+    }
+
+    private void inserirPendentes() {
+        jdbc.update("""
+                insert into outbox_evento
+                  (id, tipo, agregado_id, payload, status, criado_em, disponivel_em, tentativas)
+                values
+                  (800001, 'pedido.aprovado', '1', ?, 'PENDENTE', now(), now(), 0),
+                  (800002, 'pedido.aprovado', '2', ?, 'PENDENTE', now(), now(), 0)
+                on conflict (id) do nothing
+                """, PAYLOAD_1, PAYLOAD_2);
+    }
+
+    private Map<Long, Linha> linhas() {
+        return jdbc.query(
+                """
+                select id, status, tentativas, ultimo_erro
+                  from outbox_evento
+                 where id in (800001, 800002)
+                """,
+                rs -> {
+                    Map<Long, Linha> mapa = new LinkedHashMap<>();
+                    while (rs.next()) {
+                        mapa.put(
+                                rs.getLong("id"),
+                                new Linha(
+                                        rs.getString("status"),
+                                        rs.getInt("tentativas"),
+                                        rs.getString("ultimo_erro")));
+                    }
+                    return mapa;
+                });
+    }
+
+    private record Linha(String status, int tentativas, String ultimoErro) {}
+}
+```
+
+Os três testes cobrem os três desfechos possíveis de um lote, e cada um protege uma decisão específica:
+
+- **Aceite parcial** prova que uma transação pode gravar status diferentes por linha. Se alguém "simplificar" `processarLote` para marcar tudo igual, quebra aqui.
+- **Falha de transporte** prova que 503 não gera falso sucesso. Protege contra o adapter engolir `RestClientResponseException`.
+- **Item omitido** é o mais importante: parceiro que responde 200 com mapa incompleto. Sem a guarda do `resultado == null`, o evento ficaria `PENDENTE` para sempre, sem erro e sem retry — invisível, e o pior estado possível.
+
+### 1.5 Stub para o compose
+
+O teste usa stub programático (autocontido, sem dependência de arquivo). Para o ambiente local, o mesmo contrato em arquivo:
+
+`infra/wiremock/mappings/notafiscal-lote.json`
+
+```json
+{
+  "request": {
+    "method": "POST",
+    "url": "/v1/notas/em-lote"
+  },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": {
+      "resultados": [
+        { "chaveIdempotencia": 800001, "sucesso": true, "erro": null },
+        { "chaveIdempotencia": 800002, "sucesso": false, "erro": "rejeitado: CNPJ irregular" }
+      ]
+    }
+  }
+}
+```
+
+```yaml
+app:
+  notafiscal:
+    base-url: ${NOTAFISCAL_URL:http://wiremock:8080}
+    connect-timeout: 2s
+    read-timeout: 5s
+    tamanho-maximo-lote: 25
+```
+
+`read-timeout: 5s` é maior que o do gateway de autorização (3s) de propósito: emissão de nota em lote é operação mais pesada no parceiro. Timeout único para todos os parceiros é uma das causas mais comuns de degradação em cascata.
+
+---
+
+## 2. Relay como Deployment próprio
+
+### 2.1 O orçamento de conexão — a razão real da separação
+
+Sem números, "separar o relay" é estética. Com números, é necessidade:
+
+| Consumidor | Pool | Réplicas | Pior caso |
+|---|---|---|---|
+| API | 11 | 3–8 | 88 |
+| Relay | 6 | 2–8 | 48 |
+| Administrativo/migrations | — | — | 20 |
+| **Total** | | | **156** |
+
+Com `max_connections = 200` no PostgreSQL, sobram 44 conexões de folga. Sem a separação, você não consegue nem declarar esse orçamento — o HPA da API escala contra um limite invisível e o sintoma é `FATAL: sorry, too many clients already` no banco, não no Kubernetes.
+
+Se o orçamento não fechar, a saída é PgBouncer em modo `transaction` na frente do banco, não aumentar `max_connections`. Cada conexão custa memória fixa no servidor e degrada o planejador sob carga.
+
+### 2.2 Mesmo artefato, perfil diferente
+
+Uma imagem, dois perfis. Sem segundo jar, sem segundo build.
+
+Componentes web passam a ser condicionais:
+
+```java
+@RestController
+@RequestMapping("/v1/pedidos")
+@ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+public class PedidoController { /* inalterado */ }
+```
+
+Aplicar a mesma anotação em `ApiExceptionHandler`, `CorrelationIdFilter` e `OutboxAdminController`. Quatro classes, e o perfil `relay` passa a não instanciar nada de HTTP.
+
+`application-relay.yml`:
+
+```yaml
+spring:
+  main:
+    web-application-type: none
+  datasource:
+    hikari:
+      maximum-pool-size: 6
+      minimum-idle: 6
+      connection-timeout: 3000
+      max-lifetime: 1800000
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
+app:
+  outbox:
+    tamanho-lote: 100
+    concorrencia: 4
+    intervalo-ms: 500
+    max-tentativas: 5
+    max-por-ciclo: 2000
+    metricas-intervalo-ms: 10000
+
+management:
+  otlp:
+    metrics:
+      export:
+        url: ${OTLP_METRICS_URL:http://otel-collector.monitoring.svc:4318/v1/metrics}
+        step: 15s
+        resource-attributes:
+          service.name: pedidos-relay
+```
+
+### 2.3 O problema das métricas e a decisão honesta
+
+`web-application-type: none` significa **sem servidor HTTP**. Isso remove o `/actuator/prometheus`. Duas saídas, com custos diferentes:
+
+**Saída A (adotada): push via OTLP.** O relay empurra métricas ao OTel Collector. Nenhum servidor, nenhum scrape, nenhuma porta exposta. Custo: uma dependência e um coletor.
+
+```xml
+<dependency>
+  <groupId>io.micrometer</groupId>
+  <artifactId>micrometer-registry-otlp</artifactId>
+</dependency>
+```
+
+**Saída B (alternativa): manter servidor só para management.** `web-application-type: servlet` com `management.server.port: 8081`. Preserva scrape e probes HTTP. Custo: um Tomcat rodando para servir cinco endpoints — cerca de 80 MB de RSS para nada.
+
+Escolhi A porque o relay não recebe tráfego: um servidor HTTP numa carga que não serve requisição é desperdício de memória e superfície de ataque.
+
+Consequência para o Prometheus Adapter da Parte VII: `outbox_backlog_total` agora chega por OTLP. Configure o coletor para remote-write no Prometheus, ou aponte o exportador direto ao receiver OTLP do Prometheus 3 (`--enable-feature=otlp-write-receiver`). O nome da métrica não muda, e o HPA continua funcionando sem alteração.
+
+### 2.4 Liveness sem HTTP
+
+Sem servidor, `httpGet` não existe. E não faz sentido: o modo de falha do relay não é "não responde em 8080", é "parou de processar".
+
+Heartbeat escrito pelo próprio scheduler:
+
+```java
+package br.com.empresa.pedidos.infrastructure.observability;
+
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.context.annotation.Profile;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+@Profile("relay")
+public class RelayHeartbeat {
+
+    private static final Logger log = LoggerFactory.getLogger(RelayHeartbeat.class);
+    private static final Path ARQUIVO = Path.of("/tmp/relay-heartbeat");
+
+    @Scheduled(fixedDelay = 10_000)
+    public void bater() {
+        try {
+            Files.writeString(ARQUIVO, Instant.now().toString());
+        } catch (IOException e) {
+            log.warn("não foi possível gravar o heartbeat", e);
+        }
+    }
+}
+```
+
+Isso detecta o problema que `httpGet` não detectaria: **scheduler vivo mas parado**. Se o `TaskScheduler` travar — pool esgotado, tarefa pendurada — o arquivo envelhece e o pod reinicia. É liveness de verdade, não de processo.
+
+Quando aplicar ao relay, a verificação é a mesma: se o heartbeat não atualiza,
+o problema é real e reiniciar resolve; se atualiza, não reinicie.
+
+```yaml
+startupProbe:
+  exec:
+    command: ["sh", "-c", "test -f /tmp/relay-heartbeat"]
+  periodSeconds: 5
+  failureThreshold: 24
+
+livenessProbe:
+  exec:
+    command:
+      - sh
+      - -c
+      - test $(( $(date +%s) - $(stat -c %Y /tmp/relay-heartbeat) )) -lt 120
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+```
+
+**Não há `readinessProbe`.** Não é omissão: readiness serve para decidir se o pod recebe tráfego, e o relay não recebe. Uma readiness aqui só teria efeito de remover o pod de um Service que não existe.
+
+O `startupProbe` é obrigatório nesse desenho: sem ele, a liveness falha nos primeiros 10s (o arquivo ainda não existe) e o pod entra em `CrashLoopBackOff` antes de aquecer.
+
+### 2.5 `deployment-relay.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pedidos-relay
+  labels:
+    app.kubernetes.io/name: pedidos-relay
+    app.kubernetes.io/part-of: pedidos-service
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pedidos-relay
+        app.kubernetes.io/component: relay
+    spec:
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: registry.exemplo.com/pedidos-service:1.0.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: relay
+            - name: AMBIENTE
+              value: producao
+            - name: JAVA_OPTS
+              value: >-
+                -XX:MaxRAMPercentage=75.0
+                -XX:+ExitOnOutOfMemoryError
+                -XX:+HeapDumpOnOutOfMemoryError
+                -XX:HeapDumpPath=/tmp/heapdump.hprof
+                -Duser.timezone=UTC
+                -Dfile.encoding=UTF-8
+          envFrom:
+            - configMapRef:
+                name: pedidos-relay-config
+            - secretRef:
+                name: pedidos-relay-secrets
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "test -f /tmp/relay-heartbeat"]
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - test $(( $(date +%s) - $(stat -c %Y /tmp/relay-heartbeat) )) -lt 120
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+```
+
+Duas diferenças em relação ao Deployment da API, ambas com motivo:
+
+**`requests.cpu: 200m` e `limits.cpu: "1"`** — carga I/O-bound. CPU baixa em `requests` permite densidade alta no nó; o `limit` de 1 core evita que o relay compita com vizinhos quando o GC apertar.
+
+**`requests.memory == limits.memory: 512Mi`** — relay carrega menos que a API (sem Tomcat, sem controllers). Menos heap, mais densidade por nó. O `MaxRAMPercentage=75` dá 384 MB de heap, suficiente para lotes de 100 eventos.
+
+### 2.6 HPA separado
+
+Agora dois autoscalers, cada um com a métrica que reflete sua carga:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: pedidos-relay
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pedidos-relay
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Object
+      object:
+        describedObject:
+          apiVersion: apps/v1
+          kind: Deployment
+          name: pedidos-relay
+        metric:
+          name: outbox_backlog_total
+        target:
+          type: Value
+          value: "300"
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 900
+      selectPolicy: Min
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 180
+```
+
+`maxReplicas: 8` não é escolha de conforto: é o teto que o orçamento de conexão impõe ($8 \times 6 = 48$). Se o backlog exigir mais, o caminho é batching maior ou PgBouncer — não `maxReplicas: 20`.
+
+`scaleDown` de 900s é mais conservador que os 600s da API porque cada réplica removida reduz a taxa de drenagem, e o relay é o único consumidor da fila. Perder uma réplica no meio de um pico de aprovação é pior que pagar dois pods ociosos.
+
+Remova a métrica `outbox_backlog_total` do HPA da API — ela não pertence mais ali:
+
+```yaml
+# HorizontalPodAutoscaler pedidos-service — ajustado
+spec:
+  minReplicas: 3
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+---
+
+## 3. PDB, NetworkPolicy e ServiceMonitor
+
+### 3.1 `pdb.yaml`
+
+```yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pedidos-service
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-service
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pedidos-relay
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-relay
+```
+
+`minAvailable: 1` com `replicas: 2` permite drenar um nó por vez. Com `minAvailable: 2` você bloquearia qualquer manutenção de cluster — e um PDB que bloqueia dreno é pior que nenhum, porque o operador de infraestrutura vai removê-lo no primeiro incidente.
+
+### 3.2 NetworkPolicy do relay — isolamento total de entrada
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pedidos-relay
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-relay
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dados
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4318
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+`ingress: []` com `Ingress` em `policyTypes` significa **negar todo tráfego de entrada**. O relay não tem porta, então qualquer conexão recebida é suspeita.
+
+O DNS precisa estar explícito. Sem a regra de `kube-dns`, o relay resolve nada e falha em toda chamada externa — sintoma que aparece em teste e não em produção só porque o cluster de teste talvez não tenha a política aplicada.
+
+O `ipBlock` para o parceiro de nota fiscal é o ponto frágil: IP público de terceiro muda sem aviso. Se o cluster tiver Cilium, prefira `toFQDNs` com o domínio do parceiro. Se não, use um egress gateway com allowlist de FQDN — CIDR fixo para SaaS é dívida com data de vencimento.
+
+### 3.3 NetworkPolicy da API
+
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pedidos-service
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-service
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: dados
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - ipBlock:
+            cidr: 203.0.113.0/24
+      ports:
+        - protocol: TCP
+          port: 443
+```
+
+A regra de ingress do Prometheus é o que impede o caso clássico: você aplica NetworkPolicy, o scrape para de funcionar, e o time descobre três dias depois que o dashboard estava vazio — justamente durante o incidente em que ele era necessário.
+
+### 3.4 `ServiceMonitor`
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pedidos-service
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-service
+  endpoints:
+    - port: http
+      path: /actuator/prometheus
+      interval: 15s
+      scrapeTimeout: 10s
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: '(jvm_gc_.*|jvm_buffer_.*|jvm_classes_.*|process_cpu_.*|system_.*|logback_.*)'
+          action: drop
+```
+
+Só a API tem `ServiceMonitor` — o relay empurra por OTLP e não tem porta. Isso é consequência coerente da decisão 2.4, não esquecimento.
+
+O `metricRelabelings` de drop não é micro-otimização. `jvm_gc_*` e `jvm_buffer_*` respondem pela maior parte da cardinalidade em aplicações Spring, e cardinalidade é o custo dominante de um Prometheus em produção. Em 8 réplicas × 30 séries descartadas, você economiza 240 séries por scrape a cada 15s — e nenhum painel desta série as usa.
+
+O label `release: kube-prometheus-stack` precisa casar com o `serviceMonitorSelector` do seu Prometheus. Se não casar, o `ServiceMonitor` é criado e silenciosamente ignorado — falha sem erro, a pior categoria.
+
+Para a Saída B (relay com management port), o equivalente é:
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: pedidos-relay
+  labels:
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pedidos-relay
+  endpoints:
+    - port: management
+      path: /actuator/prometheus
+      interval: 15s
+```
+
+Requer `Service` com `port: management` apontando para 8081.
+
+### 3.5 Verificação
+
+```bash
+# a métrica chega ao Prometheus?
+kubectl get --raw \
+  "/apis/custom.metrics.k8s.io/v1beta1/namespaces/default/deployments/pedidos-relay/outbox_backlog_total" \
+  | jq '.items[0].value'
+
+# o ServiceMonitor foi absorvido pelo Prometheus?
+kubectl -n monitoring get prometheus -o jsonpath='{.items[0].spec.serviceMonitorSelector}'
+
+# a rede está fechada como esperado?
+kubectl run netcheck --rm -it --image=nicolaka/netshoot --restart=Never -- \
+  curl -s -m 3 http://pedidos-relay:8080/actuator/health
+
+# o relay está realmente drenando?
+kubectl logs -l app.kubernetes.io/name=pedidos-relay --tail=50 | grep -c "outbox processando"
+```
+
+A primeira verificação é a que decide se o HPA vai funcionar. Se retornar `404` ou lista vazia, o adapter não está resolvendo a métrica — e o HPA ficará em `<unknown>` indefinidamente, sem escalar.
+
+A terceira deve **falhar** (timeout ou connection refused). Se responder, a NetworkPolicy não foi aplicada — provavelmente porque o CNI do cluster não a suporta, ou porque você esqueceu de incluir `Ingress` em `policyTypes`.
+
+---
+
+## Resumindo
+
+- **`EventoJson` fecha um elo implícito desde a Parte V**, e depende de `write-dates-as-timestamps: false` — quebrar isso invalida todos os payloads históricos do outbox.
+- **Capturar só `ResourceAccessException` deixa passar erro HTTP.** 503 do parceiro é `RestClientResponseException`; sem tratá-la, `ultimo_erro` perde o código de status e fica inútil na auditoria de dead letter.
+- **Os três testes de lote cobrem os três desfechos reais:** aceite parcial, falha de transporte e item omitido. O item omitido é o mais perigoso — evento travado em `PENDENTE` para sempre, sem erro e sem retry.
+- **A separação do relay se justifica pelo orçamento de conexão, não por arquitetura.** API 88 + relay 48 + 20 administrativo = 156 de 200. Sem a separação, o HPA da API escala contra o limite invisível do PostgreSQL.
+- **`web-application-type: none` remove o scrape**, e a resposta coerente é push OTLP — não um Tomcat de 80 MB servindo cinco endpoints.
+- **Liveness por heartbeat de scheduler detecta o que `httpGet` não detecta:** processo vivo com scheduler parado. E `startupProbe` é obrigatório nesse desenho, senão o pod entra em `CrashLoopBackOff` antes de aquecer.
+- **`ingress: []` torna o relay inalcançável**, e a regra de `kube-dns` precisa estar explícita — sem DNS ele falha em toda chamada externa.
+- **O `metricRelabelings` de drop economiza 240 séries por scrape** em 8 réplicas. Cardinalidade é o custo dominante do Prometheus, e nenhum painel desta série usa `jvm_gc_*`.
+
+Se quiser, posso:
+
+- Escrever o `compose.yaml` de simulação com OTel Collector e o relay rodando em perfil `relay`, para validar o push de métricas sem Kubernetes.
+- Criar o `values.yaml` do OTel Collector com remote-write no Prometheus e o `recording rule` que deriva `outbox_backlog_total` a partir das métricas OTLP.
+- Montar o runbook de reprocessamento de dead letter com os comandos de diagnóstico e a decisão de quando reenviar manualmente em vez de esperar o retry.
+
+Os três itens precisam de uma correção antes de funcionarem: o `OutboxRelay` ainda é carregado no perfil da API, porque `@ConditionalOnWebApplication` foi aplicado só aos componentes web. Com o relay no Deployment separado, os dois passariam a drenar a mesma fila — o lock protege a duplicidade, mas você paga o dobro de conexões e as métricas ficam ambíguas.
+
+---
+
+# Parte IX — Validação local, coletor e operação de dead letter
+
+**Base:** Spring Boot 4.1 · Java 25 · OTel Collector Contrib · Prometheus 3 · Kubernetes
+
+---
+
+## 1. Correção de perfil e stack local com OTLP
+
+### 1.1 O gate que faltava
+
+```java
+@Component
+@Profile("relay")
+public class OutboxRelay { /* inalterado */ }
+```
+
+```java
+@Component
+@Profile("relay")
+public class OutboxMetrics { /* inalterado */ }
+```
+
+```java
+@Component
+@Profile("relay")
+public class RelayHeartbeat { /* inalterado */ }
+```
+
+E no lado da API, Flyway é responsabilidade de um dono só — o relay desliga:
+
+```yaml
+# application-relay.yml
+spring:
+  main:
+    web-application-type: none
+  flyway:
+    enabled: false
+```
+
+Sem isso, dois pods disputam a mesma migration. O Flyway tem lock em `flyway_schema_history`, então não corrompe — mas você ganha falha esporádica de startup e um log de erro que ninguém entende, porque a corrida é rara e aparece só em rollout simultâneo.
+
+### 1.2 `infra/otel/collector-config.yaml`
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 2s
+    limit_percentage: 80
+    spike_limit_percentage: 20
+
+  resource:
+    attributes:
+      - key: deployment.environment
+        value: local
+        action: upsert
+
+  batch:
+    timeout: 5s
+    send_batch_size: 2048
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+    add_metric_suffixes: true
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheus]
+```
+
+Três opções definem o resultado:
+
+**`resource_to_telemetry_conversion: true`** transforma `service.name` em label Prometheus `service_name`. Sem isso, você sabe que existe backlog mas não de qual componente.
+
+**`add_metric_suffixes: true`** é o que faz o nome bater com o que o Actuator da API produz. O Micrometer envia `outbox.lote.duracao` com unidade `s`; o exporter converte em `outbox_lote_duracao_seconds_bucket`. Sem o sufixo, o histograma chega como `outbox_lote_duracao_bucket` e o painel da Parte VII fica vazio.
+
+**`memory_limiter` antes do `batch`** protege o coletor de OOM quando o relay entra em pico. A ordem no pipeline importa: limitar depois de acumular lote é tarde.
+
+O mapeamento final de nomes:
+
+| Nome no código | Nome no Prometheus [API] | Nome no Prometheus [relay] |
+|---|---|---|
+| `outbox.eventos.pendentes` | `outbox_eventos_pendentes` | `outbox_eventos_pendentes` |
+| `outbox.evento.mais.antigo.segundos` | `outbox_evento_mais_antigo_segundos` | `outbox_evento_mais_antigo_segundos` |
+| `outbox.eventos.processados` | `outbox_eventos_processados_total` | `outbox_eventos_processados_total` |
+| `outbox.lote.duracao` | `outbox_lote_duracao_seconds_bucket` | `outbox_lote_duracao_seconds_bucket` |
+
+Daqui vem a consequência prática: **a mesma série existe nos dois jobs**, o que significa que `max()` sem filtro de `job` retorna o dobro de réplicas — mas o valor é o mesmo, então o máximo não muda. Ainda assim, sempre filtre por `job` em alerta de cardinalidade e em cálculo de réplica.
+
+### 1.3 `compose.observability.yaml`
+
+```yaml
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes:
+      - ./infra/otel/collector-config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4318:4318"
+      - "8889:8889"
+      - "13133:13133"
+
+  relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pedidos-service:local
+    profiles: ["relay"]
+    depends_on:
+      db:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    environment:
+      SPRING_PROFILES_ACTIVE: relay
+      SPRING_DATASOURCE_URL: jdbc:postgresql://db:5432/pedidos
+      SPRING_DATASOURCE_USERNAME: app
+      SPRING_DATASOURCE_PASSWORD: app
+      OTEL_METRICS_URL: http://otel-collector:4318/v1/metrics
+      NOTAFISCAL_URL: http://wiremock:8080
+      AUTORIZACAO_URL: http://wiremock:8080
+      JAVA_OPTS: >-
+        -XX:MaxRAMPercentage=75.0
+        -XX:+ExitOnOutOfMemoryError
+        -Duser.timezone=UTC
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+    stop_grace_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/rules:/etc/prometheus/rules:ro
+      - promdata:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - otel-collector
+
+  grafana:
+    image: grafana/grafana:11.5.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  promdata:
+```
+
+Duas notas de operação:
+
+O coletor **não tem `healthcheck`** e isso é intencional. A imagem contrib é mínima e não traz `curl` nem `wget`; um healthcheck funcional exigiria montar um binário só para isso. `condition: service_started` é o correto aqui — o relay tolera o coletor subir depois, porque o Micrometer enfileira e reenvia.
+
+O relay usa `profiles: ["relay"]`, então **não sobe** em `docker compose up`. Para subir: `docker compose -f compose.yaml -f compose.observability.yaml --profile relay up -d`.
+
+### 1.4 `infra/prometheus/prometheus.yml` atualizado
+
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    ambiente: local
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: pedidos-api
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ['app:8080']
+        labels:
+          servico: pedidos-service
+
+  - job_name: otel-collector
+    static_configs:
+      - targets: ['otel-collector:8889']
+        labels:
+          servico: pedidos-relay
+```
+
+O label estático `servico` sobrescreve o `service_name` na visualização. Mantive o nome curto para não reescrever todos os painéis da Parte VII.
+
+### 1.5 Verificação
+
+```bash
+docker compose -f compose.yaml -f compose.observability.yaml --profile relay up -d --build
+
+# 1. o relay subiu sem servidor HTTP?
+docker compose logs relay | grep -c "Tomcat"          # deve ser 0
+docker compose logs relay | grep "web-application-type" # none
+
+# 2. as métricas chegaram ao coletor com o nome esperado?
+curl -s localhost:8889/metrics | grep -E '^outbox_' | head -20
+
+# 3. o Prometheus está absorvendo o job do coletor?
+curl -s 'localhost:9090/api/v1/query?query=up{job="otel-collector"}' | jq '.data.result[0].value'
+
+# 4. a série de backlog existe nos dois jobs?
+curl -s 'localhost:9090/api/v1/query?query=outbox_eventos_pendentes' | jq '.data.result | length'
+```
+
+O passo 2 é o que decide se o item 2 pode existir. Se `grep` não retornar nada, o `add_metric_suffixes` ou o pipeline está errado — e nenhum painel ou HPA vai funcionar, independentemente do resto da configuração.
+
+---
+
+## 2. Coletor em Kubernetes e recording rules
+
+### 2.1 `infra/k8s/otel-collector-values.yaml`
+
+```yaml
+mode: deployment
+replicaCount: 2
+
+image:
+  repository: otel/opentelemetry-collector-contrib
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+config:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+        grpc:
+          endpoint: 0.0.0.0:4317
+
+  processors:
+    memory_limiter:
+      check_interval: 2s
+      limit_percentage: 80
+      spike_limit_percentage: 20
+    resource:
+      attributes:
+        - key: deployment.environment
+          value: producao
+          action: upsert
+    batch:
+      timeout: 5s
+      send_batch_size: 2048
+
+  exporters:
+    prometheus:
+      endpoint: 0.0.0.0:8889
+      resource_to_telemetry_conversion:
+        enabled: true
+      add_metric_suffixes: true
+
+  extensions:
+    health_check:
+      endpoint: 0.0.0.0:13133
+
+  service:
+    extensions: [health_check]
+    pipelines:
+      metrics:
+        receivers: [otlp]
+        processors: [memory_limiter, resource, batch]
+        exporters: [prometheus]
+
+ports:
+  otlp-http:
+    enabled: true
+    containerPort: 4318
+    servicePort: 4318
+    protocol: TCP
+  metrics:
+    enabled: true
+    containerPort: 8889
+    servicePort: 8889
+    protocol: TCP
+
+serviceMonitor:
+  enabled: true
+  extraEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+```
+
+`replicaCount: 2` não é redundância decorativa: o relay faz push e não guarda estado, então qualquer réplica serve — mas se uma reiniciar em meio ao push, a outra absorve. Perda de métrica aqui é aceitável; perda de **todas** as métricas por 60s derruba o HPA para `<unknown>`.
+
+### 2.2 As recording rules
+
+`infra/prometheus/rules/outbox.yml`
+
+```yaml
+groups:
+  - name: outbox.derivadas
+    interval: 15s
+    rules:
+      # Métrica que o HPA consome. Sem filtro de job de propósito:
+      # as duas fontes reportam o mesmo valor global, e max() resolve.
+      - record: outbox_backlog_total
+        expr: max(outbox_eventos_pendentes)
+
+      - record: outbox_idade_maxima_segundos
+        expr: max(outbox_evento_mais_antigo_segundos)
+
+      # Critério de aceite da Parte VI: consumido/produzido deve ficar
+      # próximo de 1. Abaixo de 0,9 sustentado = relay é o gargalo.
+      - record: outbox:razao_consumo_producao:5m
+        expr: |
+          sum(rate(outbox_eventos_processados_total[5m]))
+            / clamp_min(sum(rate(http_server_requests_seconds_count{uri="/v1/pedidos",method="POST"}[5m])), 0.001)
+
+  - name: outbox.alertas
+    interval: 30s
+    rules:
+      - alert: OutboxMetricaAusente
+        expr: absent(outbox_eventos_pendentes)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nenhuma métrica de outbox chegou por 5 minutos"
+          runbook: "verificar pods do relay, coletor OTLP e conectividade 4318"
+
+      - alert: OutboxRazaoConsumoSobPressao
+        expr: outbox:razao_consumo_producao:5m < 0.9
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Relay publicando menos do que a API produz"
+          runbook: "verificar concorrência, timeout do parceiro e réplicas do relay"
+```
+
+**Não use `or vector(0)` em `outbox_backlog_total`.** É o erro mais tentador e mais caro: mascarar a ausência faz o HPA ler `0` enquanto o banco tem 5.000 eventos pendentes — e ele nunca escala. Sem a máscara, o HPA fica em `<unknown>` e a ausência vira alerta, que é o comportamento correto: você não quer escalar cegamente, quer saber que a telemetria morreu.
+
+`outbox:razao_consumo_producao:5m` é a métrica que transforma o critério de aceite da Parte VI em algo observável em produção, não só em teste de carga. É a diferença entre "testamos uma vez" e "medimos continuamente".
+
+### 2.3 A opção mais robusta, e quando vale
+
+Toda esta cadeia depende de o relay estar vivo para reportar backlog. Se ele morrer, você perde justamente a métrica que deveria reagir à morte dele.
+
+A alternativa resiliente é exportar o backlog **do banco**, com `postgres_exporter` e uma query customizada:
+
+```yaml
+# postgres_exporter queries.yaml
+outbox:
+  query: |
+    SELECT
+      count(*) FILTER (WHERE status = 'PENDENTE') AS outbox_pendentes,
+      coalesce(cast(extract(epoch FROM now() - min(criado_em))
+        FILTER (WHERE status = 'PENDENTE') AS bigint), 0) AS outbox_idade_segundos,
+      count(*) FILTER (WHERE status = 'FALHA') AS outbox_falhas
+    FROM outbox_evento
+  metrics:
+    - outbox_pendentes:
+        usage: "GAUGE"
+        description: "eventos pendentes"
+    - outbox_idade_segundos:
+        usage: "GAUGE"
+        description: "idade do pendente mais antigo"
+    - outbox_falhas:
+        usage: "GAUGE"
+        description: "eventos em dead letter"
+```
+
+Vale adotar quando a fila for crítica o suficiente para a morte do consumidor ser um cenário que você precisa detectar pelos dados, não pela ausência deles. Custo: mais um exporter, mais um ponto de scrape e uma query periódica no banco — que precisa de índice em `status` (já existe, da Parte V).
+
+---
+
+## 3. Runbook de dead letter
+
+### 3.1 Quando este runbook se aplica
+
+Disparado por `OutboxEmDeadLetter` (Parte VI): qualquer evento com `status = 'FALHA'`. O `tentativas` chegou ao `max-tentativas` e o retry automático parou. A partir daqui, toda ação é humana e precisa de rastro.
+
+**Não existe reprocessamento automático de `FALHA` por design.** Dead letter é onde o sistema admite que não sabe o que fazer — e insistir automaticamente é como você reenvia 4.000 notas fiscais para um parceiro que já as emitiu.
+
+### 3.2 Passo 1 — Classificar o erro
+
+```sql
+select id,
+       tipo,
+       agregado_id,
+       tentativas,
+       criado_em,
+       ultimo_erro
+  from outbox_evento
+ where status = 'FALHA'
+ order by id
+ limit 100;
+```
+
+Classifique antes de agir. A decisão muda completamente conforme a categoria:
+
+| Padrão em `ultimo_erro` | Categoria | Ação |
+|---|---|---|
+| `NOTAFISCAL_HTTP_5xx`, `timeout`, `INDISPONIVEL` | Transitório | Reprocessar |
+| `NOTAFISCAL_HTTP_4xx` (400, 422) | Permanente — payload inválido | Corrigir dado, depois reprocessar |
+| `NOTAFISCAL_HTTP_401` / `403` | Credencial | Renovar secret, reprocessar |
+| `rejeitado: CNPJ irregular`, `rejeitado: ...` | Regra de negócio do parceiro | **Não reprocessar** — escalar para negócio |
+| `payload de evento inválido` | Bug de serialização | Investigar código antes |
+| `parceiro não retornou resultado` / `não retornou resultado` | Contrato do parceiro violado | Verificar no parceiro, depois decidir |
+| `handler não retornou resultado para o evento` | Bug no handler | Corrigir código, fazer deploy, reprocessar |
+
+`rejeitado:` é a categoria mais perigosa de tratar como "basta tentar de novo": o parceiro recusou por regra de negócio e vai recusar de novo indefinidamente. Reprocessar em massa produz outro lote de `FALHA` idêntico.
+
+### 3.3 Passo 2 — Verificar se o efeito já ocorreu
+
+**Este é o passo que quase todos pulam, e o que evita a duplicidade.** Um erro de dead letter não prova que o efeito não aconteceu — prova que você não recebeu confirmação. Timeout depois do commit no parceiro é o caso mais comum.
+
+```bash
+# consultar o parceiro pela chave de idempotência antes de reenviar
+curl -s "https://api.parceiro.example/v1/notas?chaveIdempotencia=800002" \
+  -H "Authorization: Bearer $TOKEN" | jq
+```
+
+Três desfechos:
+
+- **Nota existe e está válida** → o evento é falso negativo. Marque como `PROCESSADO` sem reenviar.
+- **Nota não existe** → reenvio é seguro.
+- **Nota existe em estado inconsistente** (rascunho, cancelada, rejeitada) → escalar; decisão de negócio, não operacional.
+
+```sql
+-- marcar falso negativo como processado, com rastro
+update outbox_evento
+   set status = 'PROCESSADO',
+       ultimo_erro = 'falso negativo confirmado: nota ' || :numeroNota || ' existe no parceiro'
+ where id = :id
+   and status = 'FALHA';
+```
+
+A chave de idempotência só protege se o parceiro a honrar. **Confirme essa garantia no contrato dele antes de confiar nela** — se o parceiro ignora a chave, o reenvio duplica a nota, e você descobre no fiscal.
+
+### 3.4 Passo 3 — Reprocessar um evento
+
+```bash
+curl -X POST https://api.exemplo.com/v1/admin/outbox/800002/reprocessar \
+  -H "Authorization: Bearer $TOKEN_OPERADOR" \
+  -H "X-Correlation-Id: $(uuidgen)"
+```
+
+O endpoint da Parte VI volta o evento para `PENDENTE` com `tentativas = 0` e `disponivel_em = now()`. O relay pega no próximo ciclo.
+
+Verifique em até 2 ciclos:
+
+```sql
+select id, status, tentativas, ultimo_erro, disponivel_em
+  from outbox_evento
+ where id = 800002;
+```
+
+### 3.5 Passo 4 — Reprocessar em lote, com limite
+
+Quando a causa é claramente transitória (indisponibilidade do parceiro que já voltou), o reenvio em massa é legítimo — mas precisa ser **dosado**. Enfileirar 4.000 eventos de uma vez com `concorrencia: 4` significa que o relay vai gastar horas e, se o parceiro degradar de novo, você recria o incidente.
+
+```sql
+-- reprocessa no máximo 200 por comando, em ondas
+with lote as (
+    select id
+      from outbox_evento
+     where status = 'FALHA'
+       and ultimo_erro ~ 'NOTAFISCAL_(HTTP_5|TIMEOUT|INDISPONIVEL)'
+     order by id
+     limit 200
+)
+update outbox_evento o
+   set status = 'PENDENTE',
+       tentativas = 0,
+       disponivel_em = now(),
+       ultimo_erro = ultimo_erro || ' | reprocessado por ' || :operador
+  from lote
+ where o.id = lote.id;
+```
+
+Condições obrigatórias para usar o lote: o parceiro está saudável (verificável com `outbox.eventos.falhos` estável e um teste manual bem-sucedido), a causa é a mesma para todos os eventos do filtro, e alguém está acompanhando o painel de idade durante a operação.
+
+**Nunca** use `where status = 'FALHA'` sem filtro de `ultimo_erro` e sem `limit`. Isso junta erro permanente com transitório e garante que os eventos de regra de negócio voltem para `FALHA` em minutos, mascarando os que poderiam ser resolvidos.
+
+### 3.6 Passo 5 — Encerrar sem reenviar
+
+Para erro permanente, o encerramento correto é registrar a decisão, não silenciar:
+
+```sql
+update outbox_evento
+   set ultimo_erro = 'encerrado: rejeição de negócio aceita — protocolo ' || :protocolo,
+       status = 'FALHA'
+ where id = :id;
+```
+
+Mantenha `status = 'FALHA'`. O indicador de health continua `down` e o alerta continua ativo — de propósito. Um evento encerrado é uma exceção de negócio documentada, não um problema resolvido, e o time precisa decidir se o alerta deve ser silenciado para esse caso específico (via label) em vez de o operador "limpar" a tabela.
+
+### 3.7 Escalonamento
+
+Escale quando: o erro é permanente e exige decisão de negócio; a verificação no parceiro é inconclusiva; o volume em `FALHA` passa de 1% dos eventos processados na janela; ou a causa aponta para bug de código (payload inválido, handler sem retorno).
+
+Não escale quando: a causa é timeout transitório e o parceiro já está saudável — resolva e registre.
+
+### 3.8 Pós-incidente
+
+Três perguntas obrigatórias no postmortem:
+
+1. O `max-tentativas` está calibrado? Cinco tentativas com backoff exponencial cobrem cerca de 5 minutos. Se o parceiro costuma ficar indisponível por 20 minutos, o número está errado.
+2. O erro foi classificado corretamente pelo handler? `rejeitado:` chegando a dead letter como se fosse transitório indica que a classificação no adapter está frouxa.
+3. A telemetria funcionou? Se você descobriu o problema pelo cliente e não pelo alerta, o problema real é a métrica — provavelmente `OutboxMetricaAusente` ou `OutboxEmDeadLetter` não estava ativa.
+
+### 3.9 Resumo executável
+
+```text
+FALHA detectada
+├─ 1. Classificar ultimo_erro
+│   ├─ transitório (5xx, timeout) ──────────► 2. Verificar no parceiro
+│   ├─ credencial (401/403) ────────────────► renovar secret → 2
+│   ├─ permanente (rejeitado:, 4xx) ────────► 5. Encerrar + escalar negócio
+│   └─ bug (payload inválido, sem retorno) ─► corrigir código → deploy → 2
+├─ 2. Verificar se o efeito já ocorreu
+│   ├─ já ocorreu ──────────────────────────► marcar PROCESSADO (falso negativo)
+│   └─ não ocorreu ─────────────────────────► 3. Reprocessar
+├─ 3. Reprocessar (1 evento via API, ou lote ≤200 por onda)
+├─ 4. Acompanhar por 2 ciclos; se voltar a FALHA, voltar ao passo 1
+└─ 5. Registrar decisão e revisar max-tentativas e classificação de erro
+```
+
+---
+
+## Resumindo
+
+- **O gate `@Profile("relay")` é pré-requisito de tudo.** Sem ele, a API e o relay drenam a mesma fila, e o lock salva a correção mas não o orçamento de conexão nem a clareza das métricas.
+- **`add_metric_suffixes: true` é o que faz OTLP e Actuator produzirem o mesmo nome de série** — sem ele, o histograma de duração chega como `outbox_lote_duracao_bucket` e o painel fica vazio.
+- **Validar com `curl localhost:8889/metrics | grep outbox` antes de qualquer coisa.** Se o nome não bate ali, nenhum painel, alerta ou HPA funcionará.
+- **`or vector(0)` na recording rule do HPA é uma armadilha:** mascara a ausência de telemetria e o autoscaler lê zero enquanto a fila cresce. Ausência deve virar alerta, não valor.
+- **`outbox:razao_consumo_producao:5m` torna o critério de aceite da Parte VI observável em produção**, não só em teste de carga.
+- **Verificar no parceiro antes de reprocessar é o passo que evita duplicidade** — timeout não prova ausência de efeito, e a chave de idempotência só protege se o parceiro a honrar.
+- **Reprocessar em lote sem filtro de `ultimo_erro` e sem `limit` recria o incidente** e ainda mascara os eventos que seriam resolvíveis.
+
+Se quiser, posso:
+
+- Escrever o `scripts/outbox-triage.sh` que roda a classificação, agrupa por categoria de erro e imprime o plano de ação por grupo.
+- Criar o `postgres_exporter` com as queries customizadas de outbox, eliminando a dependência de o relay estar vivo para o backlog ser observável.
+- Montar o postmortem template com as três perguntas de calibração já estruturadas em campos preenchíveis.
+
+Os três itens fecham a operação em sentidos diferentes: o script transforma o runbook em execução repetível, o exporter remove o ponto cego mais grave da série — o relay morto levando junto a métrica que deveria detectar sua morte — e o template evita que o postmortem vire narrativa sem calibração.
+
+---
+
+# Parte X — Triagem executável, fonte de verdade no banco e postmortem
+
+**Base:** PostgreSQL 17 · postgres_exporter 0.17 · Prometheus 3 · Spring Boot 4.1
+
+---
+
+## 1. `scripts/outbox-triage.sh`
+
+### 1.1 O princípio: triagem não muta
+
+A Parte IX definiu um runbook com cinco passos. Um script de triagem cobre apenas o **passo 1** — classificar. Os passos 2 a 5 exigem julgamento humano (verificar no parceiro, decidir reenvio, encerrar com rastro) e **não devem ser automatizados**, porque cada um tem consequência irreversível.
+
+Por isso o script é estritamente leitura. Ele nunca executa `UPDATE`, `DELETE` ou `INSERT`. Isso é o que permite rodá-lo em produção sem aprovação de mudança.
+
+### 1.2 O script
+
+```bash
+#!/usr/bin/env bash
+# scripts/outbox-triage.sh
+#
+# Classifica eventos em FALHA por categoria de erro e imprime o plano de ação.
+# SOMENTE LEITURA — nunca executa UPDATE, DELETE ou INSERT.
+#
+# Uso:
+#   DATABASE_URL='postgresql://...' ./scripts/outbox-triage.sh
+#   DATABASE_URL='postgresql://...' ./scripts/outbox-triage.sh --json
+#
+# Códigos de saída:
+#   0  nenhum evento em FALHA
+#   1  apenas categorias recuperáveis (transitorio, credencial)
+#   2  existe categoria que exige decisão humana
+
+set -euo pipefail
+
+DATABASE_URL="${DATABASE_URL:?defina DATABASE_URL com a string de conexão}"
+MODO="${1:-texto}"
+PSQL=(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --no-psqlrc)
+
+# Ordem das cláusulas importa: credencial antes de 4xx genérico,
+# 5xx antes de 4xx, contrato e bug antes de negócio.
+CLASSIFICACAO=$(cat <<'SQL'
+case
+  when ultimo_erro ~ 'NOTAFISCAL_HTTP_40[13]'
+    then 'credencial'
+  when ultimo_erro ~ 'NOTAFISCAL_(HTTP_5[0-9][0-9]|INDISPONIVEL|RESPOSTA_VAZIA)|imeout|Connection refused'
+    then 'transitorio'
+  when ultimo_erro ~ 'não retornou resultado'
+    then 'contrato'
+  when ultimo_erro ~ 'payload de evento inválido|handler não retornou'
+    then 'bug'
+  when ultimo_erro ~ 'rejeitado:|NOTAFISCAL_HTTP_4[0-9][0-9]'
+    then 'negocio'
+  else 'desconhecido'
+end
+SQL
+)
+
+ACAO_DE='
+credencial:   renovar secret do parceiro e reprocessar (runbook §3.4)
+transitorio:  confirmar saude do parceiro e reprocessar em ondas de ate 200 (runbook §3.5)
+negocio:      NAO reprocessar - escalar para negocio com protocolo (runbook §3.6)
+contrato:     validar no parceiro pela chave de idempotencia antes de decidir (runbook §3.3)
+bug:          corrigir codigo, fazer deploy, so entao reprocessar
+desconhecido: inspecionar ultimo_erro manualmente antes de qualquer acao
+'
+
+TOTAL=$("${PSQL[@]}" -tAc "select count(*) from outbox_evento where status = 'FALHA'")
+
+if [ "$TOTAL" -eq 0 ]; then
+  echo "OK: nenhum evento em FALHA"
+  exit 0
+fi
+
+if [ "$MODO" = "--json" ]; then
+  "${PSQL[@]}" -tAc "
+    with classificado as (
+      select id, criado_em, ultimo_erro, $CLASSIFICACAO as categoria
+        from outbox_evento
+       where status = 'FALHA'
+    ),
+    ranqueado as (
+      select *, row_number() over (partition by categoria order by id) as posicao
+        from classificado
+    ),
+    agrupado as (
+      select categoria,
+             count(*) as eventos,
+             coalesce(max(extract(epoch from now() - criado_em))::int, 0) as idade_max_segundos,
+             jsonb_agg(jsonb_build_object('id', id, 'erro', left(coalesce(ultimo_erro,''), 160))
+                       order by id)
+               filter (where posicao <= 5) as amostra
+        from ranqueado
+       group by categoria
+       order by count(*) desc
+    )
+    select jsonb_pretty(jsonb_build_object(
+      'total', $TOTAL,
+      'coletadoEm', now(),
+      'grupos', jsonb_agg(agrupado)))
+      from agrupado;
+  "
+else
+  echo "== TRIAGEM DE DEAD LETTER — OUTBOX =="
+  echo "coletado em: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "total em FALHA: $TOTAL"
+  echo
+
+  "${PSQL[@]}" -tA -F'|' -c "
+    select $CLASSIFICACAO as categoria,
+           count(*) as eventos,
+           coalesce(max(extract(epoch from now() - criado_em))::int, 0) as idade
+      from outbox_evento
+     where status = 'FALHA'
+     group by 1
+     order by count(*) desc
+  " | while IFS='|' read -r categoria eventos idade; do
+    printf '[%s] %s evento(s) — mais antigo há %ss\n' "$categoria" "$eventos" "$idade"
+    echo "  ação: $(echo "$ACAO_DE" | grep "^$categoria:" | cut -d: -f2- | sed 's/^ *//')"
+
+    "${PSQL[@]}" -tA -F' :: ' -c "
+      select id, 'tentativas=' || tentativas, left(coalesce(ultimo_erro,'(vazio)'), 100)
+        from outbox_evento
+       where status = 'FALHA'
+         and ($CLASSIFICACAO) = '$categoria'
+       order by id
+       limit 3
+    " | while IFS= read -r linha; do
+      echo "  amostra: $linha"
+    done
+    echo
+  done
+fi
+
+# Código de saída reflete a severidade operacional
+HUMANO=$("${PSQL[@]}" -tAc "
+  select count(*) from outbox_evento
+   where status = 'FALHA'
+     and ($CLASSIFICACAO) in ('negocio', 'contrato', 'bug', 'desconhecido')
+")
+
+if [ "$HUMANO" -gt 0 ]; then
+  echo "$HUMANO evento(s) exigem decisão humana — revise antes de reprocessar"
+  exit 2
+fi
+
+echo "todos os eventos são recuperáveis por procedimento padrão"
+exit 1
+```
+
+### 1.3 Três decisões embutidas
+
+**A ordem das cláusulas `CASE` é a lógica.** `NOTAFISCAL_HTTP_401` casa tanto com `40[13]` quanto com `4[0-9][0-9]`. Se a cláusula de negócio viesse antes, uma credencial vencida seria classificada como rejeição de negócio — e o operador escalaria para o time errado. O `CASE` do SQL avalia em ordem, então a especificidade precisa vir primeiro.
+
+**`--json` não é enfeite.** Automatizar a triagem só faz sentido se a saída for consumível. Com `--json`, você pluga isso em pipeline: gerar ticket, abrir incidente, alimentar dashboard de dead letter. A versão texto é para humano; a JSON é para máquina.
+
+**Código de saída em três níveis.** `2` para o que exige julgamento, `1` para o recuperável, `0` para nada a fazer. Isso permite `outbox-triage.sh || alertar` em cron sem parsear texto.
+
+### 1.4 O que o script deliberadamente não faz
+
+Não reenvia, não marca como processado, não silencia. A tentação de adicionar um `--reprocessar` é grande e é exatamente o que você não quer: um comando que classifica e executa no mesmo passo remove a única barreira entre "transitório" e "4.000 notas duplicadas". A Parte IX estabeleceu que o reenvio exige verificação no parceiro — e verificação não é script.
+
+---
+
+## 2. `postgres_exporter` como fonte de verdade
+
+### 2.1 O ponto cego que isso resolve
+
+Na Parte IX, `OutboxMetricaAusente` alerta quando nenhuma métrica chega. Mas alerta é reação — o HPA fica em `<unknown>` no exato momento em que o relay morreu e precisa escalar.
+
+E há um problema conceitual mais sério: **a métrica que mede a saúde do consumidor é produzida pelo consumidor.** Se ele morre, a métrica morre com ele. É um oximetro que desliga junto com o paciente.
+
+A correção é arquitetural: o backlog é um fato do **banco**, não do processo. O `postgres_exporter` lê a tabela e reporta mesmo com zero pods de relay rodando.
+
+| | App (OTLP) | Banco (exporter) |
+|---|---|---|
+| Detecta relay morto | Não | Sim |
+| Reporta throughput e latência de handler | Sim | Não |
+| Sobrevive a restart do relay | Não | Sim |
+| Custo por scrape | zero (push) | uma query |
+
+Não é substituição — é complemento. Backlog vem do banco; throughput e latência vêm do app. Cada fonte mede o que só ela pode medir.
+
+### 2.2 Migration `V4__outbox_metricas.sql`
+
+Antes da query, o índice. A Parte VI criou `idx_outbox_pendente` em `(disponivel_em, id) where status = 'PENDENTE'` — ótimo para o relay, inútil para `min(criado_em)`:
+
+```sql
+-- min(criado_em) dos pendentes não usa idx_outbox_pendente (que é por disponivel_em)
+create index if not exists idx_outbox_pendente_criado
+    on outbox_evento (criado_em)
+ where status = 'PENDENTE';
+```
+
+Sem esse índice, a métrica de idade vira varredura sequencial com o tempo — e uma query de observabilidade que degrada a cada minuto é pior que não ter a métrica.
+
+Valide antes de confiar:
+
+```sql
+explain (analyze, buffers)
+select count(*), min(criado_em) from outbox_evento where status = 'PENDENTE';
+```
+
+O plano deve mostrar `Index Only Scan` usando os índices parciais. Se aparecer `Seq Scan`, o índice não está sendo usado e a query vai pesar no banco a cada 15 segundos.
+
+### 2.3 `infra/postgres-exporter/queries.yaml`
+
+```yaml
+outbox:
+  query: |
+    SELECT
+      (SELECT count(*) FROM outbox_evento WHERE status = 'PENDENTE') AS pendentes,
+      (SELECT coalesce(cast(extract(epoch FROM now() - min(criado_em)) AS bigint), 0)
+         FROM outbox_evento WHERE status = 'PENDENTE') AS idade_segundos,
+      (SELECT count(*) FROM outbox_evento WHERE status = 'FALHA') AS falhas
+  master: true
+  cache_seconds: 10
+  metrics:
+    - pendentes:
+        usage: "GAUGE"
+        description: "eventos pendentes de publicação"
+    - idade_segundos:
+        usage: "GAUGE"
+        description: "idade do evento PENDENTE mais antigo, em segundos"
+    - falhas:
+        usage: "GAUGE"
+        description: "eventos em dead letter"
+```
+
+Duas opções carregam peso:
+
+**`master: true`** força a query no primário. Em réplica, o backlog aparece com lag de replicação — e você escalaria o relay baseado em dado desatualizado, criando oscilação.
+
+**`cache_seconds: 10`** evita que cada scrape dispare a query. Com `scrape_interval: 15s` o cache quase não atua, mas ele protege quando múltiplas instâncias do Prometheus fazem HA scrape do mesmo alvo.
+
+### 2.4 O usuário de monitoramento
+
+Não use o usuário da aplicação. Crie um dedicado, com o mínimo necessário:
+
+```sql
+create role outbox_monitor login password :'senha';
+grant pg_monitor to outbox_monitor;
+grant connect on database pedidos to outbox_monitor;
+grant usage on schema public to outbox_monitor;
+grant select on outbox_evento to outbox_monitor;
+```
+
+`pg_monitor` é necessário para o conjunto padrão de métricas do exporter (`pg_stat_*`, `pg_database`). Sem ele, o exporter sobe, serve as queries customizadas e falha silenciosamente em todas as demais — o log mostra erro por scrape, e você descobre que metade do dashboard está vazia só no incidente.
+
+`SELECT` apenas em `outbox_evento`, não em `*`. Um exporter lendo toda a base é superfície de exposição de dado sem contrapartida.
+
+### 2.5 `compose.observability.yaml` — adição
+
+```yaml
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.17.1
+    environment:
+      DATA_SOURCE_NAME: >-
+        postgresql://outbox_monitor:${MONITOR_SENHA}@db:5432/pedidos?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yaml
+      PG_EXPORTER_AUTO_DISCOVER_DATABASES: "false"
+      PG_EXPORTER_DISABLE_DEFAULT_METRICS: "false"
+    volumes:
+      - ./infra/postgres-exporter/queries.yaml:/etc/postgres-exporter/queries.yaml:ro
+    ports:
+      - "9187:9187"
+    depends_on:
+      db:
+        condition: service_healthy
+```
+
+`AUTO_DISCOVER_DATABASES: "false"` importa: sem ele, o exporter varre todos os bancos do cluster e multiplica conexões. Em ambiente com dezenas de bases, isso derruba o `max_connections` sozinho.
+
+### 2.6 Scrape e recording rule
+
+`infra/prometheus/prometheus.yml` — adicione o job:
+
+```yaml
+  - job_name: postgres
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+        labels:
+          servico: pedidos-db
+```
+
+`infra/prometheus/rules/outbox.yml` — a regra passa a ler do banco:
+
+```yaml
+      # Fonte de verdade do backlog: sobrevive à morte do relay.
+      # max() funciona com uma ou duas fontes (exporter + app) reportando o mesmo valor.
+      - record: outbox_backlog_total
+        expr: max(outbox_pendentes)
+
+      - record: outbox_idade_maxima_segundos
+        expr: max(outbox_idade_segundos)
+
+      - record: outbox_dead_letter_total
+        expr: max(outbox_falhas)
+```
+
+O `max()` é o detalhe que faz a transição funcionar sem quebrar nada. Enquanto o relay está vivo, `outbox_eventos_pendentes` (app) e `outbox_pendentes` (banco) reportam o mesmo número e o máximo é esse número. Quando o relay morre, resta uma fonte e o máximo continua correto. **Nenhuma mudança no HPA, nenhuma mudança nos painéis.**
+
+Consequência prática que justifica o item inteiro: com o backlog vindo do banco, o HPA escala o relay **mesmo que todos os pods estejam mortos** — que é precisamente o cenário em que escalar é a resposta certa.
+
+### 2.7 Verificação
+
+```bash
+# 1. o exporter serve as métricas customizadas?
+curl -s localhost:9187/metrics | grep -E '^outbox_'
+
+# 2. a cardinalidade está contida?
+curl -s localhost:9187/metrics | grep -c '^pg_'
+
+# 3. o índice está sendo usado?
+psql "$DATABASE_URL" -c "explain (analyze, buffers)
+  select count(*), min(criado_em) from outbox_evento where status = 'PENDENTE';"
+
+# 4. a recording rule resolve com o relay parado?
+docker compose stop relay
+curl -s 'localhost:9090/api/v1/query?query=outbox_backlog_total' | jq '.data.result[0].value[1]'
+```
+
+O passo 4 é o teste de aceite do item. Se retornar `null` com o relay parado, o exporter não está no caminho e o ponto cego persiste.
+
+---
+
+## 3. Template de postmortem
+
+### 3.1 O template
+
+```markdown
+# Postmortem — <ID do incidente>
+
+| Campo | Valor |
+|---|---|
+| Incidente | INC-0000 |
+| Severidade | SEV-1 / SEV-2 / SEV-3 |
+| Início (detecção) | AAAA-MM-DD HH:MM (UTC-3) |
+| Fim (mitigação) | AAAA-MM-DD HH:MM (UTC-3) |
+| Duração | __ min |
+| Tempo até detectar (TTD) | __ min |
+| Tempo até mitigar (TTM) | __ min |
+| Detector | alerta / cliente / engenheiro / auditoria |
+| Autor | |
+| Revisores | |
+
+## 1. Resumo em uma frase
+
+<O que quebrou, para quem, por quanto tempo. Sem jargão.>
+
+## 2. Impacto
+
+| Dimensão | Medida |
+|---|---|
+| Usuários afetados | __ |
+| Requisições com erro | __ (__%) |
+| Eventos em dead letter ao final | __ |
+| Pedidos não faturados | __ |
+| Receita em risco | `R$ __` |
+| SLA violado | sim / não |
+
+## 3. Linha do tempo
+
+| Hora | Evento | Fonte |
+|---|---|---|
+| HH:MM | primeira evidência | log / métrica / relato |
+| HH:MM | detecção pelo alerta | `OutboxIdadeAlta` |
+| HH:MM | início da investigação | |
+| HH:MM | hipótese descartada | |
+| HH:MM | causa confirmada | |
+| HH:MM | mitigação aplicada | |
+| HH:MM | estabilização confirmada | |
+| HH:MM | encerramento | |
+
+## 4. Causa raiz
+
+**O que aconteceu (técnico):**
+
+**Por que os controles não impediram:**
+
+**Por que a detecção demorou (ou foi rápida):**
+
+**Fatores contribuintes:**
+- 
+- 
+
+## 5. Calibração — as três perguntas obrigatórias
+
+### 5.1 O `max-tentativas` está calibrado?
+
+| Verificação | Comando | Resultado |
+|---|---|---|
+| Backoff total cobre a indisponibilidade típica? | 5 tentativas → $5+10+20+40+80 = 155$s | __ |
+| Maior indisponibilidade já registrada do parceiro | histórico de incidentes | __ |
+| `tentativas` dos eventos em FALHA | `select tentativas, count(*) from outbox_evento where status='FALHA' group by 1;` | __ |
+
+Conclusão: manter / aumentar para __ / reduzir para __
+Justificativa:
+
+### 5.2 O erro foi classificado corretamente pelo handler?
+
+| Verificação | Comando | Resultado |
+|---|---|---|
+| Categorias presentes no dead letter | `./scripts/outbox-triage.sh --json` | __ |
+| Algum erro transitório chegou como negócio (ou vice-versa)? | comparação com o `CASE` do script | __ |
+| `ultimo_erro` contém código do parceiro? | `select distinct left(ultimo_erro,80) from outbox_evento where status='FALHA';` | __ |
+
+Conclusão: classificação correta / ajustar `Catch` no adapter / ajustar `max-tentativas`
+Onde ajustar:
+
+### 5.3 A telemetria funcionou?
+
+| Verificação | Resultado |
+|---|---|
+| O alerta disparou? | sim / não |
+| Quanto tempo depois do início real? | __ min |
+| Algum alerta falhou por ausência de métrica (`OutboxMetricaAusente`)? | sim / não |
+| O painel mostrou o problema sem consulta manual? | sim / não |
+| Se descobrimos pelo cliente: qual métrica faltava? | |
+
+Conclusão: telemetria adequada / adicionar métrica __ / corrigir recording rule __
+
+## 6. O que funcionou
+
+- 
+- 
+
+## 7. Ações
+
+| # | Ação | Tipo | Responsável | Prazo | Ticket |
+|---|---|---|---|---|---|
+| 1 | | preventiva | | | |
+| 2 | | detecção | | | |
+| 3 | | mitigação | | | |
+| 4 | | documentação | | | |
+
+Tipos: preventiva (elimina a causa), detecção (antecipa o diagnóstico), mitigação (reduz o impacto), documentação (runbook).
+
+## 8. O que teria evitado
+
+<Exercício contrafactual: qual teste, alerta ou revisão teria pegado isso. Se a resposta for "nada", registre — significa que o incidente é novo e o sistema está aprendendo.>
+```
+
+### 3.2 Por que a seção 5 é obrigatória
+
+Postmortem sem calibração é crônica. A seção 5 é o que separa "aconteceu um problema" de "o sistema ficou mais resistente".
+
+**5.1 evita o erro mais comum:** aumentar `max-tentativas` como reflexo, sem medir. Cinco tentativas cobrem $$5 + 10 + 20 + 40 + 80 = 155$$ segundos de indisponibilidade. Se o parceiro já ficou 40 minutos fora, o número está errado e nenhum postmortem vai consertar isso — só recalibrar resolve.
+
+**5.2 é onde a maior parte dos incidentes recorrentes se resolve.** Se `rejeitado: CNPJ irregular` chegou a dead letter e ficou sendo reprocessado como transitório, o problema não é o retry: é o `catch` do adapter. Corrigir a classificação elimina a categoria inteira de incidente.
+
+**5.3 impede o autoengano.** "O time respondeu rápido" não é telemetria funcionando. Se o cliente avisou antes do alerta, você tem um alerta faltando — e isso é uma ação, não uma nota de rodapé.
+
+### 3.3 Uma regra de uso
+
+O template é preenchido **até 48h depois** do encerramento, com os dados ainda frescos, e revisado em reunião de até 30 minutos. Postmortem escrito uma semana depois vira ficção: ninguém lembra a ordem real dos fatos, e as ações perdem o dono natural.
+
+E o inverso também vale: postmortem sem ações com responsável e prazo não é postmortem, é ata. Se a tabela da seção 7 sai vazia, o incidente vai se repetir e você terá o documento provando que sabia.
+
+---
+
+## Resumindo
+
+- **A triagem cobre só o passo 1 do runbook, e isso é design.** Reenvio e encerramento exigem verificação no parceiro e julgamento humano — automatizar essas etapas é como você envia 4.000 notas duplicadas.
+- **A ordem das cláusulas `CASE` é a lógica da classificação:** `401` antes de `4xx` genérico. Invertida, credencial vencida vira rejeição de negócio e o time errado é escalado.
+- **O `postgres_exporter` corrige um ponto cego arquitetural:** a métrica que mede a saúde do consumidor era produzida pelo consumidor. Agora o backlog vem do banco e sobrevive à morte do relay — e o HPA escala mesmo com zero pods.
+- **`max()` faz a transição sem quebrar nada:** funciona com uma ou duas fontes reportando o mesmo valor, então HPA e painéis ficam intactos.
+- **O índice `(criado_em) where status='PENDENTE'` é pré-requisito,** não otimização. `min(criado_em)` não usa o índice por `disponivel_em`, e uma métrica que degrada a cada minuto é pior que não ter métrica.
+- **`master: true` e `AUTO_DISCOVER_DATABASES: false`** evitam dois incidentes silenciosos: backlog com lag de réplica e explosão de conexões em cluster com muitas bases.
+- **A seção 5 do postmortem é o que separa crônica de melhoria.** Calibrar `max-tentativas` por aritmética e verificar a classificação de erro elimina categorias inteiras de incidente recorrente.
+
+Se quiser, posso:
+
+- Empacotar tudo o que foi produzido nas Partes I a X em um repositório de documentação navegável, com sumário, índice de ADRs e os arquivos de código organizados por pasta.
+- Escrever o `scripts/outbox-reprocess.sh` separado, com verificação obrigatória no parceiro antes do reenvio e modo `--dry-run`.
+- Criar o painel de dead letter no Grafana com tabela de eventos, distribuição por categoria de erro e botão de link para o runbook de cada grupo.
+
+Os três itens fecham o ciclo em camadas diferentes: o repositório torna o conhecimento localizável, o script torna o reprocessamento seguro e repetível, e o painel torna o dead letter visível sem consulta manual.
+
+Uma restrição atravessa os três: **documentação que não está no repositório do código morre em três meses.** Por isso a estrutura abaixo não é uma pasta `docs/` solta — é um site versionado, construído no CI, com dono declarado e link check automatizado.
+
+---
+
+# Parte XI — Documentação navegável, reprocessamento seguro e painel de dead letter
+
+**Base:** Spring Boot 4.1 · Java 25 · MkDocs Material · Grafana 11 · postgres_exporter 0.17
+
+---
+
+## 1. Repositório de documentação
+
+### 1.1 O princípio que decide a estrutura
+
+O material das Partes I a X tem naturezas distintas, e misturá-las é o que produz documentação inutilizável:
+
+| Tipo | Pergunta que responde | Muda quando |
+|---|---|---|
+| **Fundamento** | "Como fazemos X?" | Raramente — só com mudança de padrão |
+| **Guia** | "Como aplicar X neste projeto?" | A cada evolução do projeto |
+| **Runbook** | "O sistema está quebrado, o que faço?" | A cada incidente |
+| **ADR** | "Por que decidimos X?" | Nunca — é histórico |
+| **Referência** | "Qual é o valor/limite/nome disso?" | Com mudança de configuração |
+
+Um runbook no meio de um fundamento é o erro mais comum: quem está em incidente às 3h não quer ler a teoria do outbox antes do comando de triagem. Por isso a separação é por **intenção de uso**, não por tema.
+
+### 1.2 Estrutura
+
+```text
+docs/
+├── README.md                          # índice e porta de entrada
+├── mkdocs.yml                         # navegação e tema
+├── 00-visao-geral/
+│   ├── como-usar.md                   # qual doc ler em cada situação
+│   ├── stack-de-referencia.md         # versões homologadas e política de upgrade
+│   └── glossario.md
+├── 01-fundamentos/
+│   ├── spring-boot.md
+│   ├── api-restful.md
+│   ├── lean-code.md
+│   ├── solid.md
+│   ├── arquitetura.md
+│   ├── qualidade.md
+│   ├── testes.md
+│   ├── persistencia-jpa.md
+│   └── lombok.md
+├── 02-guias/
+│   ├── api-sob-lean-solid.md
+│   ├── arquitetura-qualidade-testes.md
+│   ├── persistencia-lombok.md
+│   ├── eventos-outbox.md
+│   ├── resiliencia-clientes.md
+│   ├── operacao-kubernetes.md
+│   ├── observabilidade.md
+│   └── teste-de-carga.md
+├── 03-operacao/
+│   ├── runbook-outbox.md
+│   ├── runbook-dead-letter.md
+│   ├── runbook-deploy.md
+│   ├── postmortem-template.md
+│   └── checklists/
+│       ├── pr.md
+│       ├── go-live.md
+│       └── incidente.md
+├── 04-adr/
+│   ├── README.md                      # índice com status
+│   ├── 0001-clean-architecture-por-camadas.md
+│   ├── 0002-sem-lombok.md
+│   ├── 0003-outbox-transacional.md
+│   ├── 0004-resilience4j-como-biblioteca.md
+│   ├── 0005-relay-em-deployment-separado.md
+│   ├── 0006-backlog-como-metrica-do-banco.md
+│   └── 9999-template.md
+└── 05-referencia/
+    ├── matriz-sintomas.md             # sintoma → causa → correção
+    ├── metricas.md                    # nome, tipo, alerta, painel
+    ├── convencoes-codigo.md
+    └── orcamento-conexoes.md
+```
+
+### 1.3 `docs/README.md`
+
+```markdown
+# Padrões de Engenharia — Serviços Java
+
+Documentação normativa para desenvolvimento, operação e evolução de serviços
+Java 25 / Spring Boot 4.1.
+
+**Versão de referência do stack:** Spring Boot 4.1.0 · Java 25 LTS · PostgreSQL 17
+**Última revisão geral:** 2026-10-28
+
+## Por onde começar
+
+| Se você precisa... | Leia |
+|---|---|
+| Entender os padrões antes de escrever código | `01-fundamentos/` |
+| Aplicar um padrão em uma feature nova | `02-guias/` |
+| Resolver um incidente agora | `03-operacao/runbook-*.md` |
+| Saber por que algo é assim | `04-adr/` |
+| Consultar um limite, nome de métrica ou sintoma | `05-referencia/` |
+
+## Regra de precedência
+
+1. ADR aceito vence este documento.
+2. Este documento vence hábito do time.
+3. Em conflito entre guia e fundamento, o **fundamento** vence — o guia é
+   aplicação, o fundamento é o critério.
+4. Dúvida não resolvida aqui: abra issue com label `docs`.
+
+## Documentos com dono
+
+Cada arquivo declara no topo `owner` e `revisado-em`. Documento sem dono é
+removido na revisão trimestral.
+```
+
+### 1.4 Cabeçalho obrigatório em cada documento
+
+```markdown
+---
+titulo: Persistência — JPA e Hibernate
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+```
+
+`revisar-ate` no futuro é o que impede a documentação de envelhecer em silêncio: um job de CI falha quando a data passa, e o dono é notificado. Documento sem prazo de revisão é documento que ninguém relê.
+
+`status` aceita `vigente`, `em-revisao`, `obsoleto`. O build falha em `obsoleto` que ainda está na navegação — não existe documento morto apontando para lugar nenhum.
+
+### 1.5 Índice de ADRs
+
+`04-adr/README.md`
+
+```markdown
+# Decisões de Arquitetura
+
+| # | Título | Status | Data | Impacto |
+|---|---|---|---|---|
+| 0001 | Clean Architecture por camadas | Aceito | 2026-10-28 | Todo o código |
+| 0002 | Não usar Lombok em código novo | Aceito | 2026-10-28 | Domínio e DTOs |
+| 0003 | Outbox transacional para efeitos externos | Aceito | 2026-10-28 | Fluxos de escrita |
+| 0004 | Resilience4j como biblioteca, não starter | Aceito | 2026-10-28 | Clientes externos |
+| 0005 | Relay em Deployment separado | Aceito | 2026-10-28 | Operação |
+| 0006 | Backlog observado pelo banco, não pelo app | Aceito | 2026-10-28 | Observabilidade |
+
+Status possíveis: `Proposto`, `Aceito`, `Substituído por ADR-NNNN`, `Depreciado`.
+ADR aceito é imutável. Reverter exige novo ADR que o substitui.
+```
+
+`04-adr/9999-template.md`
+
+```markdown
+# ADR-NNNN — <título curto no imperativo>
+
+- **Status:** Proposto
+- **Data:** AAAA-MM-DD
+- **Decisores:** <nomes>
+- **Substitui:** ADR-NNNN (ou —)
+- **Substituído por:** —
+
+## Contexto
+
+<Qual força do sistema exige uma decisão. Fatos, restrições, números.
+Sem opinião aqui.>
+
+## Decisão
+
+<O que foi decidido, em uma frase no presente: "Adotamos X para Y".>
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| | |
+
+## Consequências
+
+**Positivas**
+- 
+
+**Negativas**
+- 
+
+**Custo operacional**
+- 
+
+## Como verificar que a decisão está sendo seguida
+
+<Regra ArchUnit, teste, métrica ou checklist. ADR sem mecanismo de
+verificação é intenção, não decisão.>
+```
+
+A última seção é o que diferencia ADR útil de ata de reunião. Se não existe teste ou regra que fiscalize a decisão, ela será violada — e o ADR vira registro de uma intenção que ninguém seguiu.
+
+### 1.6 `docs/mkdocs.yml`
+
+```yaml
+site_name: Padrões de Engenharia — Serviços Java
+site_description: Documentação normativa Java 25 / Spring Boot 4.1
+docs_dir: .
+site_dir: ../build/site
+use_directory_urls: true
+
+theme:
+  name: material
+  language: pt-BR
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Escuro
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Claro
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - search.suggest
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+plugins:
+  - search
+  - tags:
+      tags_file: 05-referencia/tags.md
+
+nav:
+  - Início: README.md
+  - Visão geral:
+      - Como usar: 00-visao-geral/como-usar.md
+      - Stack de referência: 00-visao-geral/stack-de-referencia.md
+      - Glossário: 00-visao-geral/glossario.md
+  - Fundamentos:
+      - Spring Boot: 01-fundamentos/spring-boot.md
+      - API RESTful: 01-fundamentos/api-restful.md
+      - Lean Code: 01-fundamentos/lean-code.md
+      - SOLID: 01-fundamentos/solid.md
+      - Arquitetura: 01-fundamentos/arquitetura.md
+      - Qualidade: 01-fundamentos/qualidade.md
+      - Testes: 01-fundamentos/testes.md
+      - Persistência: 01-fundamentos/persistencia-jpa.md
+      - Lombok: 01-fundamentos/lombok.md
+  - Guias:
+      - API sob Lean e SOLID: 02-guias/api-sob-lean-solid.md
+      - Arquitetura, qualidade e testes: 02-guias/arquitetura-qualidade-testes.md
+      - Persistência e Lombok: 02-guias/persistencia-lombok.md
+      - Eventos e outbox: 02-guias/eventos-outbox.md
+      - Resiliência de clientes: 02-guias/resiliencia-clientes.md
+      - Operação em Kubernetes: 02-guias/operacao-kubernetes.md
+      - Observabilidade: 02-guias/observabilidade.md
+      - Teste de carga: 02-guias/teste-de-carga.md
+  - Operação:
+      - Runbook — outbox: 03-operacao/runbook-outbox.md
+      - Runbook — dead letter: 03-operacao/runbook-dead-letter.md
+      - Runbook — deploy: 03-operacao/runbook-deploy.md
+      - Postmortem: 03-operacao/postmortem-template.md
+      - Checklists:
+          - PR: 03-operacao/checklists/pr.md
+          - Go-live: 03-operacao/checklists/go-live.md
+          - Incidente: 03-operacao/checklists/incidente.md
+  - ADRs:
+      - Índice: 04-adr/README.md
+      - Template: 04-adr/9999-template.md
+  - Referência:
+      - Matriz de sintomas: 05-referencia/matriz-sintomas.md
+      - Métricas: 05-referencia/metricas.md
+      - Convenções de código: 05-referencia/convencoes-codigo.md
+      - Orçamento de conexões: 05-referencia/orcamento-conexoes.md
+```
+
+### 1.7 Ferramentas e CI
+
+`docs/requirements.txt`
+
+```text
+mkdocs-material==9.6.0
+mkdocs-material-extensions==1.3.1
+pymdown-extensions==10.14
+```
+
+`.github/workflows/docs.yml`
+
+```yaml
+name: docs
+
+on:
+  pull_request:
+    paths: ['docs/**', '.github/workflows/docs.yml']
+  push:
+    branches: [main]
+    paths: ['docs/**']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r docs/requirements.txt
+
+      - name: Validar frontmatter e datas de revisão
+        run: |
+          python - <<'PY'
+          import pathlib, sys, datetime, re, yaml
+          falhas = []
+          hoje = datetime.date.today()
+          for md in pathlib.Path('docs').rglob('*.md'):
+              texto = md.read_text(encoding='utf-8')
+              m = re.match(r'^---\n(.*?)\n---', texto, re.S)
+              if not m:
+                  if md.name not in {'README.md', 'tags.md'}:
+                      falhas.append(f'{md}: sem frontmatter')
+                  continue
+              meta = yaml.safe_load(m.group(1)) or {}
+              for campo in ('owner', 'revisado-em', 'revisar-ate', 'status'):
+                  if campo not in meta:
+                      falhas.append(f'{md}: campo {campo} ausente')
+              if meta.get('status') == 'obsoleto':
+                  falhas.append(f'{md}: status obsoleto ainda na navegação')
+              prazo = meta.get('revisar-ate')
+              if isinstance(prazo, datetime.date) and prazo < hoje:
+                  falhas.append(f'{md}: revisão vencida em {prazo}')
+          if falhas:
+              print('\n'.join(falhas))
+              sys.exit(1)
+          print(f'{len(list(pathlib.Path("docs").rglob("*.md")))} documentos válidos')
+          PY
+
+      - name: Build estrito
+        run: mkdocs build --strict -f docs/mkdocs.yml
+
+      - name: Link check
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --verbose --no-progress --offline 'build/site/**/*.html'
+          fail: true
+```
+
+`--strict` é essencial: sem ele o MkDocs avisa sobre link quebrado na navegação e retorna sucesso. Com ele, o build falha — que é o comportamento correto para documentação normativa.
+
+### 1.8 Regras de manutenção
+
+**Documentação vive no mesmo repositório do código.** Repositório separado exige contexto que ninguém tem, e o PR de doc nunca acontece. Com `docs/` no repo, o revisor vê o código e a doc juntos.
+
+**PR que muda comportamento exige PR de doc.** Vale para: contrato de API, nome de métrica, valor de configuração, fluxo de erro, topologia de deploy. Sem isso, o documento se torna ficção progressivamente — e a ficção é pior que ausência, porque é seguida com confiança.
+
+**ADR novo para toda decisão que alguém vai questionar.** O teste é simples: se você consegue imaginar um colega novo perguntando "por que não usamos Kafka?", existe ADR a ser escrito.
+
+**Revisão trimestral com dono.** Três perguntas por documento: ainda descreve o sistema? o exemplo ainda compila? o número citado ainda é o real? Documento que falha em duas é reescrito ou removido.
+
+**`README.md` de cada pasta com uma frase de propósito.** Índice que explica a intenção de cada seção reduz pela metade o tempo de busca.
+
+---
+
+## 2. `scripts/outbox-reprocess.sh`
+
+### 2.1 O que o script faz e o que nunca faz
+
+O script da Parte X classifica. Este executa — e por isso precisa de guardrails muito mais rígidos.
+
+**Faz:** verifica no parceiro se o efeito já ocorreu, marca falsos negativos como processados, devolve eventos realmente ausentes para `PENDENTE`, e registra tudo em tabela de auditoria.
+
+**Nunca faz:** reprocessar sem `--apply`, reprocessar categoria de negócio ou bug sem justificativa explícita, exceder o limite por execução, ou alterar evento que não está em `FALHA`.
+
+A regra que dá sentido ao resto: **`--dry-run` é o padrão.** Esquecer a flag resulta em plano impresso, nunca em mutação.
+
+### 2.2 Migration `V5__outbox_auditoria.sql`
+
+```sql
+create sequence outbox_reprocessamento_seq start with 1 increment by 50;
+
+create table outbox_reprocessamento (
+    id             bigint       primary key,
+    evento_id      bigint       not null,
+    acao           varchar(30)  not null,
+    categoria      varchar(20)  not null,
+    verificacao    varchar(20)  not null,
+    operador       varchar(120) not null,
+    justificativa  varchar(500),
+    correlation_id varchar(80)  not null,
+    criado_em      timestamptz  not null default now()
+);
+
+create index idx_outbox_reproc_evento on outbox_reprocessamento (evento_id);
+create index idx_outbox_reproc_criado on outbox_reprocessamento (criado_em desc);
+```
+
+A coluna `verificacao` grava o resultado da consulta ao parceiro: `existente`, `ausente`, `indeterminado`. Sem esse registro, você não consegue responder depois se o reenvio foi justificado — e essa é exatamente a pergunta da auditoria fiscal.
+
+### 2.3 O script
+
+```bash
+#!/usr/bin/env bash
+# scripts/outbox-reprocess.sh
+#
+# Reprocessa eventos em FALHA com verificação obrigatória no parceiro.
+#
+# SEGURO POR PADRÃO: sem --apply, apenas imprime o plano.
+#
+# Uso:
+#   ./scripts/outbox-reprocess.sh --categoria transitorio
+#   ./scripts/outbox-reprocess.sh --categoria transitorio --apply --limit 50
+#   ./scripts/outbox-reprocess.sh --id 800002 --apply
+#   ./scripts/outbox-reprocess.sh --categoria negocio --apply \
+#       --forcar --justificativa "INC-1234: parceiro corrigiu cadastro"
+#
+# Variáveis:
+#   DATABASE_URL      string de conexão PostgreSQL (obrigatória)
+#   PARCEIRO_URL      base do parceiro de nota fiscal (obrigatória em --apply)
+#   PARCEIRO_TOKEN    bearer token do parceiro
+#   OPERADOR          identificação de quem executa (default: $USER)
+
+set -euo pipefail
+
+DATABASE_URL="${DATABASE_URL:?defina DATABASE_URL}"
+PARCEIRO_URL="${PARCEIRO_URL:-}"
+PARCEIRO_TOKEN="${PARCEIRO_TOKEN:-}"
+OPERADOR="${OPERADOR:-$(whoami)}"
+
+CATEGORIA=""
+EVENTO_ID=""
+LIMITE=50
+APLICAR=0
+FORCAR=0
+JUSTIFICATIVA=""
+CORRELATION_ID="$(uuidgen 2>/dev/null || python3 -c 'import uuid;print(uuid.uuid4())')"
+
+uso() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --categoria)    CATEGORIA="${2:?}"; shift 2 ;;
+    --id)           EVENTO_ID="${2:?}"; shift 2 ;;
+    --limit)        LIMITE="${2:?}"; shift 2 ;;
+    --justificativa) JUSTIFICATIVA="${2:?}"; shift 2 ;;
+    --apply)        APLICAR=1; shift ;;
+    --forcar)       FORCAR=1; shift ;;
+    -h|--help)      uso 0 ;;
+    *) echo "argumento desconhecido: $1" >&2; uso 2 ;;
+  esac
+done
+
+PSQL=(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --no-psqlrc -tA)
+
+# ---------------------------------------------------------------- validações
+if [ -z "$CATEGORIA" ] && [ -z "$EVENTO_ID" ]; then
+  echo "ERRO: informe --categoria ou --id. Reprocessar tudo é proibido." >&2
+  exit 2
+fi
+
+if [ "$LIMITE" -gt 500 ]; then
+  echo "ERRO: --limit máximo é 500. Faça em ondas e acompanhe o painel." >&2
+  exit 2
+fi
+
+if [ "$APLICAR" -eq 1 ] && [ -z "$PARCEIRO_URL" ]; then
+  echo "ERRO: --apply exige PARCEIRO_URL para verificação prévia no parceiro." >&2
+  exit 2
+fi
+
+CLASSIFICACAO=$(cat <<'SQL'
+case
+  when ultimo_erro ~ 'NOTAFISCAL_HTTP_40[13]'                                then 'credencial'
+  when ultimo_erro ~ 'NOTAFISCAL_(HTTP_5[0-9][0-9]|INDISPONIVEL|RESPOSTA_VAZIA)|imeout|Connection refused' then 'transitorio'
+  when ultimo_erro ~ 'não retornou resultado'                                then 'contrato'
+  when ultimo_erro ~ 'payload de evento inválido|handler não retornou'       then 'bug'
+  when ultimo_erro ~ 'rejeitado:|NOTAFISCAL_HTTP_4[0-9][0-9]'                 then 'negocio'
+  else 'desconhecido'
+end
+SQL
+)
+
+# Categorias que exigem --forcar + justificativa
+exige_forca() {
+  case "$1" in
+    negocio|bug|desconhecido|contrato) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- seleção
+if [ -n "$EVENTO_ID" ]; then
+  FILTRO="id = $EVENTO_ID"
+else
+  FILTRO="($CLASSIFICACAO) = '$CATEGORIA'"
+fi
+
+MAPA=$("${PSQL[@]}" -F'|' -c "
+  select id, ($CLASSIFICACAO), tentativas, left(coalesce(ultimo_erro,''), 120)
+    from outbox_evento
+   where status = 'FALHA' and $FILTRO
+   order by id
+   limit $LIMITE
+")
+
+if [ -z "$MAPA" ]; then
+  echo "nada a fazer: nenhum evento em FALHA com o filtro informado"
+  exit 0
+fi
+
+TOTAL=$(printf '%s\n' "$MAPA" | wc -l | tr -d ' ')
+
+echo "== REPROCESSAMENTO DE OUTBOX =="
+echo "operador:       $OPERADOR"
+echo "correlation id: $CORRELATION_ID"
+echo "filtro:         ${EVENTO_ID:+id=$EVENTO_ID}${CATEGORIA:+categoria=$CATEGORIA}"
+echo "eventos:        $TOTAL (limite $LIMITE)"
+echo "modo:           $([ "$APLICAR" -eq 1 ] && echo 'APLICAR' || echo 'DRY-RUN')"
+echo
+
+if exige_forca "$(printf '%s\n' "$MAPA" | head -1 | cut -d'|' -f2)" && [ "$FORCAR" -eq 0 ]; then
+  echo "BLOQUEADO: categoria '$(printf '%s\n' "$MAPA" | head -1 | cut -d'|' -f2)' exige --forcar e --justificativa."
+  echo "Consulte 03-operacao/runbook-dead-letter.md §3.6 antes de prosseguir."
+  exit 3
+fi
+
+if [ "$FORCAR" -eq 1 ] && [ -z "$JUSTIFICATIVA" ]; then
+  echo "ERRO: --forcar exige --justificativa." >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------- plano
+verificar_parceiro() {
+  local chave="$1"
+  if [ -z "$PARCEIRO_URL" ]; then
+    echo "indeterminado"; return
+  fi
+  local resposta http_code
+  resposta=$(curl -sS -m 10 -o /tmp/outbox_verif.$$ -w '%{http_code}' \
+    -H "Authorization: Bearer ${PARCEIRO_TOKEN}" \
+    "$PARCEIRO_URL/v1/notas?chaveIdempotencia=$chave" 2>/dev/null || echo "000")
+
+  http_code="$resposta"
+  case "$http_code" in
+    200)
+      if grep -q '"existe": *true' /tmp/outbox_verif.$$ 2>/dev/null; then
+        echo "existente"
+      else
+        echo "ausente"
+      fi
+      ;;
+    404) echo "ausente" ;;
+    *)   echo "indeterminado" ;;
+  esac
+  rm -f /tmp/outbox_verif.$$
+}
+
+PLANO=""
+while IFS='|' read -r id categoria tentativas erro; do
+  verificacao=$(verificar_parceiro "$id")
+
+  case "$verificacao" in
+    existente)     acao="marcar_processado" ;;
+    ausente)       acao="reenviar" ;;
+    indeterminado) acao="abortar" ;;
+  esac
+
+  printf '  %-8s %-13s tent=%s verif=%-13s -> %s\n' \
+    "$id" "$categoria" "$tentativas" "$verificacao" "$acao"
+  printf '           erro: %s\n' "${erro:-（vazio）}"
+
+  PLANO+="${id}|${categoria}|${acao}|${verificacao}"$'\n'
+done <<< "$MAPA"
+
+echo
+
+# Indeterminado é bloqueio: sem confirmação do parceiro, não há reenvio seguro
+INDETERMINADOS=$(printf '%s' "$PLANO" | grep -c '|abortar$' || true)
+if [ "$INDETERMINADOS" -gt 0 ]; then
+  echo "BLOQUEADO: $INDETERMINADOS evento(s) com verificação indeterminada."
+  echo "Verifique conectividade e credencial do parceiro antes de reexecutar."
+  echo "Reenviar sem confirmação é como você duplica nota fiscal."
+  exit 4
+fi
+
+if [ "$APLICAR" -eq 0 ]; then
+  echo "DRY-RUN: nenhuma alteração feita."
+  echo "Para aplicar: adicione --apply"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- confirmação
+echo "Você está prestes a alterar $TOTAL evento(s) em produção."
+printf 'Digite REPROCESSAR para confirmar: '
+read -r CONFIRMACAO
+[ "$CONFIRMACAO" = "REPROCESSAR" ] || { echo "cancelado"; exit 0; }
+
+# ---------------------------------------------------------------- aplicação
+while IFS='|' read -r id categoria acao verificacao; do
+  [ -z "$id" ] && continue
+
+  if [ "$acao" = "marcar_processado" ]; then
+    REGISTRO=$("${PSQL[@]}" -c "
+      with alvo as (
+        update outbox_evento
+           set status = 'PROCESSADO',
+               ultimo_erro = 'falso negativo confirmado na verificação: efeito já existia no parceiro'
+         where id = $id and status = 'FALHA'
+        returning id
+      )
+      insert into outbox_reprocessamento
+        (id, evento_id, acao, categoria, verificacao, operador, justificativa, correlation_id)
+      select nextval('outbox_reprocessamento_seq'), id, 'marcar_processado',
+             '$categoria', '$verificacao', '$OPERADOR',
+             nullif('$JUSTIFICATIVA',''), '$CORRELATION_ID'
+        from alvo
+      returning evento_id
+    ")
+  else
+    REGISTRO=$("${PSQL[@]}" -c "
+      with alvo as (
+        update outbox_evento
+           set status = 'PENDENTE',
+               tentativas = 0,
+               disponivel_em = now(),
+               ultimo_erro = null
+         where id = $id and status = 'FALHA'
+        returning id
+      )
+      insert into outbox_reprocessamento
+        (id, evento_id, acao, categoria, verificacao, operador, justificativa, correlation_id)
+      select nextval('outbox_reprocessamento_seq'), id, 'reenviar',
+             '$categoria', '$verificacao', '$OPERADOR',
+             nullif('$JUSTIFICATIVA',''), '$CORRELATION_ID'
+        from alvo
+      returning evento_id
+    ")
+  fi
+
+  if [ -n "$REGISTRO" ]; then
+    echo "  ok  $id -> $acao"
+  else
+    echo "  --  $id já não estava em FALHA (ignorado)"
+  fi
+done <<< "$PLANO"
+
+echo
+echo "concluído. Acompanhe a drenagem:"
+echo "  ./scripts/outbox-triage.sh"
+echo "  curl -s 'localhost:9090/api/v1/query?query=outbox_backlog_total' | jq '.data.result[0].value[1]'"
+echo
+echo "auditoria:"
+echo "  select * from outbox_reprocessamento where correlation_id = '$CORRELATION_ID';"
+```
+
+### 2.4 Fluxo de uso
+
+```bash
+# 1. Classificar primeiro, sempre
+./scripts/outbox-triage.sh
+
+# 2. Ver o plano sem tocar em nada
+./scripts/outbox-reprocess.sh --categoria transitorio --limit 50
+
+# 3. Aplicar em onda pequena
+PARCEIRO_URL=https://api.parceiro.example \
+PARCEIRO_TOKEN=$TOKEN \
+./scripts/outbox-reprocess.sh --categoria transitorio --limit 50 --apply
+
+# 4. Acompanhar a drenagem antes da onda seguinte
+sleep 120 && ./scripts/outbox-triage.sh
+
+# 5. Categoria de negócio: só com decisão registrada
+./scripts/outbox-reprocess.sh --id 800002 --apply \
+  --forcar --justificativa "INC-1234: cadastro corrigido pelo time fiscal"
+```
+
+### 2.5 Os cinco guardrails
+
+**Dry-run é o padrão.** A flag perigosa precisa ser digitada, não esquecida. Isso elimina a classe de acidente mais comum: script rodado com a intenção errada.
+
+**Sem `PARCEIRO_URL`, `--apply` não roda.** A verificação prévia não é opcional — é o que separa reenvio seguro de duplicação de nota fiscal. Um script que permite reenvio sem verificar é uma arma carregada.
+
+**Verificação indeterminada aborta tudo.** HTTP 500, timeout ou credencial inválida resultam em `indeterminado`, e o script para antes de qualquer mutação. A alternativa — tratar erro de rede como "não existe" — é exatamente como se duplica nota em produção.
+
+**Limite de 500 e confirmação por digitação.** `--limit 50` por padrão, teto rígido em 500, e a palavra `REPROCESSAR` escrita por extenso. Fricção intencional: reprocessamento em massa é decisão, não reflexo.
+
+**Categorias perigosas exigem justificativa.** `negocio`, `bug`, `contrato` e `desconhecido` só passam com `--forcar --justificativa`, e a justificativa é gravada na auditoria. Isso transforma "alguém reprocessou 4.000 notas" em "Fulano reprocessou sob o INC-1234, com este motivo" seis meses depois.
+
+---
+
+## 3. Painel de dead letter
+
+### 3.1 O que o painel precisa responder
+
+Quatro perguntas, em ordem de urgência:
+
+1. **Existe evento em dead letter agora?** Uma resposta binária, visível à distância.
+2. **Quantos e de que categoria?** Determina se é incidente único ou categoria inteira.
+3. **Quais são os eventos concretos?** Com id e erro, para abrir o runbook certo.
+4. **Isso está crescendo?** Taxa de entrada em `FALHA` nas últimas horas.
+
+### 3.2 Métrica por categoria — extensão do exporter
+
+A Parte X expôs o total. Para distribuir por categoria, a classificação precisa existir no banco. Duas opções: replicar o `CASE` no exporter, ou materializar a categoria na tabela.
+
+Materializar é melhor — uma fonte de verdade, testável, e dispensa repetir regex em SQL de observabilidade:
+
+```sql
+-- V6__outbox_categoria.sql
+alter table outbox_evento
+  add column if not exists categoria_falha varchar(20);
+
+create index if not exists idx_outbox_falha_categoria
+    on outbox_evento (categoria_falha)
+ where status = 'FALHA';
+```
+
+Preenchida no `registrarFalha`, com o mesmo `CASE` do script extraído para uma classe Java:
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import java.util.regex.Pattern;
+
+public final class ClassificadorErro {
+
+    private static final Pattern CREDENCIAL = Pattern.compile("NOTAFISCAL_HTTP_40[13]");
+    private static final Pattern TRANSITORIO = Pattern.compile(
+            "NOTAFISCAL_(HTTP_5\\d{2}|INDISPONIVEL|RESPOSTA_VAZIA)|imeout|Connection refused");
+    private static final Pattern CONTRATO = Pattern.compile("não retornou resultado");
+    private static final Pattern BUG = Pattern.compile("payload de evento inválido|handler não retornou");
+    private static final Pattern NEGOCIO = Pattern.compile("rejeitado:|NOTAFISCAL_HTTP_4\\d{2}");
+
+    private ClassificadorErro() {}
+
+    public static String classificar(String erro) {
+        if (erro == null) {
+            return "desconhecido";
+        }
+        if (CREDENCIAL.matcher(erro).find()) return "credencial";
+        if (TRANSITORIO.matcher(erro).find()) return "transitorio";
+        if (CONTRATO.matcher(erro).find()) return "contrato";
+        if (BUG.matcher(erro).find()) return "bug";
+        if (NEGOCIO.matcher(erro).find()) return "negocio";
+        return "desconhecido";
+    }
+}
+```
+
+Isso importa porque **a mesma classificação governa três consumidores:** o script de triagem, o script de reprocessamento e o painel. Divergência entre eles significa operador agindo sobre informação diferente do dashboard — e é assim que se cria incidente durante a mitigação.
+
+Com a coluna materializada:
+
+```yaml
+# infra/postgres-exporter/queries.yaml — adição
+outbox_por_categoria:
+  query: |
+    SELECT categoria_falha AS categoria, count(*) AS falhas
+      FROM outbox_evento
+     WHERE status = 'FALHA'
+     GROUP BY categoria_falha
+  master: true
+  cache_seconds: 15
+  metrics:
+    - falhas:
+        usage: "GAUGE"
+        description: "eventos em dead letter por categoria"
+    - categoria:
+        usage: "LABEL"
+        description: "categoria do erro"
+```
+
+Resultado: `outbox_falhas_por_categoria{categoria="transitorio"} 42`.
+
+### 3.3 Datasource PostgreSQL no Grafana
+
+A tabela de eventos precisa do banco, não do Prometheus. `infra/grafana/provisioning/datasources/postgres.yml`
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: PedidosDB
+    type: postgres
+    access: proxy
+    url: db:5432
+    database: pedidos
+    user: ${MONITOR_USUARIO}
+    jsonData:
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: false
+    secureJsonData:
+      password: ${MONITOR_SENHA}
+```
+
+Reutilize o usuário `outbox_monitor` da Parte X — ele já tem `SELECT` em `outbox_evento`, que é tudo que o painel precisa. Não crie um segundo usuário de leitura: dois conjuntos de permissão significam duas superfícies para auditar.
+
+### 3.4 `infra/grafana/dashboards/dead-letter.json`
+
+```json
+{
+  "uid": "outbox-dead-letter",
+  "title": "Outbox — Dead Letter",
+  "tags": ["pedidos", "outbox", "dead-letter"],
+  "timezone": "browser",
+  "editable": true,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "15s",
+  "links": [
+    {
+      "title": "Runbook — dead letter",
+      "url": "https://wiki.exemplo.com/runbook/outbox-dead-letter",
+      "targetBlank": true,
+      "type": "link"
+    },
+    {
+      "title": "Runbook — outbox",
+      "url": "https://wiki.exemplo.com/runbook/outbox",
+      "targetBlank": true,
+      "type": "link"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Eventos em dead letter",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        { "expr": "sum(outbox_falhas)", "refId": "A", "legendFormat": "total" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Categorias ativas",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 2 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "expr": "count(count by (categoria) (outbox_falhas_por_categoria))",
+          "refId": "A",
+          "legendFormat": "categorias"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Evento mais antigo em FALHA",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "PedidosDB" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 3600 },
+              { "color": "red", "value": 86400 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT coalesce(cast(extract(epoch FROM now() - min(criado_em)) AS bigint), 0) AS idade FROM outbox_evento WHERE status = 'FALHA'"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Estado do relay",
+      "description": "Idade do pendente mais antigo. Se cresce com dead letter zerado, o problema é consumo, não rejeição.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 180 },
+              { "color": "red", "value": 300 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        {
+          "expr": "max(outbox_idade_maxima_segundos)",
+          "refId": "A",
+          "legendFormat": "idade"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Entrada em dead letter por categoria",
+      "description": "Crescimento sustentado indica categoria inteira falhando, não caso isolado.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 15, "drawStyle": "line" }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "expr": "outbox_falhas_por_categoria",
+          "refId": "A",
+          "legendFormat": "{{categoria}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "bargauge",
+      "title": "Distribuição por categoria",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "negocio" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "purple" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "transitorio" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "bug" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true
+      },
+      "targets": [
+        {
+          "expr": "outbox_falhas_por_categoria",
+          "refId": "A",
+          "legendFormat": "{{categoria}}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Eventos em dead letter",
+      "description": "Clique na categoria para abrir o runbook correspondente.",
+      "gridPos": { "h": 14, "w": 18, "x": 0, "y": 13 },
+      "datasource": { "type": "postgres", "uid": "PedidosDB" },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "filterable": true, "inspect": true }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "categoria_falha" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Abrir runbook da categoria",
+                    "url": "https://wiki.exemplo.com/runbook/outbox-dead-letter?categoria=${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-background", "mode": "basic" }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  { "type": "value", "options": { "negocio": { "color": "purple", "index": 0 } } },
+                  { "type": "value", "options": { "transitorio": { "color": "orange", "index": 1 } } },
+                  { "type": "value", "options": { "credencial": { "color": "yellow", "index": 2 } } },
+                  { "type": "value", "options": { "bug": { "color": "red", "index": 3 } } },
+                  { "type": "value", "options": { "contrato": { "color": "blue", "index": 4 } } },
+                  { "type": "value", "options": { "desconhecido": { "color": "semi-dark-gray", "index": 5 } } }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "id" },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Triage deste evento",
+                    "url": "https://wiki.exemplo.com/runbook/outbox-dead-letter#evento-${__value.raw}",
+                    "targetBlank": true
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "criado_em", "desc": false }],
+        "footer": { "show": false, "reducer": ["sum"], "countRows": false, "fields": "" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT id, categoria_falha, agregado_id, tentativas, criado_em, left(coalesce(ultimo_erro,''), 90) AS ultimo_erro FROM outbox_evento WHERE status = 'FALHA' ORDER BY criado_em ASC LIMIT 100"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Reprocessamentos nas últimas 24h",
+      "description": "Quem agiu, quando e sobre o quê. Fonte: outbox_reprocessamento.",
+      "gridPos": { "h": 6, "w": 18, "x": 0, "y": 27 },
+      "datasource": { "type": "postgres", "uid": "PedidosDB" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 40, "drawStyle": "bars", "stacking": { "mode": "normal" } }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT criado_em AS time, count(*) AS reprocessamentos FROM outbox_reprocessamento WHERE criado_em > now() - interval '24 hours' GROUP BY 1 ORDER BY 1"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### 3.5 Os três detalhes que fazem o painel funcionar
+
+**Os data links são o ponto todo.** Um painel que mostra "42 eventos em negocio" sem levar ao runbook transforma diagnóstico em trabalho manual — alguém vai copiar o texto, procurar no wiki e clicar em três links. O link em `categoria_falha` fecha esse caminho em um clique, e `?categoria=` permite que o runbook abra já na seção certa.
+
+**O painel 4 existe para desambiguar.** Dead letter zerado com idade crescendo significa relay parado, não rejeição do parceiro. Dead letter crescendo com idade baixa significa parceiro rejeitando rápido. São dois incidentes diferentes, e sem esse painel a conclusão é sempre "o outbox está com problema".
+
+**O painel 8 fecha a auditoria visual.** Se o dead letter cai depois de um reprocessamento, você vê a correlação temporal no próprio painel. Sem ele, a auditoria só existe no banco, e ninguém consulta banco durante incidente.
+
+---
+
+## Resumindo
+
+- **Documentação se separa por intenção de uso, não por tema.** Fundamento, guia, runbook, ADR e referência mudam em ritmos diferentes — misturá-los é o que torna o material inutilizável em incidente.
+- **`revisar-ate` no frontmatter e `mkdocs build --strict` no CI** são o que impede a documentação de envelhecer em silêncio: documento vencido falha o build, não é descoberto seis meses depois.
+- **ADR só é decisão se tiver mecanismo de verificação.** A seção "como verificar que está sendo seguida" — regra ArchUnit, teste, métrica — separa decisão de ata de reunião.
+- **`--dry-run` como padrão e `--apply` explícito** eliminam a classe de acidente mais comum: script rodado com a intenção errada.
+- **Verificação indeterminada aborta tudo.** Tratar erro de rede como "nota não existe" é exatamente como se duplica nota fiscal em produção.
+- **A classificação de erro precisa de uma fonte única.** Script de triagem, script de reprocessamento e painel consumindo `ClassificadorErro` garantem que operador e dashboard vejam a mesma realidade — divergência aqui cria incidente durante a mitigação.
+- **Os data links do painel são o valor, não a tabela.** Categoria clicável que abre o runbook certo transforma diagnóstico de três cliques em um.
+
+Se quiser, posso:
+
+- Gerar o `docs/` completo já preenchido com o conteúdo das Partes I a XI, pronto para `mkdocs build`, incluindo os seis ADRs redigidos.
+- Escrever o `Makefile` do repositório com alvos `docs`, `upgrade-check`, `vet` e `operacao`, unificando build de código e documentação.
+- Criar o teste automatizado que valida a paridade entre `ClassificadorErro` (Java) e o `CASE` dos scripts, evitando que as três implementações divirjam em silêncio.
+
