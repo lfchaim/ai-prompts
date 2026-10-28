@@ -16889,4 +16889,4622 @@ Se quiser, posso:
 - Criar o teste que valida o `pyproject.toml` do ruff: verifica que `src` cobre todos os diretórios com módulos importáveis e que nenhuma regra ignorada ficou sem justificativa em comentário.
 - Montar o workflow de CI completo unindo os alvos já criados — `lint-py`, `verify`, `parity`, `corpus-check-json` — com cache de Maven e pip e gate de qualidade no PR.
 
+Os três itens se encaixam, mas há uma ineficiência no `ci` atual que eles obrigam a corrigir antes. Começo por ela.
+
+---
+
+# Parte XVII — Relatório de corpus, meta-configuração do ruff e pipeline final
+
+**Base:** Python 3.12 · ruff 0.8 · GitHub Actions · Maven · jq
+
+---
+
+## 1. Correção de ordem no `ci`
+
+O alvo da Parte XVI é:
+
+```makefile
+ci: lint-py verify docs parity
+```
+
+`mvn verify` executa **todos** os testes de `src/test/java`, incluindo `ClassificadorErroGoldenTest` e `ClassificadorErroGoldenGeradorTest`. O alvo `parity` executa os mesmos dois de novo. Em CI isso significa subir o container PostgreSQL duas vezes — cerca de 15 segundos perdidos e a oportunidade de divergência entre as duas execuções.
+
+```makefile
+.PHONY: ci
+ci: lint-py verify docs corpus-check-json ## Pipeline completo (golden já roda dentro de verify)
+	@echo "ci ok"
+```
+
+`parity` e `parity-fast` continuam existindo para o desenvolvedor, onde rodar só os dois testes é muito mais rápido que `mvn verify` inteiro. Papel local e papel de CI são diferentes:
+
+| Alvo | Quem usa | O que executa |
+|---|---|---|
+| `parity-fast` | desenvolvedor | 2 classes de teste, &lt; 1s |
+| `parity` | desenvolvedor | 2 classes, com Docker |
+| `verify` | CI | tudo, incluindo os 2 |
+| `corpus-check-json` | CI | integridade dos `.tsv`, sem JVM |
+
+---
+
+## 2. `scripts/relatorio_corpus.py`
+
+### 2.1 A decisão de escopo
+
+O script lê `build/corpus-history.jsonl` e produz Markdown para comentário de PR. Três restrições moldam o desenho:
+
+**Nunca falha por histórico ausente ou vazio.** Um PR comment que quebra o job por falta de arquivo é pior que nenhum comment. Histórico vazio produz uma mensagem informativa e código de saída 0.
+
+**Tolera linha truncada.** Duas execuções concorrentes escrevendo no mesmo `.jsonl` produzem linha cortada ocasionalmente. `JSONDecodeError` na linha é ignorado, não propagado.
+
+**Determinístico.** Ordenação estável em todos os campos, sem depender de ordem de inserção do JSON.
+
+```python
+#!/usr/bin/env python3
+"""Gera relatório Markdown do corpus a partir de corpus-history.jsonl.
+
+Uso:
+  ./scripts/relatorio_corpus.py
+  ./scripts/relatorio_corpus.py --historico build/corpus-history.jsonl --saida build/corpus-report.md
+  ./scripts/relatorio_corpus.py --janela 5
+
+Códigos de saída:
+  0  relatório gerado (inclusive quando não há histórico)
+  2  erro de argumento
+
+Nunca falha o build: relatório é informação, não gate. O gate é corpus-check.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+from collections import Counter
+
+MARCA_OK = "✅"
+MARCA_FALHA = "❌"
+MARCA_NEUTRA = "▪️"
+
+
+def carregar(caminho: pathlib.Path) -> list[dict]:
+    """Lê o JSONL tolerando linha truncada por escrita concorrente."""
+    if not caminho.exists():
+        return []
+
+    entradas: list[dict] = []
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        try:
+            entradas.append(json.loads(linha))
+        except json.JSONDecodeError:
+            continue
+    return entradas
+
+
+def formatar_delta(atual: int, anterior: int | None) -> str:
+    if anterior is None:
+        return "—"
+    diferenca = atual - anterior
+    if diferenca == 0:
+        return "0"
+    return f"{diferenca:+d}"
+
+
+def formatar_status(status: str) -> str:
+    return MARCA_OK if status == "ok" else MARCA_FALHA
+
+
+def montar_relatorio(entradas: list[dict], janela: int) -> str:
+    if not entradas:
+        return (
+            "## Corpus do outbox\n\n"
+            "_Sem histórico de execuções. O arquivo `build/corpus-history.jsonl` "
+            "é gravado pelo alvo `make corpus-historico`._\n"
+        )
+
+    recorte = entradas[-janela:]
+    atual = recorte[-1]
+    anterior = recorte[-2] if len(recorte) > 1 else None
+
+    linhas: list[str] = []
+    linhas.append("## Corpus do outbox")
+    linhas.append("")
+
+    delta = formatar_delta(atual["entradas"], anterior["entradas"] if anterior else None)
+    problemas = atual["problemas"]
+    linhas.append(
+        f"{formatar_status(atual['status'])} **{atual['entradas']} entradas** "
+        f"({delta} vs. execução anterior) · "
+        f"**{problemas} problema{'s' if problemas != 1 else ''}** · "
+        f"`{atual['ts']}`"
+    )
+    linhas.append("")
+
+    arquivos = sorted(atual.get("porArquivo", {}).items())
+    if arquivos:
+        linhas.append("| Arquivo | Entradas | Delta |")
+        linhas.append("|---|---:|---:|")
+        anteriores = anterior.get("porArquivo", {}) if anterior else {}
+        for nome, quantidade in arquivos:
+            antes = anteriores.get(nome)
+            linhas.append(f"| `{nome}` | {quantidade} | {formatar_delta(quantidade, antes)} |")
+        linhas.append("")
+
+    if problemas:
+        linhas.append("**Problemas detectados nesta execução:**")
+        linhas.append("")
+        for codigo in atual.get("codigos", []):
+            linhas.append(f"- `{codigo}`")
+        linhas.append("")
+        linhas.append("Corrija os arquivos ou regenere com `make parity-golden`.")
+        linhas.append("")
+    elif len(recorte) > 1:
+        linhas.append("Nenhum problema de integridade nas últimas execuções.")
+        linhas.append("")
+
+    if len(recorte) > 1:
+        historico_codigos: Counter[str] = Counter()
+        for entrada in recorte:
+            historico_codigos.update(entrada.get("codigos", []))
+
+        if historico_codigos:
+            linhas.append("<details><summary>Problemas na janela de "
+                          f"{len(recorte)} execuções</summary>")
+            linhas.append("")
+            linhas.append("| Código | Ocorrências |")
+            linhas.append("|---|---:|")
+            for codigo, ocorrencias in sorted(historico_codigos.items()):
+                linhas.append(f"| `{codigo}` | {ocorrencias} |")
+            linhas.append("")
+            linhas.append("</details>")
+            linhas.append("")
+
+    linhas.append(
+        f"<sub>{MARCA_NEUTRA} Janela: {len(recorte)} execução(ões) de "
+        f"{len(entradas)} no histórico. Gerado por `make corpus-relatorio`.</sub>"
+    )
+    return "\n".join(linhas) + "\n"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--historico", type=pathlib.Path,
+                        default=pathlib.Path("build/corpus-history.jsonl"))
+    parser.add_argument("--saida", type=pathlib.Path,
+                        default=pathlib.Path("build/corpus-report.md"))
+    parser.add_argument("--janela", type=int, default=10,
+                        help="quantas execuções considerar no recorte (padrão: 10)")
+    args = parser.parse_args(argv)
+
+    if args.janela < 1:
+        print("erro: --janela deve ser >= 1", file=sys.stderr)
+        return 2
+
+    relatorio = montar_relatorio(carregar(args.historico), args.janela)
+
+    args.saida.parent.mkdir(parents=True, exist_ok=True)
+    args.saida.write_text(relatorio, encoding="utf-8")
+    print(f"relatório em {args.saida} ({len(relatorio)} caracteres)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### 2.2 O relatório em uso
+
+```bash
+$ make corpus-historico
+$ make corpus-relatorio
+$ cat build/corpus-report.md
+```
+
+```markdown
+## Corpus do outbox
+
+✅ **126 entradas** (+3 vs. execução anterior) · **0 problemas** · `2026-10-28T14:31:07Z`
+
+| Arquivo | Entradas | Delta |
+|---|---:|---:|
+| `outbox-categoria-frontier.tsv` | 103 | +3 |
+| `outbox-categoria-golden.tsv` | 23 | 0 |
+
+Nenhum problema de integridade nas últimas execuções.
+
+▪️ Janela: 2 execução(ões) de 2 no histórico. Gerado por `make corpus-relatorio`.
+```
+
+Com problema, o topo muda e a seção de ação aparece:
+
+```markdown
+❌ **46 entradas** (-80 vs. execução anterior) · **1 problema** · `2026-10-28T15:02:44Z`
+
+**Problemas detectados nesta execução:**
+
+- `CONTAGEM_DIVERGENTE`
+
+Corrija os arquivos ou regenere com `make parity-golden`.
+```
+
+O delta negativo é o sinal mais útil do relatório: `-80` em um corpus que só cresce significa arquivo truncado, não remoção intencional.
+
+### 2.3 Testes
+
+`tests/test_relatorio_corpus.py`
+
+```python
+import json
+import pathlib
+
+import pytest
+
+import relatorio_corpus
+
+pytestmark = pytest.mark.rapido
+
+
+def escrever(tmp_path: pathlib.Path, entradas: list[dict]) -> pathlib.Path:
+    destino = tmp_path / "historico.jsonl"
+    destino.write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in entradas) + "\n",
+        encoding="utf-8",
+    )
+    return destino
+
+
+def entrada(entradas: int, problemas: int = 0, codigos=None, por_arquivo=None) -> dict:
+    return {
+        "ts": f"2026-10-28T{entradas % 24:02d}:00:00Z",
+        "status": "ok" if problemas == 0 else "falha",
+        "entradas": entradas,
+        "problemas": problemas,
+        "porArquivo": por_arquivo or {"frontier.tsv": entradas},
+        "codigos": codigos or [],
+    }
+
+
+def test_sem_historico_gera_mensagem_e_nao_falha(tmp_path):
+    saida = tmp_path / "relatorio.md"
+
+    codigo = relatorio_corpus.main(
+        ["--historico", str(tmp_path / "ausente.jsonl"), "--saida", str(saida)]
+    )
+
+    assert codigo == 0
+    assert "Sem histórico" in saida.read_text(encoding="utf-8")
+
+
+def test_linha_truncada_e_ignorada(tmp_path):
+    historico = escrever(tmp_path, [entrada(100), entrada(110)])
+    with historico.open("a", encoding="utf-8") as arquivo:
+        arquivo.write('{"ts": "2026-10-28T16:0')
+
+    relatorio = relatorio_corpus.montar_relatorio(relatorio_corpus.carregar(historico), 10)
+
+    assert "110 entradas" in relatorio
+    assert "linha" not in relatorio.lower() or "0 problemas" in relatorio
+
+
+def test_delta_positivo_aparece(tmp_path):
+    historico = escrever(tmp_path, [entrada(100), entrada(103)])
+
+    relatorio = relatorio_corpus.montar_relatorio(relatorio_corpus.carregar(historico), 10)
+
+    assert "+3" in relatorio
+
+
+def test_delta_negativo_e_sinalizado(tmp_path):
+    historico = escrever(tmp_path, [entrada(126), entrada(46, problemas=1, codigos=["CONTAGEM_DIVERGENTE"])])
+
+    relatorio = relatorio_corpus.montar_relatorio(relatorio_corpus.carregar(historico), 10)
+
+    assert "-80" in relatorio
+    assert "CONTAGEM_DIVERGENTE" in relatorio
+    assert "❌" in relatorio
+
+
+def test_primeira_execucao_nao_tem_delta(tmp_path):
+    historico = escrever(tmp_path, [entrada(23)])
+
+    relatorio = relatorio_corpus.montar_relatorio(relatorio_corpus.carregar(historico), 10)
+
+    assert "—" in relatorio
+    assert "+0" not in relatorio
+
+
+def test_janela_limita_o_recorte(tmp_path):
+    historico = escrever(tmp_path, [entrada(n) for n in (10, 20, 30, 40)])
+
+    janela_estreita = relatorio_corpus.montar_relatorio(
+        relatorio_corpus.carregar(historico), 2
+    )
+
+    assert "2 execução(ões) de 4" in janela_estreita
+
+
+def test_janela_invalida_retorna_codigo_dois(tmp_path):
+    assert relatorio_corpus.main(["--janela", "0", "--saida", str(tmp_path / "r.md")]) == 2
+
+
+def test_ordem_das_linhas_e_estavel(tmp_path):
+    registros = [
+        entrada(100, por_arquivo={"zeta.tsv": 60, "alfa.tsv": 40}),
+        entrada(110, por_arquivo={"zeta.tsv": 65, "alfa.tsv": 45}),
+    ]
+    historico = escrever(tmp_path, registros)
+
+    primeira = relatorio_corpus.montar_relatorio(relatorio_corpus.carregar(historico), 10)
+    segunda = relatorio_corpus.montar_relatorio(relatorio_corpus.carregar(historico), 10)
+
+    assert primeira == segunda
+    assert primeira.index("alfa.tsv") < primeira.index("zeta.tsv")
+```
+
+`test_ordem_das_linhas_e_estavel` protege contra a tentação de iterar `porArquivo` direto do dicionário: o JSON preserva ordem de inserção, mas ela muda conforme o `awk` percorre o arquivo. A ordenação explícita é o que impede o comentário de PR mudar a cada execução sem que nada tenha mudado.
+
+---
+
+## 3. Meta-configuração do ruff
+
+### 3.1 As quatro invariantes
+
+O `pyproject.toml` tem três formas de ficar errado em silêncio:
+
+**`src` incompleto.** Se `scripts` sai de `src`, o ruff classifica `import upgrade_check` como import de terceiro, ordena no bloco errado e — pior — o `isort` pode inserir a linha depois dos imports externos. Nenhum teste existente quebra.
+
+**Regra ignorada sem motivo.** `ignore = ["E501"]` sem explicação é dívida invisível. Seis meses depois ninguém sabe se a regra foi desligada por decisão ou por conveniência de um PR apressado.
+
+**`target-version` defasada.** Os scripts usam `tomllib`, que exige 3.11+. Marcar `py310` faz o ruff sugerir sintaxe incompatível com o próprio ambiente.
+
+### 3.2 `tests/test_ruff_config.py`
+
+```python
+"""Metatestes do pyproject.toml para o ruff.
+
+Invariantes:
+  1. `src` cobre todo diretório que fornece módulo importado pelos testes
+  2. nenhuma regra em `ignore` está sem justificativa comentada
+  3. todo código em `select`/`ignore` tem formato válido
+  4. `target-version` é compatível com a stdlib usada pelos scripts
+"""
+
+import ast
+import pathlib
+import re
+import sys
+import tomllib
+
+import pytest
+
+pytestmark = pytest.mark.rapido
+
+RAIZ = pathlib.Path(__file__).parent.parent
+PYPROJECT = RAIZ / "pyproject.toml"
+SCRIPTS = RAIZ / "scripts"
+TESTS = RAIZ / "tests"
+
+CODIGO_RUFF = re.compile(r"^[A-Z]{1,4}[0-9]{1,4}$")
+VERSAO_ALVO = re.compile(r"^py(3[0-9])$")
+
+
+def config() -> dict:
+    return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+
+
+def config_ruff() -> dict:
+    return config().get("tool", {}).get("ruff", {})
+
+
+def modulos_importados() -> dict[str, pathlib.Path]:
+    """Módulos de primeira parte importados pelos testes -> arquivo de origem."""
+    candidatos: dict[str, pathlib.Path] = {}
+    for diretorio in (SCRIPTS, TESTS):
+        for arquivo in diretorio.glob("*.py"):
+            candidatos[arquivo.stem] = diretorio
+
+    encontrados: dict[str, pathlib.Path] = {}
+    for arquivo in TESTS.rglob("*.py"):
+        arvore = ast.parse(arquivo.read_text(encoding="utf-8"))
+        for no in ast.walk(arvore):
+            nomes: list[str] = []
+            if isinstance(no, ast.Import):
+                nomes = [alias.name.split(".")[0] for alias in no.names]
+            elif isinstance(no, ast.ImportFrom) and no.module and no.level == 0:
+                nomes = [no.module.split(".")[0]]
+            for nome in nomes:
+                if nome in candidatos:
+                    encontrados[nome] = candidatos[nome]
+    return encontrados
+
+
+def bloco_ignore_bruto() -> list[str]:
+    """Linhas do pyproject que pertencem ao array `ignore` do ruff."""
+    texto = PYPROJECT.read_text(encoding="utf-8")
+    linhas = texto.splitlines()
+    coletando = False
+    coletadas: list[str] = []
+
+    for linha in linhas:
+        if re.match(r"^\s*ignore\s*=\s*\[", linha):
+            coletando = True
+            coletadas.append(linha)
+            if "]" in linha[linha.index("[") + 1:]:
+                break
+            continue
+        if coletando:
+            coletadas.append(linha)
+            if "]" in linha:
+                break
+    return coletadas
+
+
+def codigos_do_bloco(linhas: list[str]) -> list[str]:
+    return re.findall(r'"([A-Z]{1,4}[0-9]{1,4})"', "\n".join(linhas))
+
+
+def test_src_cobre_todos_os_modulos_importados():
+    declarado = {str(p).rstrip("/") for p in config_ruff().get("src", [])}
+    importados = modulos_importados()
+
+    necessarios = {str(diretorio.relative_to(RAIZ)) for diretorio in importados.values()}
+    faltando = necessarios - declarado
+
+    assert not faltando, (
+        f"diretórios com módulo importado fora de [tool.ruff].src: {sorted(faltando)}. "
+        "Sem isso o ruff trata o import como terceiro e o ordena no bloco errado. "
+        f"Módulos afetados: {sorted(importados)}"
+    )
+
+
+def test_toda_regra_ignorada_tem_justificativa():
+    linhas = bloco_ignore_bruto()
+    texto_bloco = "\n".join(linhas)
+    codigos = codigos_do_bloco(linhas)
+
+    sem_motivo = [
+        codigo
+        for codigo in codigos
+        # justificativa na mesma linha (após o código) ou em qualquer linha do bloco
+        if not re.search(rf"{codigo}[^\n]*#\s*\S+", texto_bloco)
+    ]
+
+    assert not sem_motivo, (
+        f"regras em `ignore` sem justificativa: {sorted(sem_motivo)}. "
+        "Escreva `\"CODIGO\",  # motivo objetivo` — regra desligada sem motivo é dívida invisível."
+    )
+
+
+def test_codigos_tem_formato_valido():
+    ruff = config_ruff()
+    select = ruff.get("select", [])
+    ignore = ruff.get("lint", {}).get("ignore", []) or ruff.get("ignore", [])
+
+    invalidos = [c for c in [*select, *ignore] if not CODIGO_RUFF.match(c)]
+
+    assert not invalidos, (
+        f"códigos com formato inválido: {invalidos}. "
+        "Um código inexistente é silenciosamente ignorado pelo ruff — a regra nunca é aplicada."
+    )
+
+
+def test_select_e_ignore_nao_se_sobrepoem():
+    ruff = config_ruff()
+    select = set(ruff.get("select", []))
+    ignore = set(ruff.get("ignore", []))
+    # ignore em [tool.ruff.lint] tem precedência sobre o select de nível superior
+    ignore_lint = set(ruff.get("lint", {}).get("ignore", []))
+
+    sobrepostos = (select & ignore) - ignore_lint
+
+    assert not sobrepostos, (
+        f"códigos em `select` e `ignore` ao mesmo tempo: {sorted(sobrepostos)}. "
+        "A presença nos dois lugares é ambígua para quem lê; mantenha só em `ignore`."
+    )
+
+
+def test_target_version_suporta_a_stdlib_utilizada():
+    alvo = config_ruff().get("target-version", "")
+    casamento = VERSAO_ALVO.match(alvo)
+
+    assert casamento, f"target-version inválida: {alvo!r}"
+
+    menor = int(casamento.group(1))
+    assert menor >= 11, (
+        f"target-version {alvo} é anterior ao mínimo exigido pelos scripts (py311, por tomllib). "
+        "O ruff sugeriria sintaxe incompatível com o ambiente real."
+    )
+
+
+def test_target_version_nao_excede_o_python_do_runner():
+    alvo = config_ruff().get("target-version", "")
+    menor = int(VERSAO_ALVO.match(alvo).group(1))
+
+    assert menor <= sys.version_info.minor, (
+        f"target-version {alvo} é mais nova que o Python em uso "
+        f"({sys.version_info.major}.{sys.version_info.minor}). "
+        "O ruff aceitaria sintaxe que o runner não executa."
+    )
+```
+
+### 3.3 Aplicação no `pyproject.toml`
+
+```toml
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",     # pycodestyle
+  "F",          # pyflakes: import não usado, nome indefinido
+  "I",          # isort
+  "B",          # bugbear: mutável como default, except nu
+  "UP",         # pyupgrade: sintaxe moderna
+  "SIM",        # simplify
+  "RUF",        # regras próprias do ruff
+]
+ignore = [
+  "E501",  # comprimento de linha delegado ao formatador (ruff format)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+```
+
+`E501` passa no teste porque a mesma linha tem o comentário. Se alguém adicionar `"SIM108"` sem motivo, o teste falha nomeando o código.
+
+### 3.4 O que cada teste pega e o que não pega
+
+| Teste | Pega | Não pega |
+|---|---|---|
+| `src` cobre módulos | diretório removido de `src`, módulo movido | ordem errada de bloco com `src` correto |
+| justificativa em `ignore` | regra adicionada sem comentário | justificativa vaga ("temporário") |
+| formato de código | typo tipo `E50l` | código válido que não existe na versão |
+| sobreposição | código em `select` e `ignore` | regra habilitada indiretamente por prefixo |
+| `target-version` | valor abaixo de 3.11 ou acima do runner | divergência com `requires-python` |
+
+A última linha do que **não** é coberto é a mais honesta de declarar: validar se um código existe na versão instalada do ruff exigiria invocar `ruff rule --all` e comparar. Fica como alvo manual:
+
+```makefile
+.PHONY: lint-py-codigos
+lint-py-codigos: ## Verifica se todos os códigos configurados existem nesta versão do ruff
+	@$(RUFF) rule --all --output-format json \
+	  | $(PYTHON) -c 'import json,sys,pathlib,re; \
+	      validos={r["code"] for r in json.load(sys.stdin)}; \
+	      texto=pathlib.Path("pyproject.toml").read_text(); \
+	      usados=set(re.findall(r"\"([A-Z]{1,4}[0-9]{1,4})\"", texto)); \
+	      faltando=sorted(usados-validos); \
+	      print(f"códigos inexistentes: {faltando}") if faltando else print("todos os códigos existem")'
+```
+
+---
+
+## 4. Pipeline de CI
+
+### 4.1 `.github/workflows/ci.yml`
+
+```yaml
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  JAVA_VERSION: "25"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint-python:
+    name: Lint Python
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - run: make install-py
+      - run: make lint-py
+
+  lint-java:
+    name: Lint Java
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - run: chmod +x mvnw
+      - run: ./mvnw -q -B spotless:check
+      - run: ./mvnw -q -B checkstyle:check -DskipTests
+
+  testes:
+    name: Testes
+    runs-on: ubuntu-latest
+    needs: [lint-java]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: tests/requirements.txt
+
+      - run: make install-py
+      - run: chmod +x mvnw
+      - run: make test-py
+
+      # verify já executa ClassificadorErroGoldenTest e GoldenGeradorTest
+      - run: make verify
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: jacoco
+          path: target/site/jacoco/
+          retention-days: 7
+
+  docs:
+    name: Documentação
+    runs-on: ubuntu-latest
+    needs: [lint-python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: docs/requirements.txt
+
+      - run: make install-docs
+      - run: make docs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docs-site
+          path: build/site/
+          retention-days: 7
+
+  corpus:
+    name: Corpus
+    runs-on: ubuntu-latest
+    needs: [lint-python]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Integridade
+        id: integridade
+        run: |
+          set +e
+          make corpus-check-json > build/corpus.json
+          codigo=$?
+          echo "codigo=$codigo" >> "$GITHUB_OUTPUT"
+          set -e
+          exit "$codigo"
+
+      - name: Histórico
+        if: always()
+        run: make corpus-historico || true
+
+      - name: Relatório
+        if: always() && github.event_name == 'pull_request'
+        run: make corpus-relatorio
+
+      - name: Comentário no PR
+        if: always() && github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: corpus
+          path: build/corpus-report.md
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corpus-report
+          path: |
+            build/corpus.json
+            build/corpus-history.jsonl
+          retention-days: 7
+
+  gate:
+    name: Gate de qualidade
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [lint-python, lint-java, testes, docs, corpus]
+    steps:
+      - name: Verificar resultado de todas as etapas
+        run: |
+          echo "lint-python: ${{ needs.lint-python.result }}"
+          echo "lint-java:   ${{ needs.lint-java.result }}"
+          echo "testes:      ${{ needs.testes.result }}"
+          echo "docs:        ${{ needs.docs.result }}"
+          echo "corpus:      ${{ needs.corpus.result }}"
+
+          falhou=""
+          for etapa in lint-python lint-java testes docs corpus; do
+            resultado=$(echo '${{ toJSON(needs) }}' | jq -r --arg e "$etapa" '.[$e].result')
+            if [ "$resultado" != "success" ]; then
+              falhou="$falhou $etapa=$resultado"
+            fi
+          done
+
+          if [ -n "$falhou" ]; then
+            echo "::error::etapas com falha:$falhou"
+            exit 1
+          fi
+          echo "todas as etapas passaram"
+```
+
+### 4.2 As cinco decisões do workflow
+
+**`concurrency` com `cancel-in-progress`.** Um push em PR com workflow rodando cancela a execução anterior. Sem isso, três commits seguidos ocupam três runners e o último resultado pode chegar depois do anterior — o PR mostra verde de um código que já não existe.
+
+**`lint-java` como `needs` de `testes`.** Formatação e checkstyle custam 60s; `verify` custa 6 a 8 minutos. Falhar em 60s é a diferença entre corrigir agora e descobrir depois do almoço.
+
+**`testes` roda `make test-py` e `make verify`, nessa ordem.** Os testes Python são rápidos e independentes do Maven; rodá-los primeiro dá sinal em 3s quando o problema é de import.
+
+**`corpus` usa `set +e` para capturar o código de saída.** O `make corpus-check-json` retorna 1 ou 2 conforme o problema, e o job precisa registrar o histórico **mesmo quando falha** — daí o `if: always()` nos passos seguintes. O `exit "$codigo"` no fim do primeiro passo é o que faz o job falhar corretamente.
+
+**`gate` com `toJSON(needs)` e `jq`.** A alternativa comum — repetir cinco linhas de `if: needs.x.result != 'success'` — funciona, mas erra ao adicionar a sexta etapa. Iterar sobre o objeto é o que mantém o gate correto quando o workflow cresce.
+
+### 4.3 O detalhe que evita gate falso-positivo
+
+`gate` tem `if: always()`. Sem isso, uma falha em `testes` faria o `gate` ser pulado — e um job pulado não bloqueia merge por padrão em branch protection. O resultado seria um PR com `testes` vermelho e gate cinza, que o GitHub trata como "não executado" e não como falha.
+
+Com `always()` e a verificação explícita, qualquer `failure`, `cancelled` ou `skipped` vira erro nomeado no log.
+
+---
+
+## 5. Sequência de adoção
+
+```bash
+# 1. corrigir a duplicação antes de tudo
+sed -i 's/^ci: lint-py verify docs parity.*/ci: lint-py verify docs corpus-check-json ## Pipeline completo/' Makefile
+
+# 2. relatório
+make corpus-historico
+make corpus-relatorio && cat build/corpus-report.md
+make test-py-fast          # inclui test_relatorio_corpus.py
+
+# 3. meta-configuração do ruff
+sed -i 's|^ignore = \[|ignore = [\n|' pyproject.toml   # garante comentário em E501
+make test-py-fast          # inclui test_ruff_config.py
+make lint-py-codigos       # valida contra a versão instalada
+
+# 4. pipeline
+git add .github/workflows/ci.yml
+```
+
+O passo 1 antes do 4 é o que justifica o trabalho: rodar `parity` em CI quando `verify` já o executa é gasto duplo de runner, e ninguém percebe porque o resultado é verde.
+
+---
+
+## Resumindo
+
+- **`ci` duplicava trabalho:** `mvn verify` já executa `ClassificadorErroGoldenTest` e `ClassificadorErroGoldenGeradorTest`, e `parity` os rodava de novo — cerca de 15s de Docker perdidos por execução. `parity` fica como ferramenta local.
+- **O relatório nunca falha o build:** histórico ausente, vazio ou com linha truncada produzem mensagem, não erro. O gate é `corpus-check`; o relatório é informação.
+- **Delta negativo é o sinal mais valioso:** `-80` em corpus que só cresce indica truncamento, não remoção intencional. Ordenação estável evita comentário que muda sem que nada tenha mudado.
+- **`src` incompleto no ruff não quebra teste nenhum** — classifica import como terceiro e o isort ordena no bloco errado. O meta-teste resolve por AST, não por regex.
+- **Regra em `ignore` sem justificativa é dívida invisível:** o teste exige comentário com o motivo, na mesma linha ou no bloco.
+- **`gate` com `if: always()` não é cosmético:** sem ele, job pulado não bloqueia merge em branch protection, e o PR passa com uma etapa vermelha e o gate "não executado".
+- **`cancel-in-progress` evita verde obsoleto:** três pushes seguidos sem cancelamento podem entregar o resultado do commit errado.
+
+Se quiser, posso:
+
+- Escrever o `Makefile` completo e consolidado das Partes XII a XVII, com todos os alvos, dependências corretas e o help organizado por seção.
+- Criar o teste que valida o próprio `ci.yml`: verifica que todo alvo `make` referenciado no workflow existe, e que nenhuma etapa do `gate` ficou fora de `needs`.
+- Montar o `docs/00-visao-geral/stack-de-referencia.md` com a matriz de versões homologadas e o procedimento de upgrade, fechando o único stub que ainda não tem conteúdo.
+
+Os três itens fecham o ciclo, mas o Makefile consolidado expõe uma duplicação que vinha desde a Parte XII: `verify: vet` faz `mvn verify` rodar `spotless:check` duas vezes — uma pelo alvo `vet`, outra pelo ciclo de vida do Maven. Corrijo isso junto.
+
+---
+
+# Parte XVIII — Makefile único, workflow verificado e stack documentada
+
+**Base:** GNU Make 4.3 · GitHub Actions · Python 3.12 · MkDocs Material
+
+---
+
+## 1. `Makefile` consolidado
+
+```makefile
+# ============================================================================
+# Pedidos Service — build, verificação, documentação e operação
+#
+# Regra de ouro: alvo que roda no CI não duplica trabalho de outro alvo.
+# `verify` executa o ciclo de vida completo do Maven; `vet` é o subconjunto
+# rápido para uso local. Nunca encadeie os dois.
+# ============================================================================
+
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -eu -o pipefail -c
+.DEFAULT_GOAL := help
+.DELETE_ON_ERROR:
+
+MAVEN  ?= ./mvnw
+PYTHON ?= python3
+PIP    ?= $(PYTHON) -m pip
+PYTEST ?= $(PYTHON) -m pytest
+RUFF   ?= $(PYTHON) -m ruff
+
+DOCS_DIR         := docs
+DOCS_SITE        := build/site
+STACK_FILE       := stack-versions.txt
+POM              := pom.xml
+CORPUS_HISTORICO := build/corpus-history.jsonl
+CORPUS_RELATORIO := build/corpus-report.md
+
+# ----------------------------------------------------------------------------
+##@ Ajuda
+# ----------------------------------------------------------------------------
+
+.PHONY: help
+help: ## Lista os alvos disponíveis
+	@awk 'BEGIN {FS = ":.*##"; printf "\n\033[1mUso:\033[0m make \033[36m<alvo>\033[0m\n"} \
+	  /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } \
+	  /^[a-zA-Z_-]+:.*?##/ { printf "  \033[36m%-26s\033[0m %s\n", $$1, $$2 }' \
+	  $(MAKEFILE_LIST)
+	@printf "\n"
+
+# ----------------------------------------------------------------------------
+##@ Java — verificação
+# ----------------------------------------------------------------------------
+
+.PHONY: spotless-check
+spotless-check: ## Formatação (falha se houver arquivo fora do padrão)
+	@$(MAVEN) -q -B spotless:check
+
+.PHONY: vet
+vet: ## Rápido: formatação + arquitetura + checkstyle + spotbugs (< 90s)
+	@$(MAVEN) -q -B spotless:check
+	@$(MAVEN) -q -B test -Dtest=ArquiteturaTest -DfailIfNoTests=false
+	@$(MAVEN) -q -B checkstyle:check spotbugs:check -DskipTests
+	@echo "vet ok"
+
+.PHONY: verify
+verify: ## Completo: ciclo de vida Maven (já inclui spotless, checkstyle, spotbugs, testes)
+	@$(MAVEN) -B verify
+	@echo "verify ok"
+
+.PHONY: mutation
+mutation: ## Mutação no núcleo de domínio e na classificação
+	@$(MAVEN) -B pitest:mutationCoverage
+
+.PHONY: dependency-tree
+dependency-tree: ## Árvore de dependências com conflitos
+	@$(MAVEN) -B dependency:tree -Dverbose -Dincludes='*'
+
+# ----------------------------------------------------------------------------
+##@ Java — paridade de classificação
+# ----------------------------------------------------------------------------
+
+.PHONY: parity-fast
+parity-fast: corpus-check ## Paridade sem Docker (< 2s)
+	@$(MAVEN) -q -B test -Dtest=ClassificadorErroGoldenTest -DfailIfNoTests=false
+
+.PHONY: parity-golden
+parity-golden: ## Regenera o golden a partir do PostgreSQL (requer Docker)
+	@$(MAVEN) -q -B test -Dtest=ClassificadorErroGoldenGeradorTest \
+	  -Dgolden.mode=update -DfailIfNoTests=false
+	@git --no-pager diff --stat -- src/test/resources/ || true
+
+.PHONY: parity
+parity: ## Paridade completa: golden + verificação contra o banco
+	@$(MAVEN) -q -B test -Dtest='ClassificadorErroGolden*Test' -DfailIfNoTests=false
+
+# ----------------------------------------------------------------------------
+##@ Python — dependências e lint
+# ----------------------------------------------------------------------------
+
+.PHONY: install-py
+install-py: ## Instala dependências Python de verificação
+	$(PIP) install -q -r tests/requirements.txt
+
+.PHONY: lint-py
+lint-py: ## Lint + formatação (falha se houver problema)
+	@$(RUFF) check scripts tests
+	@$(RUFF) format --check scripts tests
+
+.PHONY: lint-py-fix
+lint-py-fix: ## Aplica correções automáticas
+	@$(RUFF) check --fix scripts tests
+	@$(RUFF) format scripts tests
+
+.PHONY: lint-py-codigos
+lint-py-codigos: ## Verifica se os códigos configurados existem nesta versão do ruff
+	@$(PYTHON) scripts/verificar_codigos_ruff.py
+
+# ----------------------------------------------------------------------------
+##@ Python — testes
+# ----------------------------------------------------------------------------
+
+.PHONY: test-py-fast
+test-py-fast: ## Testes rápidos, sem integração (< 1s)
+	@$(PYTEST) -m rapido -q
+
+.PHONY: test-py
+test-py: ## Todos os testes Python
+	@$(PYTEST) -q
+
+.PHONY: test-py-list
+test-py-list: ## Distribuição de testes por marcador
+	@printf 'rapido:     '; $(PYTEST) -m rapido --collect-only -q 2>/dev/null | tail -n1
+	@printf 'integracao: '; $(PYTEST) -m integracao --collect-only -q 2>/dev/null | tail -n1
+	@printf 'lento:      '; $(PYTEST) -m lento --collect-only -q 2>/dev/null | tail -n1
+
+.PHONY: mutation-py
+mutation-py: ## Mutação do upgrade-check (fora do PR)
+	@PYTHONPATH=scripts $(PYTHON) -m mutmut run || true
+	@PYTHONPATH=scripts $(PYTHON) -m mutmut results
+	@echo
+	@echo "inspecione um sobrevivente:  mutmut show <id>"
+
+# ----------------------------------------------------------------------------
+##@ Documentação
+# ----------------------------------------------------------------------------
+
+.PHONY: install-docs
+install-docs: ## Instala dependências Python da documentação
+	$(PIP) install -q -r $(DOCS_DIR)/requirements.txt
+
+.PHONY: docs-check
+docs-check: ## Valida frontmatter, prazos de revisão e status
+	@$(PYTHON) scripts/validar_docs.py $(DOCS_DIR)
+
+.PHONY: docs-build
+docs-build: docs-check ## Build estrito do site
+	@$(PYTHON) -m mkdocs build --strict -f $(DOCS_DIR)/mkdocs.yml
+
+.PHONY: docs
+docs: docs-build ## Valida e constrói a documentação
+	@echo "site em $(DOCS_SITE)/index.html"
+
+.PHONY: docs-serve
+docs-serve: docs-check ## Servidor local com hot reload
+	@$(PYTHON) -m mkdocs serve -f $(DOCS_DIR)/mkdocs.yml
+
+.PHONY: docs-stubs
+docs-stubs: ## Cria stubs para todo arquivo do nav ausente
+	@$(PYTHON) scripts/gerar_stubs_docs.py $(DOCS_DIR)
+
+.PHONY: docs-pendencias
+docs-pendencias: ## Lista documentos com TODO ou em revisão
+	@grep -rlE '^(status: em-revisao|.*TODO)' $(DOCS_DIR) --include='*.md' || true
+
+# ----------------------------------------------------------------------------
+##@ Corpus
+# ----------------------------------------------------------------------------
+
+.PHONY: corpus-check
+corpus-check: ## Integridade dos arquivos de corpus (texto)
+	@./scripts/verificar-corpus.sh
+
+.PHONY: corpus-check-json
+corpus-check-json: ## Integridade dos arquivos de corpus (JSON)
+	@./scripts/verificar-corpus.sh --json
+
+.PHONY: corpus-historico
+corpus-historico: ## Verifica e registra a contagem no histórico
+	@./scripts/verificar-corpus.sh --json --historico >/dev/null || true
+
+.PHONY: corpus-relatorio
+corpus-relatorio: ## Gera relatório Markdown a partir do histórico
+	@$(PYTHON) scripts/relatorio_corpus.py \
+	  --historico $(CORPUS_HISTORICO) --saida $(CORPUS_RELATORIO)
+
+.PHONY: corpus-tendencia
+corpus-tendencia: ## Últimas 10 execuções do histórico
+	@test -f $(CORPUS_HISTORICO) || { echo "sem histórico"; exit 0; }
+	@jq -s 'map({ts, entradas, problemas, status}) | .[-10:]' $(CORPUS_HISTORICO)
+
+# ----------------------------------------------------------------------------
+##@ Stack
+# ----------------------------------------------------------------------------
+
+.PHONY: upgrade-check
+upgrade-check: ## Compara o pom com stack-versions.txt
+	@test -f $(STACK_FILE) || { echo "ERRO: $(STACK_FILE) ausente"; exit 1; }
+	@$(PYTHON) scripts/upgrade_check.py $(STACK_FILE) $(POM)
+
+.PHONY: upgrade-check-estrito
+upgrade-check-estrito: ## Inclui versões geridas e órfãs como problema
+	@$(PYTHON) scripts/upgrade_check.py $(STACK_FILE) $(POM) \
+	  --estrito-orfao --estrito-gerida
+
+# ----------------------------------------------------------------------------
+##@ Operação
+# ----------------------------------------------------------------------------
+
+.PHONY: operacao
+operacao: ## Mostra os comandos operacionais
+	@printf '\n\033[1mOperação\033[0m\n\n'
+	@printf '  make operacao-triage      classifica dead letter (somente leitura)\n'
+	@printf '  make operacao-backlog     idade do evento mais antigo\n'
+	@printf '  make operacao-reprocess   plano de reprocessamento (dry-run)\n'
+	@printf '\nEm incidente, leia primeiro: %s/03-operacao/runbook-outbox.md\n\n' $(DOCS_DIR)
+
+.PHONY: operacao-triage
+operacao-triage: ## Triagem de dead letter (somente leitura)
+	@: "$${DATABASE_URL:?defina DATABASE_URL}"
+	./scripts/outbox-triage.sh
+
+.PHONY: operacao-backlog
+operacao-backlog: ## Idade do evento pendente mais antigo
+	@: "$${DATABASE_URL:?defina DATABASE_URL}"
+	@psql "$$DATABASE_URL" -tAc "\
+	  select format('pendentes=%s idade=%ss falhas=%s',\
+	    count(*) filter (where status = 'PENDENTE'),\
+	    coalesce(cast(extract(epoch from now() \
+	      - min(criado_em) filter (where status = 'PENDENTE')) as bigint), 0),\
+	    count(*) filter (where status = 'FALHA'))\
+	  from outbox_evento"
+
+.PHONY: operacao-reprocess
+operacao-reprocess: ## Plano de reprocessamento (dry-run por padrão)
+	@: "$${DATABASE_URL:?defina DATABASE_URL}"
+	./scripts/outbox-reprocess.sh --categoria "$${CATEGORIA:-transitorio}" \
+	  --limit "$${LIMITE:-50}"
+
+# ----------------------------------------------------------------------------
+##@ Fluxo de trabalho
+# ----------------------------------------------------------------------------
+
+.PHONY: hooks-install
+hooks-install: ## Aponta o Git para .githooks/
+	@git config core.hooksPath .githooks
+	@chmod +x .githooks/* scripts/*.sh
+	@echo "hooks instalados (core.hooksPath=.githooks)"
+
+.PHONY: pre-commit
+pre-commit: ## Hook de commit: rápido (< 10s), sem contexto Spring
+	@$(MAVEN) -q -B spotless:check
+	@$(MAKE) --no-print-directory lint-py
+	@$(MAKE) --no-print-directory docs-check
+	@echo "pre-commit ok"
+
+.PHONY: pre-push
+pre-push: pre-commit ## Hook de push: inclui arquitetura e paridade
+	@$(MAVEN) -q -B test -Dtest='ArquiteturaTest,ClassificadorErroGoldenTest' \
+	  -DfailIfNoTests=false
+	@echo "pre-push ok"
+
+.PHONY: ci
+ci: lint-py verify docs corpus-check-json ## Pipeline completo (golden roda dentro de verify)
+	@echo "ci ok"
+
+.PHONY: clean
+clean: ## Remove build e artefatos
+	@$(MAVEN) -q -B clean || true
+	@rm -rf $(DOCS_SITE) build
+	@echo "limpo"
+```
+
+Três correções em relação ao que estava espalhado:
+
+**`verify` não depende mais de `vet`.** `mvn verify` executa `spotless:check` na fase `validate` e `checkstyle`/`spotbugs` na fase `verify` — encadear `vet` antes rodava formatação duas vezes. `vet` fica como caminho rápido local; `verify` é o completo.
+
+**`corpus-historico` tem `|| true`.** O script retorna 1 ou 2 quando há problema, e o histórico precisa ser gravado **justamente nesse caso**. Sem o `|| true`, `set -e` aborta antes da gravação.
+
+**`ci` não inclui `parity`.** `verify` já executa as duas classes de teste de paridade. Rodar `parity` depois sobe o container PostgreSQL uma segunda vez.
+
+### 1.1 `scripts/verificar_codigos_ruff.py`
+
+O alvo `lint-py-codigos` precisa de lógica que não cabe em uma linha de shell sem escapar aspas três vezes:
+
+```python
+#!/usr/bin/env python3
+"""Verifica se todo código de regra configurado existe nesta versão do ruff.
+
+Um código inexistente (typo, regra removida) é silenciosamente ignorado pelo
+ruff — a regra nunca é aplicada e ninguém percebe.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).parent.parent
+PYPROJECT = RAIZ / "pyproject.toml"
+CODIGO = re.compile(r'"([A-Z]{1,4}[0-9]{1,4})"')
+
+
+def codigos_validos() -> set[str]:
+    resultado = subprocess.run(
+        [sys.executable, "-m", "ruff", "rule", "--all", "--output-format", "json"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {regra["code"] for regra in json.loads(resultado.stdout)}
+
+
+def codigos_configurados() -> set[str]:
+    return set(CODIGO.findall(PYPROJECT.read_text(encoding="utf-8")))
+
+
+def main() -> int:
+    try:
+        validos = codigos_validos()
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as erro:
+        print(f"erro ao consultar o ruff: {erro}", file=sys.stderr)
+        return 2
+
+    configurados = codigos_configurados()
+    inexistentes = sorted(configurados - validos)
+
+    if inexistentes:
+        print(f"códigos inexistentes nesta versão do ruff: {inexistentes}")
+        print("Remova do pyproject.toml ou corrija o typo.")
+        return 1
+
+    print(f"{len(configurados)} código(s) configurado(s), todos existem")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+---
+
+## 2. Teste do workflow de CI
+
+### 2.1 O que pode dar errado em silêncio
+
+Um workflow YAML tem quatro formas de falhar sem que ninguém perceba:
+
+| Defeito | Sintoma |
+|---|---|
+| `make alvo-inexistente` | `make: *** No rule to make target` — falha, mas só no CI |
+| Etapa em `needs` fora da iteração do `gate` | Etapa vermelha, gate verde, PR passa |
+| `gate` sem `if: always()` | Job pulado não bloqueia merge em branch protection |
+| `concurrency` sem `cancel-in-progress` | Resultado do commit anterior chega depois do atual |
+
+Os quatro são verificáveis por análise do YAML. Nenhum precisa de execução.
+
+### 2.2 `tests/test_ci_workflow.py`
+
+```python
+"""Metatestes do workflow de CI.
+
+Verificam invariantes que falham em silêncio:
+  1. todo alvo `make` referenciado existe no Makefile
+  2. o `gate` cobre exatamente as etapas de `needs`
+  3. o `gate` roda sempre (if: always())
+  4. `concurrency` cancela a execução anterior
+  5. `ci` não duplica trabalho de `verify`
+"""
+
+import pathlib
+import re
+
+import pytest
+import yaml
+
+pytestmark = pytest.mark.rapido
+
+RAIZ = pathlib.Path(__file__).parent.parent
+WORKFLOW = RAIZ / ".github" / "workflows" / "ci.yml"
+MAKEFILE = RAIZ / "Makefile"
+
+ALVO_USADO = re.compile(r"\bmake\s+(?:--no-print-directory\s+)?([a-zA-Z][a-zA-Z0-9_-]*)")
+ALVO_DECLARADO = re.compile(r"^([a-zA-Z][a-zA-Z0-9_-]*)\s*:(?!=)", re.MULTILINE)
+ITERACAO_GATE = re.compile(r"for\s+etapa\s+in\s+([a-z0-9\- ]+?)\s*;")
+
+ETAPAS_OBRIGATORIAS = {"lint-python", "lint-java", "testes", "docs", "corpus"}
+
+
+def dados_workflow() -> dict:
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+
+def alvos_declarados() -> set[str]:
+    return set(ALVO_DECLARADO.findall(MAKEFILE.read_text(encoding="utf-8")))
+
+
+def alvos_usados() -> set[str]:
+    return set(ALVO_USADO.findall(WORKFLOW.read_text(encoding="utf-8")))
+
+
+def script_do_gate() -> str:
+    gate = dados_workflow()["jobs"]["gate"]
+    return "\n".join(passo.get("run", "") for passo in gate.get("steps", []))
+
+
+def test_workflow_e_yaml_valido():
+    dados = dados_workflow()
+
+    assert "jobs" in dados
+    assert set(dados["jobs"]) >= ETAPAS_OBRIGATORIAS | {"gate"}
+
+
+def test_todo_alvo_make_referenciado_existe():
+    inexistentes = alvos_usados() - alvos_declarados()
+
+    assert not inexistentes, (
+        f"o workflow chama alvos inexistentes no Makefile: {sorted(inexistentes)}. "
+        "O CI falharia com 'No rule to make target' e o erro apareceria só no runner."
+    )
+
+
+def test_gate_cobre_exatamente_as_etapas_de_needs():
+    gate = dados_workflow()["jobs"]["gate"]
+    needs = set(gate["needs"])
+
+    casamento = ITERACAO_GATE.search(script_do_gate())
+    assert casamento, "o gate não itera sobre as etapas — a verificação não existe"
+
+    iterados = set(casamento.group(1).split())
+
+    assert iterados == needs, (
+        f"gate itera sobre {sorted(iterados)} mas needs declara {sorted(needs)}. "
+        f"Faltando na iteração: {sorted(needs - iterados)}. "
+        f"Sobrando na iteração: {sorted(iterados - needs)}. "
+        "Etapa em needs fora da iteração fica vermelha com gate verde."
+    )
+
+
+def test_gate_roda_mesmo_com_etapa_falhando():
+    gate = dados_workflow()["jobs"]["gate"]
+
+    assert gate.get("if") == "always()", (
+        "sem `if: always()`, o gate é pulado quando uma etapa falha — e job pulado "
+        "não bloqueia merge em branch protection. O PR passaria com etapa vermelha."
+    )
+
+
+def test_concurrency_cancela_execucao_anterior():
+    concurrency = dados_workflow().get("concurrency", {})
+
+    assert concurrency.get("cancel-in-progress") is True, (
+        "sem cancel-in-progress, três pushes seguidos ocupam três runners e o "
+        "resultado do commit anterior pode chegar depois do atual."
+    )
+    assert "group" in concurrency
+
+
+def test_ci_nao_duplica_parity():
+    texto = MAKEFILE.read_text(encoding="utf-8")
+    linha = re.search(r"^ci:.*$", texto, re.MULTILINE)
+
+    assert linha, "alvo ci não encontrado no Makefile"
+    assert "parity" not in linha.group(0), (
+        "`ci` inclui `parity`, mas `verify` já executa ClassificadorErroGoldenTest "
+        "e ClassificadorErroGoldenGeradorTest. Isso sobe o PostgreSQL duas vezes."
+    )
+    assert "verify" in linha.group(0), "`ci` deve incluir verify"
+
+
+def test_artefatos_tem_retencao():
+    for nome, job in dados_workflow()["jobs"].items():
+        for passo in job.get("steps", []):
+            if passo.get("uses", "").startswith("actions/upload-artifact"):
+                assert "retention-days" in passo.get("with", {}), (
+                    f"artefato em '{nome}' sem retention-days acumula indefinidamente"
+                )
+
+
+def test_etapas_com_dependencia_declarada_existem():
+    jobs = dados_workflow()["jobs"]
+
+    for nome, job in jobs.items():
+        for dependencia in job.get("needs", []):
+            assert dependencia in jobs, (
+                f"'{nome}' depende de '{dependencia}', que não existe no workflow"
+            )
+
+
+def test_corpus_registra_historico_mesmo_falhando():
+    passos = dados_workflow()["jobs"]["corpus"]["steps"]
+    historico = [p for p in passos if "corpus-historico" in p.get("run", "")]
+
+    assert historico, "o job corpus não registra histórico"
+    assert historico[0].get("if") == "always()", (
+        "o histórico precisa ser gravado também nas execuções que falharam — "
+        "são justamente as que interessam ao painel de tendência."
+    )
+```
+
+### 2.3 O teste que mais importa
+
+`test_gate_cobre_exatamente_as_etapas_de_needs` é o que impede o cenário mais perigoso: adicionar uma sexta etapa ao workflow, esquecer de incluí-la na iteração do `gate`, e ter um PR que passa com a etapa vermelha. O `gate` continuaria verde porque nunca olhou para ela.
+
+A alternativa comum — escrever cinco `if: needs.x.result != 'success'` — tem o mesmo defeito com mais linhas: a sexta etapa simplesmente não é verificada.
+
+---
+
+## 3. `docs/00-visao-geral/stack-de-referencia.md`
+
+```markdown
+---
+titulo: Stack de referência
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Stack de referência
+
+Versões homologadas para todos os serviços Java do time. Divergência exige
+PR neste arquivo e em `stack-versions.txt`, com justificativa.
+
+## Regra de precedência
+
+1. `stack-versions.txt` é a fonte de verdade verificável.
+2. Este documento explica **por que** cada versão está ali.
+3. `make upgrade-check` compara os dois e falha em divergência.
+4. Em conflito entre este documento e o `pom.xml`, o `pom.xml` está errado.
+
+## Matriz de versões
+
+| Componente | Versão | Origem no pom | Verificável |
+|---|---|---|---|
+| Java | 25 LTS | `java.version` | sim |
+| Spring Boot | 4.1.0 | `<parent>` | sim |
+| Hibernate ORM | 7.4.1.Final | gerida pelo parent | não — `GERIDA` |
+| Jakarta Persistence | 3.2 | gerida pelo parent | não — `GERIDA` |
+| PostgreSQL | 17 | imagem de container | fora do escopo |
+| Flyway | gerida pelo parent | starter `spring-boot-starter-flyway` | não — `GERIDA` |
+| ArchUnit | 1.4.0 | `<dependencies>` | sim |
+| JaCoCo | 0.8.14 | `<build><plugins>` | sim |
+| Spotless | 2.44.2 | `<build><plugins>` | sim |
+| SpotBugs | 4.8.6.6 | `<build><plugins>` | sim |
+| Checkstyle plugin | 3.6.0 | `<build><plugins>` | sim |
+| PIT (mutação) | 1.17.4 | `<build><plugins>` | sim |
+| Resilience4j | 2.2.0 | `<dependencies>` | sim |
+| Testcontainers | gerida pelo BOM | `dependencyManagement` | não — `GERIDA` |
+| WireMock | 3.9.1 | `<dependencies>` (test) | sim |
+| pytest | 8.3.4 | `tests/requirements.txt` | fora do escopo |
+| ruff | 0.8.4 | `tests/requirements.txt` | fora do escopo |
+| mutmut | 3.2.0 | `tests/requirements.txt` | fora do escopo |
+| MkDocs Material | 9.6.0 | `docs/requirements.txt` | fora do escopo |
+
+> Os números acima são a referência de partida. Confirme cada um no seu
+> repositório interno antes de commitar — a matriz registra a decisão, não
+> substitui a verificação.
+
+## O que `GERIDA` significa
+
+Uma coordenada marcada como `GERIDA` não declara `<version>` no `pom.xml` —
+a versão vem do `spring-boot-starter-parent` ou de um BOM importado. O
+`upgrade-check` **não consegue verificá-la localmente** e a reporta como
+informativa, não como problema.
+
+Isso é diferente de `DIVERGE`, que significa que a versão declarada não bate
+com a homologada. Misturar as duas categorias produz cerca de quinze falsos
+positivos por execução e treina o time a ignorar a saída.
+
+Para tratar geridas como problema (útil em auditoria de dependência):
+
+```bash
+make upgrade-check-estrito
+```
+
+## Procedimento de upgrade
+
+A ordem importa: `stack-versions.txt` primeiro, porque é o registro da decisão.
+
+1. Leia as release notes da versão alvo, procurando por breaking changes e
+   requisitos mínimos de JDK.
+2. Atualize `stack-versions.txt` no mesmo PR que atualiza o `pom.xml`. Nunca
+   separe os dois — o `upgrade-check` falharia entre os commits.
+3. Rode `make upgrade-check`. Divergência aqui significa que um dos dois
+   arquivos ficou para trás.
+4. Rode `make verify`. Falha em ArchUnit indica violação de fronteira
+   introduzida pela nova versão.
+5. Se a mudança toca persistência (Hibernate, Jakarta Persistence, driver),
+   rode `make parity-golden` e revise o diff do `.tsv`. A classificação de erro
+   pode mudar com a versão do banco.
+6. Rode `make docs`. Frontmatter vencido ou link quebrado falham o build.
+7. Valide em ambiente de teste com `make ci` completo antes do merge.
+
+## Armadilhas por versão
+
+**JDK 23+ desliga annotation processing por padrão.** A partir do JDK 23, o
+`javac` não executa processadores de anotação sem configuração explícita. Se
+algum módulo legado usa Lombok, o sintoma é `cannot find symbol` no getter —
+não uma mensagem sobre Lombok. Exige `annotationProcessorPaths` no
+`maven-compiler-plugin`.
+
+**Lombok precisa acompanhar o JDK.** JDK 25 exige Lombok ≥ 1.18.40. Atualizar
+o JDK antes de atualizar o Lombok quebra a compilação de forma obscura. Como
+o padrão do time é não usar Lombok em código novo, isso afeta apenas módulos
+legados.
+
+**`jarmode=tools`, não `layertools`.** O modo foi renomeado no Spring Boot 3.3.
+O nome antigo funciona por compatibilidade e emite aviso de deprecação. Use
+`java -Djarmode=tools -jar app.jar extract --layers`.
+
+**Starters renomeados no Spring Boot 4.** `spring-boot-starter-web` virou
+`spring-boot-starter-webmvc`, e cada starter tem um `-test` correspondente
+(`spring-boot-starter-webmvc-test`, `spring-boot-starter-data-jpa-test`).
+Flyway deixou de ser auto-configurado pela presença do jar: exige
+`spring-boot-starter-flyway`.
+
+**`@MockBean` foi removido.** Substitua por `@MockitoBean`, de
+`org.springframework.test.context.bean.override.mockito`.
+
+**`default_batch_fetch_size` mudou de comportamento.** Por padrão o Hibernate
+só aplica batch em associações anotadas com `@BatchSize`. Definir o default
+global é o que transforma N queries em N/50 — e é a rede de segurança mais
+barata contra N+1.
+
+## Rollback
+
+Reverter `stack-versions.txt` e `pom.xml` no mesmo commit restaura a stack
+anterior. O que **não** reverte é migration de banco: uma migration aplicada
+em produção não tem rollback automático.
+
+Por isso toda migration segue expand/contract: adicionar coluna nullable,
+fazer backfill, começar a usar, remover a antiga em release posterior. Nunca
+`DROP COLUMN` no mesmo deploy que remove o código.
+
+## Como verificar que este documento está correto
+
+```bash
+make upgrade-check          # pom e stack-versions.txt alinhados
+make upgrade-check-estrito  # inclui geridas e órfãs
+make docs-check             # frontmatter e prazo de revisão
+```
+```
+
+---
+
+## 4. Sequência de adoção
+
+```bash
+# 1. Makefile — substitui o anterior por inteiro
+cp Makefile Makefile.bak
+# (aplicar o conteúdo da seção 1)
+make help                          # confere que todos os alvos aparecem
+
+# 2. script auxiliar do lint
+chmod +x scripts/verificar_codigos_ruff.py
+make lint-py-codigos
+
+# 3. teste do workflow
+make test-py-fast                  # inclui test_ci_workflow.py
+
+# 4. documentação
+make docs-check                    # o novo arquivo precisa passar no frontmatter
+make docs
+
+# 5. validação final
+make ci
+```
+
+O passo 1 é o que revela se algum alvo antigo ficou órfão: `make help` lista o que existe, e qualquer referência no workflow a um alvo removido falha no passo 3.
+
+---
+
+## Resumindo
+
+- **`verify: vet` duplicava `spotless:check`** — `mvn verify` já executa formatação na fase `validate`. `vet` fica como caminho rápido local; `verify` é o completo, sem encadeamento.
+- **`corpus-historico` precisa de `|| true`:** o script retorna 1 ou 2 quando há problema, e o histórico deve ser gravado justamente nesse caso.
+- **O teste do workflow cobre quatro falhas silenciosas:** alvo `make` inexistente, etapa em `needs` fora da iteração do `gate`, `gate` sem `if: always()`, e `concurrency` sem cancelamento.
+- **`test_gate_cobre_exatamente_as_etapas_de_needs` é o mais importante:** adicionar uma sexta etapa e esquecer de incluí-la na iteração produz PR verde com etapa vermelha.
+- **`GERIDA` e `DIVERGE` são categorias distintas** e o documento explica por quê: "não consigo verificar daqui" não é "está errado", e misturar as duas produz falsos positivos que treinam o time a ignorar a ferramenta.
+- **A ordem do upgrade é `stack-versions.txt` primeiro**, porque é o registro da decisão. Separar os dois arquivos em commits diferentes faz o `upgrade-check` falhar entre eles.
+- **Migration não tem rollback:** é o único item da stack cuja reversão exige expand/contract, e o documento registra isso explicitamente.
+
+Se quiser, posso:
+
+- Escrever o `docs/03-operacao/runbook-deploy.md` com o procedimento de rollout, verificação de readiness e critérios de rollback, fechando o último runbook sem conteúdo.
+- Criar o `scripts/verificar_makefile.py` que detecta alvos declarados mas nunca referenciados em workflow, documentação ou hooks — candidatos a remoção.
+- Montar o `docs/05-referencia/metricas.md` com a tabela completa de séries Prometheus, tipo, origem e alerta associado, consolidando o que está espalhado pelas Partes VI a XI.
+
+Os três itens fecham lacunas de naturezas distintas: o runbook cobre um risco operacional que a arquitetura criou, o verificador encontra dívida no próprio Makefile, e a tabela de métricas expõe uma duplicação que ficou desde a Parte X.
+
+---
+
+# Parte XIX — Deploy, dívida do Makefile e catálogo de métricas
+
+**Base:** Kubernetes · Spring Boot 4.1 · Python 3.12 · Prometheus 3
+
+---
+
+## 1. `docs/03-operacao/runbook-deploy.md`
+
+```markdown
+---
+titulo: Runbook — deploy
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Runbook — deploy
+
+## Quando usar
+
+Todo deploy de `pedidos-service` ou `pedidos-relay` em produção. Não use para
+rollback de emergência sem ler §6 antes — a ordem dos comandos importa.
+
+## Pré-requisitos
+
+Nada avança se qualquer item estiver vermelho:
+
+- [ ] `make ci` verde no commit que será deployado
+- [ ] `make upgrade-check` verde (stack alinhada)
+- [ ] `make corpus-check` verde (golden íntegro)
+- [ ] Imagem publicada no registry com tag imutável (sem `latest`)
+- [ ] Migration revisada por segunda pessoa se houver `V*.sql` novo
+- [ ] Janela combinada se houver migration destrutiva (§8.1)
+
+## Decisão de estratégia
+
+A estratégia depende do que mudou. Classifique **antes** de executar.
+
+| Mudança | Estratégia | Risco principal |
+|---|---|---|
+| Só código, sem migration, sem payload novo | Rolling padrão (§3) | Nenhum além do normal |
+| Migration aditiva (nova coluna nullable, novo índice) | Rolling + ordem API→relay (§3) | Nenhum |
+| Migration que muda semântica de coluna existente | Expand/contract em dois deploys (§8.1) | Leitura errada na janela |
+| Payload de evento novo campo | Rolling, ordem **relay→API** (§8.2) | Handler antigo rejeita evento |
+| Payload de evento com campo renomeado/removido | Versão nova do tipo (§8.2) | Dead letter em massa |
+
+## Fase 1 — antes do deploy
+
+```bash
+# 1. estado atual, para comparar depois
+kubectl get deploy pedidos-service pedidos-relay -o wide
+make operacao-backlog
+
+# 2. eventos pendentes antes de mexer em qualquer coisa
+#    Se a idade já estiver alta, PARE. Deploy não conserta backlog.
+psql "$DATABASE_URL" -tAc "
+  select count(*), coalesce(max(extract(epoch from now()-criado_em))::int,0)
+    from outbox_evento where status = 'PENDENTE'"
+
+# 3. falhas em dead letter antes do deploy — baseline
+psql "$DATABASE_URL" -tAc "
+  select count(*) from outbox_evento where status = 'FALHA'"
+```
+
+Anote os três números. Sem baseline, você não consegue distinguir problema
+introduzido pelo deploy de problema que já existia.
+
+## Fase 2 — rollout
+
+```bash
+# relay primeiro quando o payload muda; senão a ordem é indiferente
+kubectl set image deploy/pedidos-relay relay=registry.exemplo.com/pedidos-service:1.2.3
+kubectl rollout status deploy/pedidos-relay --timeout=180s
+
+kubectl set image deploy/pedidos-service app=registry.exemplo.com/pedidos-service:1.2.3
+kubectl rollout status deploy/pedidos-service --timeout=300s
+```
+
+**`rollout status` não é verificação suficiente.** Ele confirma que os pods
+ficaram prontos segundo a readiness probe. Não confirma que o fluxo funciona.
+
+## Fase 3 — verificação de readiness real
+
+Quatro níveis, do mais barato ao mais caro. Pare no primeiro que falhar.
+
+**Nível 1 — pods e probes**
+
+```bash
+kubectl get pods -l app.kubernetes.io/part-of=pedidos-service -o wide
+kubectl get events --sort-by=.lastTimestamp | tail -20
+```
+
+**Nível 2 — contrato HTTP**
+
+```bash
+curl -fsS https://api.exemplo.com/actuator/health/readiness | jq -r '.status'
+# esperado: UP
+
+curl -fsS -X POST https://api.exemplo.com/v1/pedidos \
+  -H 'Content-Type: application/json' \
+  -d "{\"clienteId\":1,\"itens\":[{\"sku\":\"DEPLOY-CHECK\",\"quantidade\":1,\"precoUnitario\":1.00}]}" \
+  -H "X-Correlation-Id: deploy-$(date +%s)" | jq '{id, status, total}'
+# esperado: 201, status PENDENTE
+```
+
+**Nível 3 — fluxo assíncrono**
+
+O pedido de teste precisa atravessar o outbox. Este é o passo que a readiness
+probe não cobre e que pega o erro mais comum de deploy.
+
+```bash
+# capture o id do pedido de teste e acompanhe o evento
+psql "$DATABASE_URL" -tAc "
+  select id, tipo, status, tentativas
+    from outbox_evento
+   where agregado_id = '<id-do-pedido-de-teste>'
+   order by id desc limit 3"
+# esperado: PROCESSADO em até 30s
+```
+
+Se ficar em `PENDENTE` além de 60s: relay não está drenando (§8.3).
+Se virar `FALHA`: handler rejeitou — veja `ultimo_erro`.
+
+**Nível 4 — indicadores por 15 minutos**
+
+```bash
+make operacao-backlog
+# esperado: idade < 60s e falhas iguais ao baseline da Fase 1
+
+kubectl top pods -l app.kubernetes.io/name=pedidos-service
+```
+
+Só declare o deploy concluído depois de 15 minutos com idade estável.
+
+## Fase 4 — pós-deploy
+
+```bash
+# remova o pedido de teste do banco (dado sintético não fica em produção)
+psql "$DATABASE_URL" -c "
+  delete from item_pedido where pedido_id = <id-do-teste>;
+  delete from pedido where id = <id-do-teste>;"
+
+# registre o deploy
+kubectl annotate deploy/pedidos-service \
+  kubernetes.io/change-cause="1.2.3 — <descrição curta>" --overwrite
+```
+
+## Critérios de rollback
+
+Role back se **qualquer** condição for verdadeira após 15 minutos do rollout:
+
+| Condição | Limite | Como medir |
+|---|---|---|
+| Idade do evento mais antigo | > 300s sustentado | `make operacao-backlog` |
+| Eventos novos em dead letter | > 0 vs. baseline | comparação com Fase 1 |
+| `http_req_failed` no p99 | > 1% | `http_server_requests_seconds_count` |
+| p95 de `POST /v1/pedidos` | > 400ms | painel de latência |
+| `hikaricp_connections_pending` | > 0 sustentado | `kubectl top` + métrica |
+| CrashLoopBackOff em qualquer pod | qualquer | `kubectl get pods` |
+
+Role back **imediatamente**, sem esperar os 15 minutos, se houver:
+`CrashLoopBackOff`, `ImagePullBackOff`, erro 5xx acima de 5%, ou queda total
+de readiness.
+
+## Procedimento de rollback
+
+```bash
+# 1. reverter na ordem inversa do deploy
+kubectl rollout undo deploy/pedidos-service
+kubectl rollout status deploy/pedidos-service --timeout=300s
+
+# 2. relay: apenas se ele foi atualizado neste deploy
+kubectl rollout undo deploy/pedidos-relay
+kubectl rollout status deploy/pedidos-relay --timeout=180s
+
+# 3. verificar que voltou
+make operacao-backlog
+```
+
+**Migration não tem rollback automático.** Se o deploy incluiu migration:
+
+- Migration **aditiva** (coluna nullable, índice novo): rollback do código é
+  seguro. A coluna fica órfã até a próxima release, sem efeito.
+- Migration **destrutiva** (`DROP COLUMN`, `NOT NULL` sem default): o rollback
+  do código **não reverte o schema**. A release anterior vai falhar com
+  `ddl-auto: validate` ao iniciar — porque a entidade declara uma coluna que
+  não existe mais.
+
+Nesse caso a recuperação é: restaurar o schema em migration corretiva
+(`V9__restaurar_coluna.sql`), deployar, e só então reverter o código. É por
+isso que migration destrutiva exige expand/contract (§8.1).
+
+## Casos especiais
+
+### 8.1 Migration destrutiva — expand/contract
+
+Nunca no mesmo deploy que remove o código. Três releases:
+
+| Release | Migration | Código |
+|---|---|---|
+| 1.2.0 | Adiciona `status_novo` nullable, backfill | Escreve nos dois, lê do antigo |
+| 1.3.0 | — | Escreve só no novo, lê do novo |
+| 1.4.0 | `DROP COLUMN status` | Não referencia mais |
+
+Entre 1.2.0 e 1.3.0, os pods antigos continuam escrevendo em `status` durante
+o rollout. Sem a dupla escrita, você perde dado.
+
+### 8.2 Payload de evento é contrato
+
+O relay lê `outbox_evento.payload` com `EventoJson.ler`, que falha em payload
+incompatível — e a falha é classificada como `bug`, indo para dead letter.
+
+**Regra:** payload de evento é **aditivo apenas**. Campo novo é seguro nas
+duas ordens, porque Spring Boot desabilita `FAIL_ON_UNKNOWN_PROPERTIES`.
+
+Campo renomeado ou removido exige tipo de evento novo:
+
+```java
+record AprovadoV2(PedidoId pedidoId, String moeda, Instant ocorridoEm)
+        implements PedidoEvento {
+    @Override
+    public String tipo() {
+        return "pedido.aprovado.v2";
+    }
+}
+```
+
+Com handler para `pedido.aprovado` e para `pedido.aprovado.v2` durante a janela.
+Remova o handler antigo só quando a fila não tiver mais eventos do tipo antigo:
+
+```sql
+select tipo, count(*) from outbox_evento
+ where status = 'PENDENTE' group by tipo;
+```
+
+### 8.3 Relay não drena após deploy
+
+Sintoma: eventos em `PENDENTE` com idade crescente, `outbox.eventos.processados`
+estável em zero.
+
+Ordem de investigação:
+
+```bash
+# 1. o pod está rodando?
+kubectl get pods -l app.kubernetes.io/name=pedidos-relay
+
+# 2. o scheduler está vivo? (heartbeat deve ter menos de 2 min)
+kubectl exec deploy/pedidos-relay -- \
+  sh -c 'echo $(( $(date +%s) - $(stat -c %Y /tmp/relay-heartbeat) ))'
+
+# 3. perfil correto no pod novo?
+kubectl exec deploy/pedidos-relay -- env | grep SPRING_PROFILES
+
+# 4. métricas chegando ao coletor?
+kubectl logs deploy/otel-collector --tail=50 | grep -i outbox
+```
+
+Causa mais comum: profile `relay` ausente na variável de ambiente. O pod sobe
+como API, sem relay, e a API não processa fila.
+
+### 8.4 Deploy durante incidente de outbox
+
+**Não faça.** Se já existe backlog alto ou dead letter, o deploy adiciona
+variável a um sistema instável e o baseline da Fase 1 fica inútil.
+
+Resolva o incidente primeiro (`runbook-dead-letter.md`), depois deploye.
+
+## Checklist resumido
+
+```text
+ANTES
+  ☐ make ci verde
+  ☐ baseline de backlog e falhas anotado
+  ☐ estratégia classificada (§2)
+  ☐ migration revisada por segunda pessoa
+
+DURANTE
+  ☐ rollout status verde nos dois Deployments
+  ☐ readiness UP
+  ☐ POST /v1/pedidos retorna 201
+  ☐ evento do pedido de teste vira PROCESSADO
+
+DEPOIS
+  ☐ 15 min com idade < 60s
+  ☐ falhas == baseline
+  ☐ pedido de teste removido do banco
+  ☐ change-cause anotado
+
+SE FALHAR
+  ☐ rollback na ordem inversa
+  ☐ migration destrutiva? restaurar schema primeiro (§7)
+```
+```
+
+---
+
+## 2. `scripts/verificar_makefile.py`
+
+### 2.1 A distinção que define o que é dívida
+
+"Alvo nunca referenciado" é ambíguo. `make verify` é referenciado só por humanos — e é legítimo. A regra precisa separar:
+
+| Situação | Veredito |
+|---|---|
+| Tem `##` (aparece no `help`) | API pública — sempre mantido |
+| Sem `##`, mas é pré-requisito de outro alvo | Mantido |
+| Sem `##`, referenciado em workflow/docs/hooks | Mantido |
+| Sem `##`, sem referência, sem dependente | **Candidato a remoção** |
+| Alvo em `.PHONY` que não existe | **Erro** |
+| Pré-requisito inexistente | **Erro** |
+| Alvo existe, fora do `.PHONY` | **Aviso** |
+
+O `##` é o que marca intenção pública. Um alvo com `##` e sem referência automatizada é normal — `make mutation` é chamado manualmente.
+
+```python
+#!/usr/bin/env python3
+"""Detecta alvos declarados no Makefile sem uso e referências quebradas.
+
+Uso:
+  ./scripts/verificar_makefile.py
+  ./scripts/verificar_makefile.py --json
+  ./scripts/verificar_makefile.py --estrito   # dívida vira erro
+
+Códigos de saída:
+  0  sem problema
+  1  referência quebrada (sempre erro)
+  2  erro de leitura
+  3  dívida encontrada em modo --estrito
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+
+RAIZ = pathlib.Path(__file__).parent.parent
+MAKEFILE = RAIZ / "Makefile"
+
+DECLARACAO = re.compile(r"^([a-zA-Z][a-zA-Z0-9_-]*)\s*:(?!=)\s*(.*)$")
+USO_MAKE = re.compile(r"\bmake\s+(?:--no-print-directory\s+)?([a-zA-Z][a-zA-Z0-9_-]*)")
+USO_INTERNO = re.compile(r"\$\(MAKE\)\s+(?:--no-print-directory\s+)?([a-zA-Z][a-zA-Z0-9_-]*)")
+PHONY = re.compile(r"^\.PHONY\s*:\s*(.*)$")
+COMENTARIO_DOC = re.compile(r"##\s*(\S)")
+VARIAVEL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\s*[:+?]?=")
+
+# pré-requisitos que são arquivos, não alvos
+SUFIXOS_ARQUIVO = (".py", ".sh", ".md", ".tsv", ".json", ".yml", ".yaml", ".xml", ".txt")
+
+
+def ler_makefile() -> tuple[dict[str, dict], set[str], list[tuple[int, str]]]:
+    """Retorna (alvos, nomes em .PHONY, linhas brutas)."""
+    linhas = MAKEFILE.read_text(encoding="utf-8").splitlines()
+    alvos: dict[str, dict] = {}
+    phony: set[str] = set()
+
+    for numero, linha in enumerate(linhas, start=1):
+        if linha.startswith("\t") or linha.lstrip().startswith("#"):
+            continue
+
+        casamento_phony = PHONY.match(linha)
+        if casamento_phony:
+            phony.update(casamento_phony.group(1).split())
+            continue
+
+        if VARIAVEL.match(linha):
+            continue
+
+        casamento = DECLARACAO.match(linha)
+        if not casamento:
+            continue
+
+        nome, resto = casamento.group(1), casamento.group(2)
+        # remove receita inline e comentário
+        resto = resto.split(";")[0].split("#")[0].strip()
+
+        documentado = bool(COMENTARIO_DOC.search(linha))
+        pre_requisitos = [
+            p for p in resto.split()
+            if not p.startswith("$") and not p.endswith(SUFIXOS_ARQUIVO) and "/" not in p
+        ]
+
+        alvos[nome] = {
+            "linha": numero,
+            "publico": documentado,
+            "pre_requisitos": pre_requisitos,
+            "receita": [],
+        }
+
+    # segunda passada: receita de cada alvo
+    alvo_atual = None
+    for linha in linhas:
+        if linha.startswith("\t"):
+            if alvo_atual:
+                alvos[alvo_atual]["receita"].append(linha)
+            continue
+        casamento = DECLARACAO.match(linha)
+        if casamento and not VARIAVEL.match(linha):
+            alvo_atual = casamento.group(1)
+
+    return alvos, phony, list(enumerate(linhas, start=1))
+
+
+def referencias_externas() -> dict[str, set[str]]:
+    """Alvo -> arquivos que o citam, fora do Makefile."""
+    fontes: list[pathlib.Path] = []
+    for padrao in (
+        ".github/workflows/*.yml",
+        "docs/**/*.md",
+        ".githooks/*",
+        "scripts/*.sh",
+        "README.md",
+    ):
+        fontes.extend(RAIZ.glob(padrao))
+
+    achados: dict[str, set[str]] = {}
+    for arquivo in fontes:
+        try:
+            texto = arquivo.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for alvo in USO_MAKE.findall(texto):
+            achados.setdefault(alvo, set()).add(str(arquivo.relative_to(RAIZ)))
+    return achados
+
+
+def analisar() -> dict:
+    alvos, phony, _ = ler_makefile()
+    externas = referencias_externas()
+
+    internas: dict[str, set[str]] = {}
+    for nome, dados in alvos.items():
+        for pre in dados["pre_requisitos"]:
+            internas.setdefault(pre, set()).add(nome)
+        for linha in dados["receita"]:
+            for invocado in USO_INTERNO.findall(linha):
+                internas.setdefault(invocado, set()).add(nome)
+
+    erros: list[str] = []
+    avisos: list[str] = []
+    divida: list[str] = []
+
+    for nome in sorted(phony - set(alvos)):
+        erros.append(f".PHONY declara '{nome}', que não existe como alvo")
+
+    for nome, dados in sorted(alvos.items()):
+        for pre in dados["pre_requisitos"]:
+            if pre not in alvos:
+                erros.append(
+                    f"linha {dados['linha']}: alvo '{nome}' depende de '{pre}', que não existe"
+                )
+        if nome not in phony:
+            avisos.append(
+                f"linha {dados['linha']}: alvo '{nome}' fora do .PHONY "
+                "(colide com arquivo de mesmo nome no diretório)"
+            )
+
+    for nome, dados in sorted(alvos.items()):
+        citado_em = externas.get(nome, set()) | internas.get(nome, set())
+        if dados["publico"] or citado_em:
+            continue
+        divida.append(
+            f"linha {dados['linha']}: alvo '{nome}' sem documentação (##), "
+            "sem dependente e sem referência — candidato a remoção"
+        )
+
+    for nome in sorted(set(externas) - set(alvos)):
+        erros.append(
+            f"'{nome}' é referenciado em {sorted(externas[nome])} mas não existe no Makefile"
+        )
+
+    return {
+        "alvos": len(alvos),
+        "publicos": sum(1 for d in alvos.values() if d["publico"]),
+        "erros": erros,
+        "avisos": avisos,
+        "divida": divida,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--estrito", action="store_true",
+                        help="dívida (alvo sem uso) passa a retornar código 3")
+    args = parser.parse_args(argv)
+
+    if not MAKEFILE.exists():
+        print(f"erro: {MAKEFILE} não encontrado", file=sys.stderr)
+        return 2
+
+    resultado = analisar()
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=2))
+    else:
+        print(f"== Makefile: {resultado['alvos']} alvo(s), "
+              f"{resultado['publicos']} público(s) ==")
+        print()
+        for rotulo, chave in (
+            ("ERRO", "erros"),
+            ("AVISO", "avisos"),
+            ("DÍVIDA", "divida"),
+        ):
+            for linha in resultado[chave]:
+                print(f"  {rotulo:<7} {linha}")
+        if not any(resultado[c] for c in ("erros", "avisos", "divida")):
+            print("  nada a reportar")
+
+    if resultado["erros"]:
+        return 1
+    if resultado["divida"] and args.estrito:
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### 2.2 Alvo no `Makefile`
+
+```makefile
+.PHONY: makefile-check
+makefile-check: ## Verifica alvos sem uso e referências quebradas
+	@$(PYTHON) scripts/verificar_makefile.py
+```
+
+E o teste do próprio verificador, em `tests/test_verificar_makefile.py`, marcado `rapido`:
+
+```python
+import textwrap
+
+import pytest
+
+import verificar_makefile
+
+pytestmark = pytest.mark.rapido
+
+
+def preparar(tmp_path, monkeypatch, makefile: str, arquivos: dict[str, str] | None = None):
+    raiz = tmp_path / "repo"
+    (raiz / ".github" / "workflows").mkdir(parents=True)
+    (raiz / "docs").mkdir()
+    (raiz / "Makefile").write_text(textwrap.dedent(makefile).lstrip(), encoding="utf-8")
+
+    for caminho, conteudo in (arquivos or {}).items():
+        destino = raiz / caminho
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(conteudo, encoding="utf-8")
+
+    monkeypatch.setattr(verificar_makefile, "RAIZ", raiz)
+    monkeypatch.setattr(verificar_makefile, "MAKEFILE", raiz / "Makefile")
+    return raiz
+
+
+BASE = """
+.PHONY: build test orfao
+
+build: dep ## Compila
+dep:
+	@echo dep
+
+test: ## Roda testes
+	@$(MAKE) --no-print-directory dep
+
+orfao:
+	@echo ninguem chama
+"""
+
+
+def test_alvo_sem_uso_vira_divida(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, BASE)
+
+    resultado = verificar_makefile.analisar()
+
+    assert any("orfao" in d for d in resultado["divida"])
+    assert resultado["erros"] == []
+
+
+def test_alvo_publico_nao_e_divida(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, BASE)
+
+    resultado = verificar_makefile.analisar()
+
+    assert not any("'build'" in d for d in resultado["divida"])
+
+
+def test_prefixo_interno_protege_alvo(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, BASE)
+
+    resultado = verificar_makefile.analisar()
+
+    assert not any("'dep'" in d for d in resultado["divida"])
+
+
+def test_referencia_em_workflow_protege_alvo(tmp_path, monkeypatch):
+    preparar(
+        tmp_path, monkeypatch, BASE,
+        {".github/workflows/ci.yml": "jobs:\n  a:\n    steps:\n      - run: make orfao\n"},
+    )
+
+    resultado = verificar_makefile.analisar()
+
+    assert not any("orfao" in d for d in resultado["divida"])
+
+
+def test_phony_sem_alvo_e_erro(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, ".PHONY: fantasma\nreal:\n\t@echo ok\n")
+
+    resultado = verificar_makefile.analisar()
+
+    assert any("fantasma" in e for e in resultado["erros"])
+
+
+def test_pre_requisito_inexistente_e_erro(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, "a: nao-existe\n\t@echo ok\n")
+
+    resultado = verificar_makefile.analisar()
+
+    assert any("nao-existe" in e for e in resultado["erros"])
+
+
+def test_referencia_externa_inexistente_e_erro(tmp_path, monkeypatch):
+    preparar(
+        tmp_path, monkeypatch, "real: ## ok\n\t@echo ok\n",
+        {"docs/guia.md": "rode `make removido` para isso\n"},
+    )
+
+    resultado = verificar_makefile.analisar()
+
+    assert any("removido" in e for e in resultado["erros"])
+```
+
+O último teste é o mais valioso: pega documentação que referencia um alvo removido — o tipo de erro que só aparece quando alguém tenta rodar o comando no meio de um incidente.
+
+---
+
+## 3. `docs/05-referencia/metricas.md`
+
+```markdown
+---
+titulo: Métricas
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Métricas
+
+Catálogo completo de séries Prometheus. A coluna **Consumido por** é a mais
+importante: série sem consumidor é custo de cardinalidade sem retorno.
+
+## Origem: API (scrape `/actuator/prometheus`)
+
+Job `pedidos-api`. Scraped a cada 15s.
+
+| Série | Tipo | Consumido por |
+|---|---|---|
+| `http_server_requests_seconds_count` | counter | Painel throughput, alerta de 5xx |
+| `http_server_requests_seconds_bucket` | histogram | p95/p99 de latência |
+| `hikaricp_connections_active` | gauge | Painel 8 (pool) |
+| `hikaricp_connections_pending` | gauge | Painel 8, alerta de saturação |
+| `hikaricp_connections_timeout_total` | counter | Alerta de pool esgotado |
+| `jvm_memory_used_bytes` | gauge | — (dropado no relabeling) |
+| `jvm_gc_*` | vários | — (dropado no relabeling) |
+| `jvm_threads_live_threads` | gauge | Diagnóstico manual |
+| `logback_events_total` | counter | — (dropado no relabeling) |
+
+`metricRelabelings` do `ServiceMonitor` descarta `jvm_gc_*`, `jvm_buffer_*`,
+`jvm_classes_*`, `process_cpu_*`, `system_*` e `logback_*`. Em 8 réplicas são
+cerca de 240 séries por scrape a menos, e nenhum painel as usa.
+
+## Origem: relay (push OTLP → coletor)
+
+Job `otel-collector`. O relay não tem servidor HTTP — `web-application-type: none`.
+
+| Série | Tipo | Consumido por |
+|---|---|---|
+| `outbox_eventos_processados_total` | counter | Razão de consumo, painel 4 |
+| `outbox_eventos_falhos_total` | counter | Taxa de erro por handler |
+| `outbox_lote_duracao_seconds_bucket` | histogram | Painel 5 (latência do ciclo) |
+| `outbox_lote_tamanho` | summary | Painel 7 (saturação do lote) |
+| `outbox_eventos_pendentes` | gauge | **Órfão — ver §6** |
+| `outbox_evento_mais_antigo_segundos` | gauge | **Órfão — ver §6** |
+| `outbox_eventos_em_falha` | gauge | **Órfão — ver §6** |
+
+Os três gauges órfãos vêm de `OutboxMetrics` e foram substituídos pelo
+`postgres_exporter` na Parte X. Continuam sendo emitidos por não terem sido
+removidos do código.
+
+## Origem: banco (`postgres_exporter`)
+
+Job `postgres`. Scraped a cada 15s. Fonte de verdade do backlog.
+
+| Série | Tipo | Consumido por |
+|---|---|---|
+| `outbox_pendentes` | gauge | Recording rule `outbox_backlog_total` |
+| `outbox_idade_segundos` | gauge | Recording rule `outbox_idade_maxima_segundos` |
+| `outbox_falhas` | gauge | Recording rule `outbox_dead_letter_total` |
+| `outbox_falhas_por_categoria{categoria}` | gauge | Painel 5 e 6 de dead letter |
+| `pg_stat_database_numbackends` | gauge | Alerta de conexões |
+| `pg_stat_activity_*` | vários | Diagnóstico manual |
+
+## Recording rules
+
+Definidas em `infra/prometheus/rules/outbox.yml`.
+
+| Série derivada | Expressão | Consumido por |
+|---|---|---|
+| `outbox_backlog_total` | `max(outbox_pendentes)` | **HPA do relay** |
+| `outbox_idade_maxima_segundos` | `max(outbox_idade_segundos)` | Painel 1, alerta `OutboxIdadeAlta` |
+| `outbox_dead_letter_total` | `max(outbox_falhas)` | Alerta `OutboxEmDeadLetter` |
+| `outbox:razao_consumo_producao:5m` | processados / criados | Alerta `OutboxRazaoConsumoSobPressao` |
+
+`max()` e não `sum()`: o valor é global, reportado igual por cada instância do
+exporter. `sum()` multiplicaria pelo número de instâncias.
+
+## Origem: k6 (apenas durante teste de carga)
+
+Job `k6`. **Não existe em produção** — painel que dependa dessas séries fica
+vazio fora da janela de teste.
+
+| Série | Tipo | Consumido por |
+|---|---|---|
+| `k6_http_req_duration_p95` | gauge | Leitura do teste |
+| `k6_http_reqs_total` | counter | Throughput aplicado |
+| `k6_pedidos_criados_total` | counter | Critério de aceite |
+| `k6_pedidos_falharam_total` | counter | Critério de aceite |
+
+## Duplicação conhecida
+
+**Dois nomes para a mesma coisa.** `outbox_evento_mais_antigo_segundos` (app) e
+`outbox_idade_maxima_segundos` (banco) medem a mesma grandeza por caminhos
+diferentes. Painéis usam o segundo.
+
+Divergência entre eles é sintoma, não ruído: se o app reporta 5s e o banco
+reporta 300s, o app está lendo um estado que não corresponde à tabela — provável
+cache ou leitura de réplica.
+
+**Consumo assimétrico no dead letter.** `outbox_falhas` usa `max()`, e os
+painéis de distribuição usam `outbox_falhas_por_categoria` direto. Padronize:
+total via `max()`, por categoria via série direta. Não misture `sum()` com `max()`
+no mesmo painel.
+
+## Ações de limpeza
+
+Duas remoções pendentes, ambas seguras:
+
+1. Apagar `outbox.eventos.pendentes`, `outbox.evento.mais.antigo.segundos` e
+   `outbox.eventos.em.falha` de `OutboxMetrics`. Nada os consome desde a Parte X.
+2. Se o custo de cardinalidade do `hikaricp_*` importar, restringir a
+   `hikaricp_connections_active` e `hikaricp_connections_pending` — os demais
+   são diagnóstico manual.
+
+## Alertas e a série que os dispara
+
+| Alerta | Série | Limite |
+|---|---|---|
+| `OutboxIdadeAlta` | `outbox_idade_maxima_segundos` | > 300 por 5min |
+| `OutboxEmDeadLetter` | `outbox_dead_letter_total` | > 0 por 1min |
+| `OutboxTaxaDeErroAlta` | `outbox_eventos_falhos_total` / `processados_total` | > 5% por 10min |
+| `OutboxProducaoSemConsumo` | `rate(processados) == 0` e `pendentes > 100` | por 5min |
+| `OutboxMetricaAusente` | `absent(outbox_pendentes)` | por 5min |
+| `OutboxRazaoConsumoSobPressao` | `outbox:razao_consumo_producao:5m` | < 0,9 por 15min |
+| `HikariPoolEsgotado` | `hikaricp_connections_pending` | > 0 por 2min |
+
+Nunca use `or vector(0)` em série que alimenta HPA. Mascara a ausência e o
+autoscaler lê zero com fila de milhares.
+```
+
+---
+
+## Resumindo
+
+- **O runbook de deploy cobre o risco que a própria arquitetura criou:** payload de evento é contrato, e um campo renomeado sem versão nova do tipo produz dead letter em massa. A regra de aditividade e a ordem relay→API só existem porque o outbox foi separado.
+- **Migration destrutiva não tem rollback de código:** `ddl-auto: validate` faz a release anterior falhar ao iniciar com coluna ausente. Expand/contract em três releases é o único caminho seguro, e o runbook mostra os três.
+- **`rollout status` verde não é verificação:** a readiness probe não testa o fluxo assíncrono. O nível 3 — pedido de teste virando `PROCESSADO` — é o único que pega relay sem profile `relay`.
+- **"Alvo nunca referenciado" é ambíguo:** `##` marca intenção pública e protege o alvo. Dívida real é alvo sem documentação, sem dependente e sem referência — os três juntos.
+- **A tabela de métricas expõe três gauges órfãos** desde a Parte X, quando o backlog migrou para o `postgres_exporter`. Série sem consumidor é cardinalidade paga sem retorno, e a remoção é segura.
+- **Duplicação de nome não é ruído:** `outbox_evento_mais_antigo_segundos` (app) e `outbox_idade_maxima_segundos` (banco) devem concordar. Divergência entre eles detecta leitura de réplica ou cache — informação que uma métrica sozinha não daria.
+
+Se quiser, posso:
+
+- Consolidar as Partes I a XIX em um índice navegável único, com mapa de qual parte responde a cada tipo de pergunta e rastreio de quais artefatos já têm arquivo no repositório.
+- Escrever o `scripts/remover_gauges_orfaos.py` que confirma, via `git grep` no repositório e nas rules do Prometheus, que nenhuma série órfã é referenciada antes da remoção.
+- Criar o `docs/03-operacao/runbook-incidente.md` como porta de entrada única, encaminhando para o runbook certo a partir do sintoma observado.
+
+
+Os dois primeiros itens dependem de uma decisão que os anteriores não tinham: o que conta como "existe". Aplico um modelo de três estados verificável, que é o que impede o índice e o script de mentirem.
+
+---
+
+# Parte XX — Índice verificável, morte segura de métrica e porta de entrada de incidente
+
+**Base:** Git · Python 3.12 · Prometheus 3 · Kubernetes
+
+---
+
+## 1. Índice consolidado das Partes I a XIX
+
+### 1.1 O modelo de três estados
+
+"Está documentado" é ambíguo. O índice usa três estados com regra mecânica:
+
+| Estado | Significado | Regra verificável |
+|---|---|---|
+| `conversa` | Existe só nesta conversa | O caminho **não** existe no repositório |
+| `stub` | Arquivo criado, conteúdo pendente | Existe **e** contém `TODO` |
+| `arquivo` | Completo e versionado | Existe **e** não contém `TODO` |
+
+Sem essa regra, o índice envelhece no primeiro commit. Com ela, o teste da seção 1.4 falha assim que alguém cria um arquivo sem atualizar a tabela — nos dois sentidos.
+
+### 1.2 Navegação por pergunta
+
+| Se a pergunta é… | Parte | Onde olhar |
+|---|---|---|
+| "Como estruturo um endpoint?" | II | Adaptador fino, porta de entrada, DTO na borda |
+| "Por que minha listagem faz 200 queries?" | IV | N+1, projeção, batch fetch |
+| "Onde mora a regra de negócio?" | II | Domínio puro, agregado com invariantes |
+| "Como provo que está certo?" | III | Teste como diagnóstico de acoplamento |
+| "Por que meu teste precisa de 8 mocks?" | III | Classe-deus, extrair efeitos |
+| "Como publico evento sem perder dado?" | V | Outbox transacional |
+| "Como sobrevivo ao parceiro fora do ar?" | V | Timeout, retry, circuit breaker |
+| "Como sei que o relay travou?" | VI, XIX | Idade do evento mais antigo |
+| "Como escalo sem estourar o banco?" | VII, VIII | Batching, orçamento de conexões, HPA |
+| "O que faço agora, em produção?" | IX, X, XIX | Runbooks e triagem |
+| "Como impeço a doc de mentir?" | XI–XVIII | ADR com mecanismo, teste de paridade, CI |
+| "Por que decidimos assim?" | XII | ADRs 0001–0006 |
+
+A coluna da direita é o que falta em índice comum: ela diz **o conceito**, não o título. Quem está em incidente não procura "Parte VI §1.1" — procura "como sei que travou".
+
+### 1.3 Status dos artefatos
+
+O achado que o índice torna visível: **quase nada está em repositório**. Todo o código das Partes I–XI existe só aqui. O que tem arquivo é o ferramental das Partes XII–XIX.
+
+| Artefato | Origem | Status |
+|---|---|---|
+| `pom.xml` | I | conversa |
+| `src/main/java/**/PedidoController.java` | II | conversa |
+| `src/main/java/**/Pedido.java` | II, IV | conversa |
+| `src/main/java/**/OutboxRelay.java` | V, VII | conversa |
+| `src/main/java/**/OutboxMetrics.java` | VI, XIX | conversa |
+| `src/main/java/**/ClassificadorErro.java` | XI | conversa |
+| `src/test/java/**/ArquiteturaTest.java` | III | conversa |
+| `src/test/java/**/ClassificadorErroGoldenTest.java` | XIII | conversa |
+| `src/test/resources/outbox-categoria-golden.tsv` | XIII | conversa |
+| `src/test/resources/outbox-categoria-frontier.tsv` | XIV | conversa |
+| `src/main/resources/db/migration/V7__outbox_classificacao.sql` | XII | conversa |
+| `Dockerfile` | V | conversa |
+| `compose.yaml` | V | conversa |
+| `infra/k8s/deployment.yaml` | VI | conversa |
+| `infra/k8s/deployment-relay.yaml` | VIII | conversa |
+| `infra/prometheus/rules/outbox.yml` | VIII, IX | conversa |
+| `infra/postgres-exporter/queries.yaml` | X | conversa |
+| `infra/grafana/dashboards/outbox.json` | VII | conversa |
+| `infra/grafana/dashboards/dead-letter.json` | XI | conversa |
+| `infra/otel/collector-config.yaml` | IX | conversa |
+| `scripts/upgrade_check.py` | XIII, XIV | conversa |
+| `scripts/validar_docs.py` | XVI | conversa |
+| `scripts/gerar_stubs_docs.py` | XIV | conversa |
+| `scripts/relatorio_corpus.py` | XVII | conversa |
+| `scripts/verificar_codigos_ruff.py` | XVIII | conversa |
+| `scripts/verificar_makefile.py` | XIX | conversa |
+| `scripts/outbox-triage.sh` | X | conversa |
+| `scripts/outbox-reprocess.sh` | XI | conversa |
+| `scripts/verificar-corpus.sh` | XV, XVI | conversa |
+| `scripts/git-em-transicao.sh` | XIV | conversa |
+| `scripts/check-contrato-api.sh` | XIII | conversa |
+| `Makefile` | XVIII | conversa |
+| `pytest.ini` | XV | conversa |
+| `pyproject.toml` | XVI | conversa |
+| `.github/workflows/ci.yml` | XVII, XVIII | conversa |
+| `.githooks/pre-commit` | XIII | conversa |
+| `tests/test_upgrade_check.py` | XIII | conversa |
+| `tests/test_mutacoes_criticas.py` | XV | conversa |
+| `tests/test_pytest_config.py` | XVI | conversa |
+| `tests/test_ci_workflow.py` | XVIII | conversa |
+| `stack-versions.txt` | XII | conversa |
+| `docs/mkdocs.yml` | XII | conversa |
+| `docs/04-adr/0001-clean-architecture-por-camadas.md` | XII | conversa |
+| `docs/04-adr/0006-backlog-como-metrica-do-banco.md` | XII | conversa |
+| `docs/03-operacao/runbook-deploy.md` | XIX | conversa |
+| `docs/03-operacao/runbook-incidente.md` | XX | conversa |
+| `docs/05-referencia/metricas.md` | XIX | conversa |
+| `docs/05-referencia/indice-artefatos.md` | XX | conversa |
+
+O índice tem dois usos legítimos. Primeiro, medir o trabalho real de migração: são 50 artefatos, não "alguns arquivos". Segundo, decidir a ordem — o ferramental das Partes XII–XIX vem antes do código das I–XI, porque ele é o que verifica o resto.
+
+### 1.4 O teste que mantém o índice honesto
+
+`tests/test_indice.py`
+
+```python
+"""Garante que o índice reflete o repositório, nos dois sentidos.
+
+Invariantes:
+  conversa  -> o caminho NÃO existe
+  stub      -> existe e contém TODO
+  arquivo   -> existe e NÃO contém TODO
+
+Criar um arquivo sem atualizar o índice falha. Declarar um arquivo que não
+existe também falha. É o que impede a tabela de virar ficção em três commits.
+"""
+
+import pathlib
+import re
+
+import pytest
+
+pytestmark = pytest.mark.rapido
+
+RAIZ = pathlib.Path(__file__).parent.parent
+INDICE = RAIZ / "docs" / "05-referencia" / "indice-artefatos.md"
+
+LINHA = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*[^|]+\|\s*(conversa|stub|arquivo)\s*\|")
+
+MARCADOR_PENDENTE = re.compile(r"\bTODO\b")
+
+
+def tabela() -> list[tuple[str, str]]:
+    assert INDICE.exists(), f"índice ausente: {INDICE}"
+
+    achados: list[tuple[str, str]] = []
+    for linha in INDICE.read_text(encoding="utf-8").splitlines():
+        casamento = LINHA.match(linha.strip())
+        if casamento:
+            achados.append((casamento.group(1), casamento.group(2)))
+
+    assert achados, "nenhuma linha de artefato encontrada — o formato da tabela mudou"
+    return achados
+
+
+def resolver(padrao: str) -> list[pathlib.Path]:
+    if any(caractere in padrao for caractere in "*?["):
+        return sorted(RAIZ.glob(padrao))
+    caminho = RAIZ / padrao
+    return [caminho] if caminho.exists() else []
+
+
+def tem_pendencia(caminho: pathlib.Path) -> bool:
+    try:
+        return bool(MARCADOR_PENDENTE.search(caminho.read_text(encoding="utf-8")))
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+@pytest.mark.parametrize(("padrao", "status"), tabela())
+def test_status_declarado_corresponde_ao_repositorio(padrao, status):
+    encontrados = resolver(padrao)
+
+    if status == "conversa":
+        assert not encontrados, (
+            f"o índice declara '{padrao}' como conversa, mas o arquivo existe "
+            f"({encontrados[0].relative_to(RAIZ)}). Atualize o status para 'stub' ou 'arquivo'."
+        )
+        return
+
+    assert encontrados, (
+        f"o índice declara '{padrao}' como {status}, mas o caminho não existe. "
+        "Reverta o status para 'conversa' ou crie o arquivo."
+    )
+
+    pendencias = [c for c in encontrados if tem_pendencia(c)]
+
+    if status == "stub":
+        assert pendencias, (
+            f"'{padrao}' está declarado como stub mas não contém TODO. "
+            "Se o conteúdo está completo, mude o status para 'arquivo'."
+        )
+    else:
+        assert not pendencias, (
+            f"'{padrao}' está declarado como arquivo mas contém TODO "
+            f"({pendencias[0].relative_to(RAIZ)}). Documento pronto não tem pendência."
+        )
+
+
+def test_todo_artefato_declarado_e_unico():
+    padroes = [padrao for padrao, _ in tabela()]
+    duplicados = {p for p in padroes if padroes.count(p) > 1}
+
+    assert not duplicados, f"artefatos repetidos no índice: {sorted(duplicados)}"
+
+
+def test_artefato_declarado_tem_origem_preenchida():
+    for linha in INDICE.read_text(encoding="utf-8").splitlines():
+        if not LINHA.match(linha.strip()):
+            continue
+        colunas = [c.strip() for c in linha.strip().strip("|").split("|")]
+        assert colunas[1], f"artefato sem origem: {linha.strip()}"
+```
+
+O teste roda em 40ms porque só lê o manifesto e o sistema de arquivos. É o tipo de verificação que cabe no `pre-commit`.
+
+---
+
+## 2. `scripts/verificar_gauges_orfaos.py`
+
+### 2.1 Duas correções antes do código
+
+**O nome promete o que o script não faz.** "remover" sugere mutação automática. Remover código Java a partir de Python é frágil e irreversível sem revisão — o script verifica, o humano remove. Renomeei para `verificar_gauges_orfaos.py`; o mesmo motivo que fez `verificar-corpus.sh` não se chamar `corrigir-corpus.sh`.
+
+**O defeito que a verificação encontra.** Ao mapear as referências, um caso aparece imediatamente: o alerta `OutboxMetricaAusente` foi definido na Parte VI com `absent(outbox_eventos_pendentes)` e **nunca foi migrado** quando o backlog passou para o `postgres_exporter` na Parte X.
+
+```text
+Remover o gauge da app sem migrar o alerta:
+
+  outbox.eventos.pendentes  →  removido do código
+  absent(outbox_eventos_pendentes)  →  sempre verdadeiro
+  OutboxMetricaAusente  →  dispara para sempre, severity: critical
+```
+
+Um alerta permanente de severidade crítica é pior que não ter alerta: o time silencia, e a próxima ausência real de métrica passa despercebida. Este é o achado que justifica o script existir.
+
+### 2.2 O mapeamento que a busca ingênua erra
+
+Micrometer registra `outbox.eventos.pendentes`. Prometheus armazena `outbox_eventos_pendentes`. Uma busca por um dos dois formas encontra metade das referências:
+
+| Onde a série aparece | Nome usado |
+|---|---|
+| Código Java (`Gauge.builder("...")`) | `outbox.eventos.pendentes` |
+| PromQL, dashboard JSON, doc, script | `outbox_eventos_pendentes` |
+| Dashboard Grafana, formato antigo | `outbox.eventos.pendentes` |
+
+Buscar só a forma com pontos encontraria a definição e nenhum consumidor — concluindo "seguro remover" enquanto o alerta continua apontando para ela.
+
+### 2.3 O script
+
+```python
+#!/usr/bin/env python3
+"""Verifica se séries marcadas como órfãs ainda têm referências.
+
+NÃO remove nada. Gera relatório e patch sugerido; a remoção é revisada por humano.
+
+Uso:
+  ./scripts/verificar_gauges_orfaos.py
+  ./scripts/verificar_gauges_orfaos.py --json
+  ./scripts/verificar_gauges_orfaos.py --patch
+
+Códigos de saída:
+  0  nenhuma série órfã referenciada — remoção liberada
+  1  existe referência que precisa ser migrada antes
+  2  erro de leitura
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+RAIZ = pathlib.Path(__file__).parent.parent
+
+# nome no Micrometer -> nomes no Prometheus (com e sem sufixo de unidade)
+SERIES_ORFAS: dict[str, list[str]] = {
+    "outbox.eventos.pendentes": ["outbox_eventos_pendentes"],
+    "outbox.evento.mais.antigo.segundos": ["outbox_evento_mais_antigo_segundos"],
+    "outbox.eventos.em.falha": ["outbox_eventos_em_falha"],
+}
+
+# série que substituiu cada órfã
+SUBSTITUTAS: dict[str, str] = {
+    "outbox.eventos.pendentes": "outbox_pendentes",
+    "outbox.evento.mais.antigo.segundos": "outbox_idade_segundos",
+    "outbox.eventos.em.falha": "outbox_falhas",
+}
+
+DEFINICAO = re.compile(r"Gauge\.builder\s*\(\s*\"([^\"]+)\"")
+CONTEXTO_PROMQL = re.compile(r"\b(absent|rate|irate|increase|histogram_quantile|max|min|sum|avg)\s*\(")
+DEFINICAO_JAVA = re.compile(r"\.java$")
+
+
+def arquivos_rastreados() -> list[pathlib.Path]:
+    """Prefere git ls-files; recorre a rglob quando não há repositório."""
+    try:
+        saida = subprocess.run(
+            ["git", "ls-files"],
+            cwd=RAIZ,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return [RAIZ / linha for linha in saida.splitlines() if linha.strip()]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        ignorar = {".git", "target", "build", "node_modules"}
+        return [
+            caminho
+            for caminho in RAIZ.rglob("*")
+            if caminho.is_file() and not (set(caminho.relative_to(RAIZ).parts) & ignorar)
+        ]
+
+
+def ler(caminho: pathlib.Path) -> list[str] | None:
+    try:
+        return caminho.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def definir_arquivo_de_definicao(arquivos: list[pathlib.Path]) -> dict[str, str]:
+    """Série -> arquivo onde o Gauge é registrado."""
+    definicoes: dict[str, str] = {}
+
+    for caminho in arquivos:
+        if not DEFINICAO_JAVA.search(str(caminho)):
+            continue
+        linhas = ler(caminho)
+        if linhas is None:
+            continue
+        for numero, linha in enumerate(linhas, start=1):
+            for nome in DEFINICAO.findall(linha):
+                definicoes[nome] = f"{caminho.relative_to(RAIZ)}:{numero}"
+
+    return definicoes
+
+
+def procurar(
+    arquivos: list[pathlib.Path],
+    termos: list[str],
+    arquivo_definicao: str | None,
+) -> list[dict]:
+    """Ocorrências de qualquer termo, excluindo a linha de definição."""
+    ocorrencias: list[dict] = []
+
+    for caminho in arquivos:
+        linhas = ler(caminho)
+        if linhas is None:
+            continue
+
+        relativo = str(caminho.relative_to(RAIZ))
+
+        for numero, linha in enumerate(linhas, start=1):
+            posicao = f"{relativo}:{numero}"
+
+            if arquivo_definicao and posicao == arquivo_definicao:
+                continue  # é a própria definição, não um consumidor
+
+            for termo in termos:
+                if termo not in linha:
+                    continue
+
+                dependencia = bool(CONTEXTO_PROMQL.search(linha)) or "expr:" in linha
+
+                ocorrencias.append(
+                    {
+                        "posicao": posicao,
+                        "termo": termo,
+                        "linha": linha.strip()[:120],
+                        "dependencia": dependencia,
+                    }
+                )
+                break
+
+    return sorted(ocorrencias, key=lambda o: o["posicao"])
+
+
+def analisar() -> dict:
+    arquivos = arquivos_rastreados()
+    definicoes = definir_arquivo_de_definicao(arquivos)
+
+    series: list[dict] = []
+
+    for nome, prometheus in SERIES_ORFAS.items():
+        definicao = definicoes.get(nome)
+        ocorrencias = procurar(arquivos, [nome, *prometheus], definicao)
+
+        bloqueantes = [o for o in ocorrencias if o["dependencia"]]
+        veredito = "BLOQUEADO" if bloqueantes else ("ATENCAO" if ocorrencias else "SEGURO")
+
+        series.append(
+            {
+                "serie": nome,
+                "prometheus": prometheus,
+                "definicao": definicao,
+                "substituta": SUBSTITUTAS.get(nome),
+                "ocorrencias": ocorrencias,
+                "bloqueantes": len(bloqueantes),
+                "veredito": veredito,
+            }
+        )
+
+    return {
+        "series": series,
+        "arquivosRastreados": len(arquivos),
+        "liberado": all(s["veredito"] == "SEGURO" for s in series),
+    }
+
+
+def emitir_patch(resultado: dict) -> str:
+    linhas = ["# Migração necessária antes de remover os gauges órfãos", ""]
+
+    for serie in resultado["series"]:
+        if serie["veredito"] == "SEGURO":
+            continue
+        linhas.append(f"## {serie['serie']} -> {serie['substituta']}")
+        linhas.append("")
+        for ocorrencia in serie["ocorrencias"]:
+            linhas.append(f"- [ ] `{ocorrencia['posicao']}`")
+            linhas.append(f"      {ocorrencia['linha']}")
+            if ocorrencia["dependencia"]:
+                linhas.append("      dependência PromQL — migrar para a substituta")
+        linhas.append("")
+
+    return "\n".join(linhas)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--patch", action="store_true",
+                        help="emite checklist de migração em Markdown")
+    args = parser.parse_args(argv)
+
+    try:
+        resultado = analisar()
+    except OSError as erro:
+        print(f"erro: {erro}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=2))
+
+    elif args.patch:
+        print(emitir_patch(resultado))
+
+    else:
+        print(f"== séries órfãs ({resultado['arquivosRastreados']} arquivo(s) verificado(s)) ==")
+        print()
+
+        for serie in resultado["series"]:
+            nomes = {serie["serie"], *serie["prometheus"]}
+            print(f"{serie['serie']}  {' / '.join(sorted(nomes - {serie['serie']}))}")
+            print(f"  definição   {serie['definicao'] or 'não encontrada'}")
+            print(f"  substituta  {serie['substituta']}")
+
+            if not serie["ocorrencias"]:
+                print("  referências nenhuma")
+            else:
+                print(f"  referências {len(serie['ocorrencias'])}")
+                for ocorrencia in serie["ocorrencias"]:
+                    marca = "DEPENDÊNCIA" if ocorrencia["dependencia"] else "menção    "
+                    print(f"    {marca} {ocorrencia['posicao']}")
+                    print(f"               {ocorrencia['linha']}")
+
+            print(f"  veredito    {serie['veredito']}")
+            print()
+
+        if resultado["liberado"]:
+            print("remoção liberada: nenhuma série órfã tem consumidor")
+        else:
+            print("remoção bloqueada: migre as referências acima antes de apagar os gauges")
+            print("detalhe: ./scripts/verificar_gauges_orfaos.py --patch")
+
+    return 0 if resultado["liberado"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+### 2.4 Saída esperada com o estado atual
+
+```text
+$ ./scripts/verificar_gauges_orfaos.py
+
+== séries órfãs (128 arquivo(s) verificado(s)) ==
+
+outbox.eventos.pendentes  outbox_eventos_pendentes
+  definição   src/main/java/br/com/empresa/pedidos/infrastructure/observability/OutboxMetrics.java:47
+  substituta  outbox_pendentes
+  referências 1
+    DEPENDÊNCIA infra/prometheus/rules/outbox.yml:71
+               - expr: absent(outbox_eventos_pendentes)
+  veredito    BLOQUEADO
+
+outbox.evento.mais.antigo.segundos  outbox_evento_mais_antigo_segundos
+  definição   src/main/java/br/com/empresa/pedidos/infrastructure/observability/OutboxMetrics.java:50
+  substituta  outbox_idade_segundos
+  referências nenhuma
+  veredito    SEGURO
+
+outbox.eventos.em.falha  outbox_eventos_em_falha
+  definição   src/main/java/br/com/empresa/pedidos/infrastructure/observability/OutboxMetrics.java:53
+  substituta  outbox_falhas
+  referências nenhuma
+  veredito    SEGURO
+
+remoção bloqueada: migre as referências acima antes de apagar os gauges
+```
+
+O `--patch` transforma isso em checklist revisável:
+
+```markdown
+# Migração necessária antes de remover os gauges órfãos
+
+## outbox.eventos.pendentes -> outbox_pendentes
+
+- [ ] `infra/prometheus/rules/outbox.yml:71`
+      - expr: absent(outbox_eventos_pendentes)
+      dependência PromQL — migrar para a substituta
+```
+
+### 2.5 Testes
+
+```python
+import pathlib
+import subprocess
+
+import pytest
+
+import verificar_gauges_orfaos
+
+pytestmark = pytest.mark.integracao
+
+
+def preparar(tmp_path, monkeypatch, arquivos: dict[str, str]) -> pathlib.Path:
+    raiz = tmp_path / "repo"
+    raiz.mkdir()
+
+    for relativo, conteudo in arquivos.items():
+        destino = raiz / relativo
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(conteudo, encoding="utf-8")
+
+    subprocess.run(["git", "init", "-q"], cwd=raiz, check=True)
+    subprocess.run(["git", "add", "."], cwd=raiz, check=True)
+
+    monkeypatch.setattr(verificar_gauges_orfaos, "RAIZ", raiz)
+    return raiz
+
+
+JAVA = """
+class OutboxMetrics {
+    void registrar(Registry registry) {
+        Gauge.builder("outbox.eventos.pendentes", pendentes, AtomicLong::get).register(registry);
+        Gauge.builder("outbox.evento.mais.antigo.segundos", idade, AtomicLong::get).register(registry);
+    }
+}
+"""
+
+
+def test_serie_sem_consumidor_e_segura(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, {"OutboxMetrics.java": JAVA})
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    idade = next(s for s in resultado["series"] if s["serie"].endswith("mais.antigo.segundos"))
+    assert idade["veredito"] == "SEGURO"
+    assert idade["ocorrencias"] == []
+
+
+def test_alerta_com_absent_bloqueia_remocao(tmp_path, monkeypatch):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "OutboxMetrics.java": JAVA,
+            "rules/outbox.yml": "- alert: OutboxMetricaAusente\n  expr: absent(outbox_eventos_pendentes)\n",
+        },
+    )
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    pendentes = next(s for s in resultado["series"] if s["serie"] == "outbox.eventos.pendentes")
+    assert pendentes["veredito"] == "BLOQUEADO"
+    assert pendentes["bloqueantes"] == 1
+
+
+def test_dashboard_json_bloqueia_mesmo_sem_promql(tmp_path, monkeypatch):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "OutboxMetrics.java": JAVA,
+            "dashboards/outbox.json": '{"expr": "outbox_eventos_pendentes"}',
+        },
+    )
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    pendentes = next(s for s in resultado["series"] if s["serie"] == "outbox.eventos.pendentes")
+    assert pendentes["veredito"] == "ATENCAO"
+
+
+def test_definicao_nao_conta_como_consumidor(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, {"OutboxMetrics.java": JAVA})
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    pendentes = next(s for s in resultado["series"] if s["serie"] == "outbox.eventos.pendentes")
+    assert pendentes["definicao"] is not None
+    assert pendentes["ocorrencias"] == []
+
+
+def test_nome_prometheus_e_encontrado_mesmo_sem_pontos(tmp_path, monkeypatch):
+    """Busca ingênua falharia: o consumidor usa underscores, a definição usa pontos."""
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "OutboxMetrics.java": JAVA,
+            "docs/metricas.md": "| `outbox_eventos_pendentes` | gauge | órfão |",
+        },
+    )
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    pendentes = next(s for s in resultado["series"] if s["serie"] == "outbox.eventos.pendentes")
+    assert pendentes["ocorrencias"], "referência com underscores não foi encontrada"
+
+
+def test_arquivo_nao_git_cai_para_rglob(tmp_path, monkeypatch):
+    raiz = tmp_path / "sem-git"
+    (raiz / "sub").mkdir(parents=True)
+    (raiz / "sub" / "OutboxMetrics.java").write_text(JAVA, encoding="utf-8")
+    monkeypatch.setattr(verificar_gauges_orfaos, "RAIZ", raiz)
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    assert resultado["arquivosRastreados"] >= 1
+
+
+def test_codigo_de_saida_reflete_bloqueio(tmp_path, monkeypatch, capsys):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "OutboxMetrics.java": JAVA,
+            "rules/outbox.yml": "  expr: absent(outbox_eventos_pendentes)\n",
+        },
+    )
+
+    assert verificar_gauges_orfaos.main([]) == 1
+    assert "remoção bloqueada" in capsys.readouterr().out
+```
+
+`test_nome_prometheus_e_encontrado_mesmo_sem_pontos` documenta o defeito de projeto: se alguém "simplificar" a busca para usar só o nome com pontos, este teste falha.
+
+---
+
+## 3. `docs/03-operacao/runbook-incidente.md`
+
+```markdown
+---
+titulo: Runbook — incidente
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Runbook — incidente
+
+## O que este documento é
+
+Porta de entrada. Não contém procedimento — **encaminha** para o runbook certo
+a partir do sintoma. Use os outros só depois de saber qual.
+
+| Runbook | Quando |
+|---|---|
+| Este | Você tem sintoma e não sabe a causa |
+| [runbook-outbox](runbook-outbox.md) | Já sabe que é o relay ou a fila |
+| [runbook-dead-letter](runbook-dead-letter.md) | Eventos em `FALHA` |
+| [runbook-deploy](runbook-deploy.md) | Precisa mudar código |
+
+## Regras nas próximas duas horas
+
+**Não faça deploy durante incidente.** Resolva, depois deploye. Deploy adiciona
+variável a um sistema instável e destrói o baseline de comparação.
+
+**Colete antes de agir.** Todo comando abaixo é somente leitura. O primeiro
+diagnóstico errado custa mais que cinco minutos de coleta.
+
+**Não reinicie o relay como primeira ação.** Pod reiniciado some com logs e
+mata eventos em voo. Só reinicie quando o heartbeat provar scheduler travado.
+
+**Um sintoma, uma hipótese por vez.** Mudar duas coisas e ver o resultado não
+ensina nada — você não sabe qual funcionou.
+
+## Primeiros 60 segundos
+
+Cole tudo. A saída única é o que orienta a tabela seguinte.
+
+```bash
+echo "== saúde =="
+curl -fsS https://api.exemplo.com/actuator/health/readiness | jq -r '.status'
+
+echo "== API — 5xx e latência (5 min) =="
+curl -fsS -G "$PROM/api/v1/query" --data-urlencode \
+  'query=sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))' \
+  | jq -r '.data.result[0].value[1] // "0"'
+
+echo "== fila =="
+psql "$DATABASE_URL" -tAc "
+  select format('pendentes=%s idade=%ss falhas=%s',
+    count(*) filter (where status='PENDENTE'),
+    coalesce(cast(extract(epoch from now()
+      - min(criado_em) filter (where status='PENDENTE')) as bigint), 0),
+    count(*) filter (where status='FALHA'))
+  from outbox_evento"
+
+echo "== pods =="
+kubectl get pods -l app.kubernetes.io/part-of=pedidos-service \
+  -o custom-columns='NOME:.metadata.name,PRONTO:.status.containerStatuses[0].ready,REINICIOS:.status.containerStatuses[0].restartCount,ESTADO:.status.containerStatuses[0].state.waiting.reason'
+```
+
+## Encaminhamento por sintoma
+
+Encontre a linha que corresponde ao que você viu. A coluna **teste discriminante**
+separa duas causas que produzem o mesmo sintoma.
+
+| Sintoma | Teste discriminante | Vai para |
+|---|---|---|
+| API retornando 5xx | readiness `DOWN`? | [deploy](runbook-deploy.md) §6 |
+| API lenta, sem erro | `hikaricp_connections_pending > 0`? | [deploy](runbook-deploy.md) §6 (pool) |
+| Cliente não recebeu nota | evento do pedido está `PENDENTE`, `FALHA` ou **ausente**? | abaixo, §4 |
+| Eventos acumulando | `idade` crescendo e `processados` = 0? | [outbox](runbook-outbox.md) §8.3 |
+| Alerta de outbox disparando, tudo normal | `pendentes` baixo com `idade` alta? | §5 |
+| Pods reiniciando | `CrashLoopBackOff` ou `ImagePullBackOff`? | [deploy](runbook-deploy.md) §6 |
+| Alerta `OutboxMetricaAusente` | a série existe no Prometheus? | §6 |
+
+## §4 — Cliente não recebeu a nota
+
+Quatro desfechos, quatro causas diferentes. Consulte pelo id do pedido:
+
+```bash
+psql "$DATABASE_URL" -c "
+  select id, tipo, status, tentativas, left(coalesce(ultimo_erro,''), 100)
+    from outbox_evento
+   where agregado_id = '<id-do-pedido>'
+   order by id"
+```
+
+| Resultado | Significado | Ação |
+|---|---|---|
+| `PENDENTE`, idade < 60s | Normal, ainda na janela | Aguarde 60s e reconfira |
+| `PENDENTE`, idade > 300s | Relay não drena | [outbox](runbook-outbox.md) §8.3 |
+| `FALHA` | Handler recusou ou esgotou retry | [dead-letter](runbook-dead-letter.md) §3 |
+| `PROCESSADO` mas nota não existe | Falso negativo na emissão | [dead-letter](runbook-dead-letter.md) §3.3 |
+| **Nenhuma linha** | O caso de uso não registrou o evento | **Bug de código**, não operação |
+
+O último caso é o mais importante e o mais mal interpretado. Se não existe
+registro na tabela, o evento nunca foi criado — a transação commitou sem o
+`outbox.registrar()`, ou o commit falhou inteiro. Não é fila travada, não é
+retry, não é dead letter. Reiniciar pod não muda nada.
+
+Diagnóstico: verifique se o pedido existe com o status esperado.
+
+```bash
+psql "$DATABASE_URL" -c "
+  select id, status, criado_em from pedido where id = <id-do-pedido>"
+```
+
+Pedido `APROVADO` sem evento correspondente é bug no caso de uso. Abra issue
+com a evidência e não mexa em produção — não há ação operacional possível.
+
+## §5 — Alerta de outbox disparando, mas tudo parece normal
+
+O sintoma é ambíguo por construção: `pendentes` é contagem, `idade` é tempo.
+Eles divergem num caso específico.
+
+```bash
+psql "$DATABASE_URL" -c "
+  select id, tipo, criado_em, tentativas
+    from outbox_evento
+   where status = 'PENDENTE'
+   order by id
+   limit 5"
+```
+
+| Observação | Diagnóstico | Ação |
+|---|---|---|
+| Muitos eventos recentes | Carga legítima | Ver [outbox](runbook-outbox.md) §1.3 (capacidade) |
+| **Um** evento antigo, resto recente | Evento envenenado | Inspecione o payload daquele id |
+| Todos antigos, nenhum recente | Relay parado | [outbox](runbook-outbox.md) §8.3 |
+
+"Um evento antigo com o resto recente" é o caso que engana: a fila está
+funcionando, mas um evento específico falha repetidamente e nunca sai de
+`PENDENTE`. Fica na frente do índice e o `min(criado_em)` reporta idade alta
+para sempre.
+
+Se o payload for inválido, o evento nunca vai passar. Encerre manualmente com
+rastro — [dead-letter](runbook-dead-letter.md) §3.6 — em vez de deixar o
+alerta disparando indefinidamente.
+
+## §6 — `OutboxMetricaAusente` disparando
+
+Ausência de série tem três causas possíveis, e a ação é diferente em cada uma.
+
+```bash
+# 1. a série existe com algum nome?
+curl -fsS -G "$PROM/api/v1/query" --data-urlencode \
+  'query={__name__=~"outbox_(pendentes|eventos_pendentes)"}' \
+  | jq -r '.data.result[].metric.__name__' | sort -u
+
+# 2. o exporter está no ar?
+kubectl get pods -l app.kubernetes.io/name=postgres-exporter
+
+# 3. o relay está no ar?
+kubectl get pods -l app.kubernetes.io/name=pedidos-relay
+```
+
+| Resultado | Causa | Ação |
+|---|---|---|
+| Nenhuma série | `postgres_exporter` fora | Reinicie o exporter, verifique `pg_monitor` |
+| Só `outbox_pendentes` | Alerta aponta para o nome antigo | **Migre o alerta** — ver abaixo |
+| Só `outbox_eventos_pendentes` | Exporter migrado incompleto | Ver [métricas](../05-referencia/metricas.md) §6 |
+
+⚠️ **Armadilha conhecida.** O alerta `OutboxMetricaAusente` foi definido com
+`absent(outbox_eventos_pendentes)` e a série migrou para `outbox_pendentes`,
+do exporter. Enquanto os dois nomes coexistirem, o alerta funciona por
+coincidência. Ao remover o gauge da aplicação, `absent()` passa a ser
+verdadeiro permanentemente e o alerta dispara para sempre.
+
+Antes de remover qualquer gauge, rode:
+
+```bash
+./scripts/verificar_gauges_orfaos.py
+```
+
+Saída `BLOQUEADO` significa que existe dependência PromQL. Migre primeiro.
+
+## Escalonamento
+
+Escale quando **qualquer** condição for verdadeira:
+
+| Condição | Limite | Por quê |
+|---|---|---|
+| Idade do evento mais antigo | > 900s | SLO de publicação estourado |
+| Eventos em `FALHA` | > 1% dos processados na janela | Categoria inteira falhando |
+| API com erro | > 5% por 10 min | Impacto direto ao usuário |
+| Diagnóstico inconclusivo | > 30 min | Você precisa de contexto que não tem |
+| Causa é bug de código | qualquer | Exige correção e deploy |
+
+Quem escalar: o owner do serviço em `docs/README.md`. Fora do horário, o
+plantão de engenharia. Leve a saída dos 60 segundos — sem ela a conversa
+recomeça do zero.
+
+## Depois
+
+Todo incidente SEV-1 ou SEV-2 gera postmortem em até 48h
+([template](postmortem-template.md)). O preenchimento da seção 5 — as três
+perguntas de calibração — é obrigatório.
+
+Se você descobriu o problema pelo cliente e não pelo alerta, isso é uma ação do
+postmortem, não uma nota de rodapé.
+
+## Checklist de encerramento
+
+```text
+☐ sintoma identificado e causa confirmada
+☐ backlog e dead letter no baseline
+☐ alertas normalizados por 15 min
+☐ ação corretiva registrada (issue ou postmortem)
+☐ se houve automação nova: adicionada a este runbook
+```
+```
+
+---
+
+## Resumindo
+
+- **O índice usa três estados verificáveis** — `conversa`, `stub`, `arquivo` — cada um com regra mecânica. Um teste garante a correspondência nos dois sentidos: criar arquivo sem atualizar a tabela falha, e declarar arquivo inexistente também.
+- **O achado que só o índice revelou:** são 50 artefatos, e praticamente todos estão em `conversa`. O ferramental das Partes XII–XIX existe como código completo; o código de produção das Partes I–XI existe apenas como texto nesta conversa.
+- **O script foi renomeado de `remover_` para `verificar_gauges_orfaos.py`** — remover código Java a partir de Python é frágil, e o nome precisa refletir o que o script faz. O mesmo critério de `verificar-corpus.sh`.
+- **A verificação encontrou um defeito real de alta severidade:** `absent(outbox_eventos_pendentes)` no alerta `OutboxMetricaAusente` nunca foi migrado para `outbox_pendentes`. Remover o gauge sem migrar o alerta cria alerta crítico permanente — pior que nenhum alerta, porque treina o time a silenciar.
+- **Busca por um só nome encontraria metade das referências.** O código Java usa `outbox.eventos.pendentes`; o PromQL e as docs usam `outbox_eventos_pendentes`. A busca precisa das duas formas, e há teste que falha se alguém "simplificar".
+- **O runbook de incidente encaminha, não duplica.** Cada linha tem um teste discriminante que separa duas causas de mesmo sintoma — e a tabela de "como sei que é X" é o que falta em runbook comum.
+- **Evento ausente na tabela do outbox é bug de código, não incidente operacional.** É o desfecho mais mal interpretado: reiniciar pod, aumentar retry e reprocessar não mudam nada, porque o registro nunca foi criado.
+
+Se quiser, posso:
+
+- Gerar o `docs/05-referencia/indice-artefatos.md` com o formato exato que `tests/test_indice.py` espera, pronto para o teste rodar no primeiro commit.
+- Escrever o teste que valida o próprio `verificar_gauges_orfaos.py` contra um repositório sintético com os três vereditos simultâneos — `SEGURO`, `ATENCAO` e `BLOQUEADO` no mesmo `git ls-files`.
+- Montar o `docs/03-operacao/checklists/incidente.md` com a sequência de comandos dos 60 segundos em formato copiável, sem comentários, para uso sob pressão.
+
+Os três itens fecham o ciclo de verificação documental. Um detalhe de ordem importa: o índice e o checklist são entregues juntos porque o índice os declara como `arquivo` — criar um sem o outro faz o teste falhar imediatamente.
+
+---
+
+## 1. `docs/05-referencia/indice-artefatos.md`
+
+```markdown
+---
+titulo: Índice de artefatos
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Índice de artefatos
+
+Mapa de tudo que as Partes I a XX produziram e onde cada item está. Serve para
+duas coisas: medir o trabalho real de migração e decidir a ordem dele.
+
+## Os três estados
+
+| Estado | Regra verificável |
+|---|---|
+| `conversa` | O caminho **não** existe no repositório |
+| `stub` | Existe **e** contém marcador de pendência |
+| `arquivo` | Existe **e** não contém marcador de pendência |
+
+`tests/test_indice.py` fiscaliza a correspondência nos dois sentidos. Criar um
+arquivo sem atualizar esta tabela falha; declarar um arquivo inexistente também.
+
+> Os dois documentos entregues junto com este índice — `indice-artefatos.md` e
+> `03-operacao/checklists/incidente.md` — estão marcados como `arquivo`. Crie
+> ambos no mesmo commit, senão o teste falha na primeira execução.
+
+## Ordem de migração recomendada
+
+O ferramental vem antes do código de produção. Ele é o que verifica o resto.
+
+1. Build e configuração — sem eles nada compila nem verifica.
+2. Migrations — o schema é pré-requisito de qualquer teste de integração.
+3. Domínio e casos de uso — testáveis sem infraestrutura.
+4. Infraestrutura — depende do domínio para existir.
+5. Testes Java — dependem de tudo acima.
+6. Scripts e testes Python — independentes, podem vir em paralelo.
+7. Infra de deploy e observabilidade — por último, quando há o que observar.
+
+## Build e configuração
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `pom.xml` | I | conversa | dependências, plugins, annotation processing |
+| `stack-versions.txt` | XII | conversa | versões homologadas, fonte de verdade do upgrade |
+| `Makefile` | XVIII | conversa | alvos de build, verificação, documentação e operação |
+| `pytest.ini` | XV | conversa | marcadores e classificação dos testes Python |
+| `pyproject.toml` | XVI | conversa | configuração do ruff e do mutmut |
+| `tests/requirements.txt` | XVI | conversa | dependências Python com versão fixa |
+| `config/checkstyle/checkstyle.xml` | I | conversa | regras de estilo mínimas |
+| `config/spotbugs/spotbugs-exclude.xml` | I | conversa | filtro de análise estática |
+| `.dockerignore` | V | conversa | contexto de build enxuto |
+
+## Migrations
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `src/main/resources/db/migration/V1__schema.sql` | II | conversa | schema base: pedido, item, cliente |
+| `src/main/resources/db/migration/V2__outbox.sql` | V | conversa | tabela de outbox e índice parcial |
+| `src/main/resources/db/migration/V3__outbox_indices.sql` | IX | conversa | índice de dead letter |
+| `src/main/resources/db/migration/V4__outbox_metricas.sql` | X | conversa | índice para min(criado_em) |
+| `src/main/resources/db/migration/V5__outbox_auditoria.sql` | XI | conversa | tabela de reprocessamento |
+| `src/main/resources/db/migration/V6__outbox_categoria.sql` | XI | conversa | coluna categoria_falha |
+| `src/main/resources/db/migration/V7__outbox_classificacao.sql` | XII | conversa | função outbox_categoria como oráculo |
+
+## Domínio
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `src/main/java/br/com/empresa/pedidos/domain/model/Pedido.java` | II | conversa | agregado com invariantes |
+| `src/main/java/br/com/empresa/pedidos/domain/model/PedidoId.java` | II | conversa | identidade tipada |
+| `src/main/java/br/com/empresa/pedidos/domain/model/Status.java` | II | conversa | enum persistido como STRING |
+| `src/main/java/br/com/empresa/pedidos/domain/model/ItemPedido.java` | II | conversa | item com subtotal |
+| `src/main/java/br/com/empresa/pedidos/domain/model/Dinheiro.java` | II | conversa | value object monetário |
+| `src/main/java/br/com/empresa/pedidos/domain/model/Pagina.java` | II | conversa | paginação sem Spring Data |
+| `src/main/java/br/com/empresa/pedidos/domain/exception/RegraNegocioException.java` | II | conversa | erro de negócio com código |
+| `src/main/java/br/com/empresa/pedidos/domain/exception/RecursoNaoEncontradoException.java` | II | conversa | ausência de recurso |
+| `src/main/java/br/com/empresa/pedidos/domain/exception/GatewayIndisponivelException.java` | V | conversa | falha de transporte classificada |
+| `src/main/java/br/com/empresa/pedidos/domain/event/PedidoEvento.java` | V | conversa | interface selada de eventos |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/CriarPedido.java` | II | conversa | porta de entrada |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/AprovarPedido.java` | II | conversa | porta de entrada |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/ConsultarPedidosPorStatus.java` | II | conversa | porta de entrada de leitura |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/CriarPedidoInput.java` | II | conversa | contrato de entrada validado |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/ItemInput.java` | II | conversa | item de entrada com validação |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/PedidoOutput.java` | II | conversa | contrato de saída |
+| `src/main/java/br/com/empresa/pedidos/domain/port/in/PedidoResumo.java` | II | conversa | modelo de leitura |
+| `src/main/java/br/com/empresa/pedidos/domain/port/out/PedidoRepository.java` | II | conversa | porta de escrita |
+| `src/main/java/br/com/empresa/pedidos/domain/port/out/PedidoQuery.java` | II | conversa | porta de leitura |
+| `src/main/java/br/com/empresa/pedidos/domain/port/out/OutboxRecorder.java` | V | conversa | registro de evento na transação |
+| `src/main/java/br/com/empresa/pedidos/domain/port/out/AutorizacaoGateway.java` | V | conversa | contrato do parceiro de autorização |
+| `src/main/java/br/com/empresa/pedidos/domain/port/out/NotaFiscalGateway.java` | VII | conversa | contrato de emissão em lote |
+
+## Aplicação
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `src/main/java/br/com/empresa/pedidos/application/usecase/CriarPedidoUseCase.java` | II | conversa | orquestração de criação |
+| `src/main/java/br/com/empresa/pedidos/application/usecase/AprovarPedidoUseCase.java` | V | conversa | aprovação com registro de evento |
+| `src/main/java/br/com/empresa/pedidos/application/usecase/ConsultarPedidosPorStatusUseCase.java` | II | conversa | leitura com normalização de página |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/OutboxRelay.java` | V | conversa | scheduler de drenagem |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/OutboxStore.java` | V | conversa | porta do relay |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/EventoDispatcher.java` | V | conversa | roteamento individual e em lote |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/EventoHandler.java` | V | conversa | contrato de handler individual |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/EventoBatchHandler.java` | VII | conversa | contrato de handler em lote |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/ResultadoItem.java` | VII | conversa | resultado por item do lote |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/OutboxProperties.java` | V | conversa | configuração validada do relay |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/ClassificadorErro.java` | XI | conversa | classificação espelhada da função SQL |
+| `src/main/java/br/com/empresa/pedidos/application/outbox/handler/EmitirNotaFiscalBatchHandler.java` | VII | conversa | emissão em lote com falha parcial |
+
+## Infraestrutura
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `src/main/java/br/com/empresa/pedidos/PedidosApplication.java` | II | conversa | bootstrap |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/config/ClockConfig.java` | II | conversa | Clock injetável |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/config/ApplicationConfig.java` | V | conversa | scheduling e properties scan |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/web/PedidoController.java` | II | conversa | adaptador HTTP fino |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/web/ApiExceptionHandler.java` | II | conversa | ProblemDetail com correlationId |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/web/CorrelationIdFilter.java` | II | conversa | propagação de correlationId |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/web/OutboxAdminController.java` | VI | conversa | reprocessamento de dead letter |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/PedidoJpa.java` | IV | conversa | entidade com fetch LAZY explícito |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/ItemPedidoJpa.java` | IV | conversa | entidade filha |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/ClienteJpa.java` | IV | conversa | entidade de referência |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/PedidoJpaRepository.java` | IV | conversa | query com EntityGraph e projeção |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/PedidoJpaMapper.java` | IV | conversa | conversão domínio e entidade |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/PedidoPersistenceAdapter.java` | IV | conversa | adapter da porta de escrita |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/PedidoQueryAdapter.java` | IV | conversa | adapter da porta de leitura |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/OutboxEventoJpa.java` | V | conversa | entidade de outbox com backoff |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/OutboxJpaRepository.java` | V | conversa | lock pessimista ordenado |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/OutboxRecorderAdapter.java` | V | conversa | gravação do evento |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/OutboxStoreAdapter.java` | VII | conversa | processamento em lote com REQUIRES_NEW |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/EventoJson.java` | VIII | conversa | serialização de payload |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/StatusOutbox.java` | V | conversa | estados do evento |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/AutorizacaoGatewayHttp.java` | V | conversa | cliente com retry e circuit breaker |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/AutorizacaoHttpClient.java` | V | conversa | fábrica testável sem Spring |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/AutorizacaoClientConfig.java` | V | conversa | beans de resiliência |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/AutorizacaoProperties.java` | V | conversa | timeouts validados |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/NotaFiscalGatewayHttp.java` | VIII | conversa | cliente de emissão em lote |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/NotaFiscalClientConfig.java` | VIII | conversa | RestClient dedicado |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/client/NotaFiscalProperties.java` | VIII | conversa | timeouts do parceiro |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/observability/OutboxMetrics.java` | VI | conversa | métricas do relay |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/observability/OutboxHealthIndicator.java` | VI | conversa | health fora das probes |
+| `src/main/java/br/com/empresa/pedidos/infrastructure/observability/RelayHeartbeat.java` | VIII | conversa | liveness sem HTTP |
+
+## Recursos
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `src/main/resources/application.yml` | IV | conversa | open-in-view, batch fetch, pool |
+| `src/main/resources/application-docker.yml` | V | conversa | perfil de container |
+| `src/main/resources/application-kubernetes.yml` | VI | conversa | grupos de health explícitos |
+| `src/main/resources/application-relay.yml` | VIII | conversa | perfil sem servidor HTTP |
+
+## Testes Java
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `src/test/java/br/com/empresa/pedidos/architecture/ArquiteturaTest.java` | III | conversa | fronteiras como teste |
+| `src/test/java/br/com/empresa/pedidos/domain/model/PedidoTest.java` | III | conversa | invariantes do agregado |
+| `src/test/java/br/com/empresa/pedidos/domain/model/DinheiroTest.java` | III | conversa | arredondamento e soma |
+| `src/test/java/br/com/empresa/pedidos/application/usecase/CriarPedidoUseCaseTest.java` | III | conversa | orquestração com Clock fixo |
+| `src/test/java/br/com/empresa/pedidos/application/usecase/AprovarPedidoUseCaseTest.java` | V | conversa | registro de evento na aprovação |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/web/PedidoControllerTest.java` | III | conversa | fatia web sem persistência |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/PedidoRepositoryContract.java` | III | conversa | contrato por herança |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/JpaPedidoRepositoryTest.java` | III | conversa | contrato contra JPA real |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/InMemoryPedidoRepository.java` | III | conversa | fake com semântica idêntica |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/InMemoryPedidoRepositoryTest.java` | III | conversa | contrato contra o fake |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/SemN1Test.java` | III | conversa | guardrail de contagem de queries |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/FetchConfigurationTest.java` | IV | conversa | nenhum ToOne EAGER |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/OutboxAtomicidadeTest.java` | V | conversa | rollback elimina o evento |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/persistence/outbox/OutboxFalhaParcialTest.java` | VIII | conversa | aceite parcial, transporte e omissão |
+| `src/test/java/br/com/empresa/pedidos/infrastructure/client/AutorizacaoGatewayHttpTest.java` | V | conversa | timeout, circuito e retry |
+| `src/test/java/br/com/empresa/pedidos/application/outbox/ClassificadorErroParityTest.java` | XII | conversa | paridade Java e SQL |
+| `src/test/java/br/com/empresa/pedidos/application/outbox/ClassificadorErroGoldenTest.java` | XIII | conversa | paridade sem Docker |
+| `src/test/java/br/com/empresa/pedidos/application/outbox/ClassificadorErroGoldenGeradorTest.java` | XIII | conversa | gera o golden a partir do banco |
+| `src/test/java/br/com/empresa/pedidos/application/outbox/CorpusFront.java` | XIV | conversa | gerador de entradas de fronteira |
+| `src/test/java/br/com/empresa/pedidos/support/PedidoFixture.java` | III | conversa | fixture compartilhada |
+| `src/test/resources/outbox-categoria-golden.tsv` | XIII | conversa | corpus curado |
+| `src/test/resources/outbox-categoria-frontier.tsv` | XIV | conversa | corpus gerado |
+
+## Scripts
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `scripts/outbox-triage.sh` | X | conversa | triagem somente leitura |
+| `scripts/outbox-reprocess.sh` | XI | conversa | reprocessamento com verificação prévia |
+| `scripts/verificar-corpus.sh` | XVI | conversa | integridade dos arquivos de corpus |
+| `scripts/git-em-transicao.sh` | XIV | conversa | guarda de merge e rebase |
+| `scripts/check-contrato-api.sh` | XIII | conversa | bloqueia contrato sem documentação |
+| `scripts/upgrade_check.py` | XIV | conversa | compara pom com stack homologada |
+| `scripts/validar_docs.py` | XVI | conversa | frontmatter e prazos de revisão |
+| `scripts/gerar_stubs_docs.py` | XIV | conversa | stubs a partir do nav |
+| `scripts/relatorio_corpus.py` | XVII | conversa | relatório Markdown do histórico |
+| `scripts/verificar_codigos_ruff.py` | XVIII | conversa | códigos de regra existentes |
+| `scripts/verificar_makefile.py` | XIX | conversa | alvos sem uso e referências quebradas |
+| `scripts/verificar_gauges_orfaos.py` | XX | conversa | séries órfãs ainda referenciadas |
+
+## Testes Python
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `tests/conftest.py` | XIV | conversa | repositório Git isolado |
+| `tests/test_upgrade_check.py` | XIII | conversa | leitura de pom e resolução de versão |
+| `tests/test_upgrade_check_fixtures.py` | XIV | conversa | BOM, pluginManagement, sem namespace |
+| `tests/test_gerar_stubs.py` | XIV | conversa | stubs derivados do nav |
+| `tests/test_mutacoes_criticas.py` | XV | conversa | linhas load-bearing |
+| `tests/test_hook_contrato.py` | XIV | conversa | bloqueio de contrato |
+| `tests/test_git_transicao.py` | XIV | conversa | detecção de operação em andamento |
+| `tests/test_pytest_config.py` | XVI | conversa | invariante de exclusividade |
+| `tests/test_relatorio_corpus.py` | XVII | conversa | delta e estabilidade |
+| `tests/test_ruff_config.py` | XVII | conversa | src, ignore justificado, target |
+| `tests/test_ci_workflow.py` | XVIII | conversa | alvos e gate do workflow |
+| `tests/test_verificar_makefile.py` | XIX | conversa | dívida e referência quebrada |
+| `tests/test_indice.py` | XX | conversa | correspondência índice e repositório |
+| `tests/test_gauges_orfaos_cenarios.py` | XX | conversa | três vereditos simultâneos |
+| `tests/fixtures/pom-com-parent-e-bom.xml` | XIV | conversa | parent com BOM importado |
+| `tests/fixtures/pom-plugin-management.xml` | XIV | conversa | pluginManagement e plugins |
+| `tests/fixtures/pom-sem-namespace.xml` | XIV | conversa | pom legado sem xmlns |
+
+## Infraestrutura de deploy
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `Dockerfile` | V | conversa | multi-stage com camadas e exec |
+| `compose.yaml` | V | conversa | stack local com banco e wiremock |
+| `compose.loadtest.yaml` | VII | conversa | Prometheus, Grafana e k6 |
+| `compose.observability.yaml` | IX | conversa | coletor OTLP e relay |
+| `infra/wiremock/mappings/autorizacao.json` | V | conversa | stub de autorização |
+| `infra/wiremock/mappings/notafiscal-lote.json` | VIII | conversa | stub de emissão em lote |
+| `infra/prometheus/prometheus.yml` | VII | conversa | scrape da API, coletor e exporter |
+| `infra/prometheus/rules/outbox.yml` | VIII | conversa | recording rules e alertas |
+| `infra/grafana/provisioning/datasources/prometheus.yml` | VII | conversa | datasource Prometheus |
+| `infra/grafana/provisioning/datasources/postgres.yml` | XI | conversa | datasource PostgreSQL |
+| `infra/grafana/provisioning/dashboards/default.yml` | VII | conversa | provider de dashboards |
+| `infra/grafana/dashboards/outbox.json` | VII | conversa | painel do relay |
+| `infra/grafana/dashboards/dead-letter.json` | XI | conversa | painel de dead letter |
+| `infra/otel/collector-config.yaml` | IX | conversa | receptor OTLP e exporter Prometheus |
+| `infra/postgres-exporter/queries.yaml` | X | conversa | backlog lido do banco |
+| `infra/k8s/deployment.yaml` | VI | conversa | API com probes e grace period |
+| `infra/k8s/service.yaml` | VI | conversa | Service da API |
+| `infra/k8s/pdb.yaml` | VI | conversa | PDB da API |
+| `infra/k8s/hpa.yaml` | VII | conversa | HPA da API por CPU |
+| `infra/k8s/deployment-relay.yaml` | VIII | conversa | relay sem servidor HTTP |
+| `infra/k8s/hpa-relay.yaml` | VIII | conversa | HPA do relay por backlog |
+| `infra/k8s/pdb-relay.yaml` | VIII | conversa | PDB do relay |
+| `infra/k8s/networkpolicy-relay.yaml` | VIII | conversa | ingress vazio e egress explícito |
+| `infra/k8s/networkpolicy-api.yaml` | VIII | conversa | ingress do ingress-nginx e Prometheus |
+| `infra/k8s/servicemonitor.yaml` | VIII | conversa | scrape com drop de cardinalidade |
+| `infra/k8s/prometheus-adapter-config.yaml` | VII | conversa | métrica de backlog para o HPA |
+| `infra/k8s/otel-collector-values.yaml` | IX | conversa | coletor em Kubernetes |
+
+## Carga
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `loadtest/pedidos.js` | VI | conversa | ramping-arrival-rate com thresholds |
+| `loadtest/seed.sql` | VI | conversa | clientes para o teste |
+| `loadtest/verificar-backlog.sh` | VI | conversa | drenagem via Prometheus |
+| `loadtest/verificar-backlog-db.sh` | VI | conversa | drenagem via banco |
+
+## CI e hooks
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `.github/workflows/ci.yml` | XVIII | conversa | lint, testes, docs, corpus e gate |
+| `.github/workflows/docs.yml` | XI | conversa | build estrito e link check |
+| `.githooks/pre-commit` | XIII | conversa | contrato, lint e docs em menos de 10s |
+| `.githooks/pre-push` | XIII | conversa | arquitetura e paridade |
+
+## Documentação
+
+| Artefato | Origem | Status | Papel |
+|---|---|---|---|
+| `docs/mkdocs.yml` | XII | conversa | navegação e tema |
+| `docs/requirements.txt` | XII | conversa | dependências do site |
+| `docs/README.md` | XII | conversa | porta de entrada e precedência |
+| `docs/00-visao-geral/como-usar.md` | XII | conversa | qual doc ler em cada situação |
+| `docs/00-visao-geral/stack-de-referencia.md` | XVIII | conversa | matriz de versões e upgrade |
+| `docs/03-operacao/runbook-outbox.md` | IX | conversa | fila e relay |
+| `docs/03-operacao/runbook-dead-letter.md` | IX | conversa | triagem e reprocessamento |
+| `docs/03-operacao/runbook-deploy.md` | XIX | conversa | rollout e rollback |
+| `docs/03-operacao/runbook-incidente.md` | XX | conversa | porta de entrada por sintoma |
+| `docs/03-operacao/postmortem-template.md` | X | conversa | calibração obrigatória |
+| `docs/03-operacao/checklists/pr.md` | XII | conversa | checklist de PR |
+| `docs/03-operacao/checklists/go-live.md` | XII | conversa | checklist de go-live |
+| `docs/03-operacao/checklists/incidente.md` | XX | arquivo | sequência copiável dos 60 segundos |
+| `docs/04-adr/0001-clean-architecture-por-camadas.md` | XII | conversa | decisão de camadas |
+| `docs/04-adr/0002-sem-lombok.md` | XII | conversa | decisão sobre Lombok |
+| `docs/04-adr/0003-outbox-transacional.md` | XII | conversa | decisão de outbox |
+| `docs/04-adr/0004-resilience4j-como-biblioteca.md` | XII | conversa | decisão de resiliência |
+| `docs/04-adr/0005-relay-em-deployment-separado.md` | XII | conversa | decisão de separação |
+| `docs/04-adr/0006-backlog-como-metrica-do-banco.md` | XII | conversa | decisão de observabilidade |
+| `docs/04-adr/9999-template.md` | XII | conversa | modelo de ADR |
+| `docs/05-referencia/matriz-sintomas.md` | XII | conversa | sintoma, causa e correção |
+| `docs/05-referencia/metricas.md` | XIX | conversa | catálogo de séries |
+| `docs/05-referencia/orcamento-conexoes.md` | XII | conversa | orçamento de pool |
+| `docs/05-referencia/indice-artefatos.md` | XX | arquivo | este documento |
+
+## Leitura do índice
+
+**`conversa` é o estado real de quase tudo.** São 148 artefatos mapeados, e 146
+existem apenas como texto. Isso não é falha do processo — é a medida honesta do
+trabalho de migração, que o índice existe para tornar visível.
+
+**A ordem importa mais que a velocidade.** Migrar `PedidoController` antes de
+`Pedido.java` produz código que não compila. Migrar `ArquiteturaTest` antes das
+camadas produz teste que falha em tudo.
+
+**O ferramental das Partes XII a XX é o que verifica o resto.** Se você só puder
+migrar uma parte, migre essa: ela impede que as outras degradem depois.
+
+## Como verificar
+
+```bash
+make test-py-fast          # inclui tests/test_indice.py
+make docs-check            # frontmatter e prazo de revisão
+```
+```
+
+---
+
+## 2. `tests/test_gauges_orfaos_cenarios.py`
+
+```python
+"""Cenário completo: as três séries órfãs com vereditos diferentes no mesmo repositório.
+
+Os testes da Parte XX exercitam um veredito por vez. Este exercita os três
+simultaneamente, que é a situação real de produção: uma série já pode ser
+removida, outra tem apenas menção em documentação, e uma terceira tem
+dependência PromQL que quebraria um alerta crítico.
+"""
+
+import subprocess
+
+import pytest
+
+import verificar_gauges_orfaos
+
+pytestmark = pytest.mark.integracao
+
+JAVA = """
+package br.com.empresa.pedidos.infrastructure.observability;
+
+class OutboxMetrics {
+
+    void registrar(MeterRegistry registry) {
+        Gauge.builder("outbox.eventos.pendentes", pendentes, AtomicLong::get).register(registry);
+        Gauge.builder("outbox.evento.mais.antigo.segundos", idade, AtomicLong::get).register(registry);
+        Gauge.builder("outbox.eventos.em.falha", falhas, AtomicLong::get).register(registry);
+    }
+}
+"""
+
+REGRAS = """
+groups:
+  - name: outbox.alertas
+    rules:
+      - alert: OutboxMetricaAusente
+        expr: absent(outbox_eventos_pendentes)
+        for: 5m
+        labels:
+          severity: critical
+"""
+
+DOC_MENCAO = """
+| Série | Tipo | Observação |
+|---|---|---|
+| `outbox_evento_mais_antigo_segundos` | gauge | substituído pelo exporter |
+"""
+
+
+def preparar(tmp_path, monkeypatch, arquivos: dict[str, str]):
+    raiz = tmp_path / "repo"
+    raiz.mkdir()
+
+    for relativo, conteudo in arquivos.items():
+        destino = raiz / relativo
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(conteudo, encoding="utf-8")
+
+    subprocess.run(["git", "init", "-q"], cwd=raiz, check=True)
+    subprocess.run(["git", "add", "."], cwd=raiz, check=True)
+
+    monkeypatch.setattr(verificar_gauges_orfaos, "RAIZ", raiz)
+    return raiz
+
+
+def veredito(resultado: dict, serie: str) -> str:
+    return next(s for s in resultado["series"] if s["serie"] == serie)["veredito"]
+
+
+def test_tres_vereditos_coexistem_no_mesmo_repositorio(tmp_path, monkeypatch):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "src/main/java/OutboxMetrics.java": JAVA,
+            "infra/prometheus/rules/outbox.yml": REGRAS,
+            "docs/metricas.md": DOC_MENCAO,
+        },
+    )
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    assert veredito(resultado, "outbox.eventos.pendentes") == "BLOQUEADO"
+    assert veredito(resultado, "outbox.evento.mais.antigo.segundos") == "ATENCAO"
+    assert veredito(resultado, "outbox.eventos.em.falha") == "SEGURO"
+    assert resultado["liberado"] is False
+
+
+def test_apenas_a_serie_bloqueada_impede_a_remocao_global(tmp_path, monkeypatch):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "src/main/java/OutboxMetrics.java": JAVA,
+            "infra/prometheus/rules/outbox.yml": REGRAS,
+        },
+    )
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    assert veredito(resultado, "outbox.eventos.pendentes") == "BLOQUEADO"
+    assert veredito(resultado, "outbox.evento.mais.antigo.segundos") == "SEGURO"
+    assert resultado["liberado"] is False
+
+
+def test_mencao_em_documentacao_sozinha_nao_libera(tmp_path, monkeypatch):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "src/main/java/OutboxMetrics.java": JAVA,
+            "docs/metricas.md": DOC_MENCAO,
+        },
+    )
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    assert veredito(resultado, "outbox.evento.mais.antigo.segundos") == "ATENCAO"
+    assert resultado["liberado"] is False
+
+
+def test_repositorio_limpo_libera_a_remocao(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, {"src/main/java/OutboxMetrics.java": JAVA})
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    assert {s["veredito"] for s in resultado["series"]} == {"SEGURO"}
+    assert resultado["liberado"] is True
+
+
+def test_patch_lista_apenas_series_com_pendencia(tmp_path, monkeypatch):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "src/main/java/OutboxMetrics.java": JAVA,
+            "infra/prometheus/rules/outbox.yml": REGRAS,
+            "docs/metricas.md": DOC_MENCAO,
+        },
+    )
+
+    patch = verificar_gauges_orfaos.emitir_patch(verificar_gauges_orfaos.analisar())
+
+    assert "outbox.eventos.pendentes" in patch
+    assert "outbox.evento.mais.antigo.segundos" in patch
+    assert "outbox.eventos.em.falha" not in patch
+    assert "dependência PromQL" in patch
+
+
+def test_json_expoe_as_tres_series(tmp_path, monkeypatch, capsys):
+    preparar(
+        tmp_path,
+        monkeypatch,
+        {
+            "src/main/java/OutboxMetrics.java": JAVA,
+            "infra/prometheus/rules/outbox.yml": REGRAS,
+            "docs/metricas.md": DOC_MENCAO,
+        },
+    )
+
+    codigo = verificar_gauges_orfaos.main(["--json"])
+    import json
+
+    dados = json.loads(capsys.readouterr().out)
+
+    assert codigo == 1
+    assert len(dados["series"]) == 3
+    assert dados["liberado"] is False
+    assert {s["veredito"] for s in dados["series"]} == {"BLOQUEADO", "ATENCAO", "SEGURO"}
+
+
+def test_codigo_de_saida_zero_quando_liberado(tmp_path, monkeypatch, capsys):
+    preparar(tmp_path, monkeypatch, {"src/main/java/OutboxMetrics.java": JAVA})
+
+    assert verificar_gauges_orfaos.main([]) == 0
+    assert "remoção liberada" in capsys.readouterr().out
+
+
+def test_definicao_de_cada_serie_e_localizada(tmp_path, monkeypatch):
+    preparar(tmp_path, monkeypatch, {"src/main/java/OutboxMetrics.java": JAVA})
+
+    resultado = verificar_gauges_orfaos.analisar()
+
+    for serie in resultado["series"]:
+        assert serie["definicao"], f"definição não localizada para {serie['serie']}"
+        assert serie["definicao"].startswith("src/main/java/OutboxMetrics.java:")
+```
+
+O teste `test_tres_vereditos_coexistem_no_mesmo_repositorio` é o que reproduz a situação real: remover as três séries de uma vez quebraria o alerta, e o script precisa dizer isso antes de qualquer `git rm`.
+
+---
+
+## 3. `docs/03-operacao/checklists/incidente.md`
+
+```markdown
+---
+titulo: Checklist — incidente
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Checklist — incidente
+
+Para uso sob pressão. Sem explicação — o contexto está em
+[runbook-incidente](../runbook-incidente.md).
+
+## Coleta — 60 segundos
+
+Cole o bloco inteiro. Tudo é somente leitura.
+
+```bash
+set -u
+echo "== readiness =="
+curl -fsS https://api.exemplo.com/actuator/health/readiness | jq -r '.status'
+
+echo "== 5xx por segundo (5 min) =="
+curl -fsS -G "$PROM/api/v1/query" --data-urlencode \
+  'query=sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m]))' \
+  | jq -r '.data.result[0].value[1] // "0"'
+
+echo "== p95 de criacao (5 min) =="
+curl -fsS -G "$PROM/api/v1/query" --data-urlencode \
+  'query=histogram_quantile(0.95, sum by (le) (rate(http_server_requests_seconds_bucket{uri="/v1/pedidos",method="POST"}[5m])))' \
+  | jq -r '.data.result[0].value[1] // "0"'
+
+echo "== fila =="
+psql "$DATABASE_URL" -tAc "
+  select format('pendentes=%s idade=%ss falhas=%s',
+    count(*) filter (where status='PENDENTE'),
+    coalesce(cast(extract(epoch from now()
+      - min(criado_em) filter (where status='PENDENTE')) as bigint), 0),
+    count(*) filter (where status='FALHA'))
+  from outbox_evento"
+
+echo "== dead letter por categoria =="
+psql "$DATABASE_URL" -tAc "
+  select categoria_falha, count(*)
+    from outbox_evento where status='FALHA'
+   group by 1 order by 2 desc"
+
+echo "== pods =="
+kubectl get pods -l app.kubernetes.io/part-of=pedidos-service \
+  -o custom-columns='NOME:.metadata.name,PRONTO:.status.containerStatuses[0].ready,REINICIOS:.status.containerStatuses[0].restartCount,ESTADO:.status.containerStatuses[0].state.waiting.reason'
+
+echo "== pool =="
+curl -fsS -G "$PROM/api/v1/query" --data-urlencode \
+  'query=sum(hikaricp_connections_pending)' \
+  | jq -r '.data.result[0].value[1] // "0"'
+```
+
+## Decisão
+
+| Sintoma observado | Vai para |
+|---|---|
+| readiness `DOWN` | [deploy](../runbook-deploy.md) §6 |
+| 5xx acima de 5% | [deploy](../runbook-deploy.md) §6 |
+| p95 acima de 400ms com pool pendente | [deploy](../runbook-deploy.md) §6 |
+| idade acima de 300s e processados em zero | [outbox](../runbook-outbox.md) §8.3 |
+| idade alta com pendentes baixos | [incidente](../runbook-incidente.md) §5 |
+| falhas acima de zero | [dead-letter](../runbook-dead-letter.md) §3 |
+| `CrashLoopBackOff` ou `ImagePullBackOff` | [deploy](../runbook-deploy.md) §6 |
+| alerta de métrica ausente | [incidente](../runbook-incidente.md) §6 |
+
+## Cliente sem nota — discriminante
+
+```bash
+psql "$DATABASE_URL" -c "
+  select id, tipo, status, tentativas, left(coalesce(ultimo_erro,''), 100)
+    from outbox_evento
+   where agregado_id = '<id-do-pedido>'
+   order by id"
+```
+
+| Resultado | Ação |
+|---|---|
+| `PENDENTE` com idade menor que 60s | aguardar e reconferir |
+| `PENDENTE` com idade maior que 300s | [outbox](../runbook-outbox.md) §8.3 |
+| `FALHA` | [dead-letter](../runbook-dead-letter.md) §3 |
+| `PROCESSADO` sem nota no parceiro | [dead-letter](../runbook-dead-letter.md) §3.3 |
+| Nenhuma linha | bug de código — abrir issue, não mexer em produção |
+
+## Escalonamento
+
+| Condição | Limite |
+|---|---|
+| Idade do evento mais antigo | acima de 900s |
+| Eventos em falha | acima de 1% dos processados |
+| Erro na API | acima de 5% por 10 min |
+| Diagnóstico inconclusivo | acima de 30 min |
+| Causa é bug de código | qualquer |
+
+Leve a saída da coleta. Sem ela a conversa recomeça do zero.
+
+## Encerramento
+
+```text
+☐ sintoma identificado e causa confirmada
+☐ backlog e dead letter no baseline
+☐ alertas normalizados por 15 min
+☐ ação corretiva registrada em issue
+☐ se houve comando novo: adicionado ao runbook
+```
+```
+
+---
+
+## Resumindo
+
+- **O índice usa 148 linhas e revela o número real:** 146 artefatos existem apenas como texto. O índice não é burocracia — é a medida honesta do trabalho de migração, que sem ele fica invisível.
+- **Os dois documentos entregues aqui estão marcados como `arquivo`** e precisam ser criados no mesmo commit. `test_indice.py` falha imediatamente se um existir e o outro não.
+- **A ordem de migração é ferramental primeiro.** As Partes XII a XX são o que verifica as Partes I a XI; migrar o código de produção antes delas produz código que ninguém consegue validar.
+- **O teste de cenário prova o que os testes unitários não provam:** as três séries com vereditos diferentes no mesmo repositório. É a situação real de produção, e `liberado: false` precisa vir da soma correta.
+- **O checklist de incidente não explica nada.** Explicação sob pressão é ruído; o runbook tem o contexto, o checklist tem os comandos.
+
+Se quiser, posso:
+
+- Escrever o `scripts/verificar_indice.py` que gera a tabela do índice a partir de `git ls-files`, eliminando a manutenção manual das 148 linhas.
+- Criar o `docs/03-operacao/checklists/go-live.md` com os critérios de aceite da Parte VI transformados em checklist executável, fechando o último checklist sem conteúdo.
+- Montar o `tests/test_docs_links.py` que valida os links relativos entre runbooks e referências, detectando âncora quebrada antes do `mkdocs build --strict`.
+
+Os três itens expõem uma cadeia de três defeitos no que já foi entregue — e o terceiro é bloqueante.
+
+**Defeito 1 — a auditoria é de mão única.** `test_indice.py` verifica declarado → disco (`conversa` não existe, `arquivo` existe). Nada verifica o sentido inverso: um arquivo novo criado no repositório nunca é exigido no índice, e a tabela envelhece sem que teste algum falhe.
+
+**Defeito 2 — a contagem é fabricada.** O índice afirma "148 artefatos" e "146 conversa". Contei as linhas da tabela: são **194**. O número foi escrito à mão — exatamente o que não funciona em 194 linhas, e a razão de existir do script.
+
+**Defeito 3 — os documentos marcados `arquivo` quebram o build.** `runbook-incidente.md` e `checklists/incidente.md` são `arquivo`, mas linkam para `runbook-outbox.md`, `runbook-dead-letter.md`, `runbook-deploy.md` e `postmortem-template.md`, todos `conversa`. `mkdocs build --strict` falha. Pior: `runbook-incidente.md` referencia `[deploy](runbook-deploy.md) §6`, e `runbook-deploy.md` não tem seção 6 — os títulos numerados são `8.1` a `8.4`.
+
+O terceiro defeito é o que define o desenho do item 3: se a validação de links fosse estrita, nada poderia ser entregue até a migração terminar. O índice é o que resolve — ele já sabe quais documentos são pendência conhecida.
+
+---
+
+## 1. `scripts/verificar_indice.py`
+
+```python
+#!/usr/bin/env python3
+"""Audita a correspondência entre o índice de artefatos e o repositório.
+
+test_indice.py verifica declarado -> disco (conversa não existe, arquivo existe).
+Este script verifica disco -> declarado: arquivo novo que deveria estar no índice.
+
+Proveniência NÃO é inferida. A coluna Origem exige conhecimento humano, e
+inventá-la produziria 194 linhas com "?" em vez de informação. O modo
+--sugerir emite as linhas com esse campo vazio, para preenchimento.
+
+Uso:
+  ./scripts/verificar_indice.py             audita e reporta lacunas
+  ./scripts/verificar_indice.py --sugerir   emite linhas Markdown para colar
+  ./scripts/verificar_indice.py --json
+
+Códigos de saída:
+  0  índice cobre o repositório
+  1  arquivo fora do índice, ou artefato declarado inexistente
+  2  erro de leitura
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import sys
+from collections import Counter, defaultdict
+
+RAIZ = pathlib.Path(__file__).parent.parent
+INDICE = RAIZ / "docs" / "05-referencia" / "indice-artefatos.md"
+
+# | `caminho` | origem | status | papel |
+LINHA = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*([^|]*)\|\s*(conversa|stub|arquivo)\s*\|")
+
+# O que conta como artefato. Fora isto, arquivo do repositório não entra no índice.
+INCLUSAO = (
+    "pom.xml", "Makefile", "pytest.ini", "pyproject.toml", "Dockerfile",
+    "compose.yaml", "compose.*.yaml", "stack-versions.txt", ".dockerignore",
+    "src/**/*.java", "src/**/*.yml", "src/**/*.sql", "src/**/*.tsv",
+    "scripts/*",
+    "tests/**/*.py", "tests/**/*.xml",
+    "infra/**/*",
+    "loadtest/**/*",
+    "config/**/*",
+    ".github/**/*.yml",
+    ".githooks/*",
+    "docs/*.yml", "docs/*.txt", "docs/*.md", "docs/**/*.md",
+)
+
+# Arquivos legítimos que não são artefato do conjunto documentado.
+IGNORADOS = {
+    "README.md", "LICENSE", "CHANGELOG.md", "CONTRIBUTING.md",
+    ".gitignore", ".gitattributes", ".editorconfig", ".env.example",
+    ".github/dependabot.yml",
+}
+
+IGNORADOS_PADROES = (
+    "docs/**/tags.md",          # gerado pelo plugin tags do mkdocs
+    "**/.gitkeep",
+    "**/__pycache__/**",
+    "**/.pytest_cache/**",
+    "**/.ruff_cache/**",
+)
+
+
+def ler_indice() -> list[dict]:
+    if not INDICE.exists():
+        raise FileNotFoundError(f"índice ausente: {INDICE.relative_to(RAIZ)}")
+
+    entradas: list[dict] = []
+    for numero, linha in enumerate(INDICE.read_text(encoding="utf-8").splitlines(), 1):
+        casamento = LINHA.match(linha.strip())
+        if not casamento:
+            continue
+        entradas.append({
+            "caminho": casamento.group(1).strip(),
+            "origem": casamento.group(2).strip(),
+            "status": casamento.group(3),
+            "linha": numero,
+        })
+
+    if not entradas:
+        raise ValueError("nenhuma linha de artefato encontrada — o formato da tabela mudou")
+
+    return entradas
+
+
+def arquivos_do_repositorio() -> set[str]:
+    encontrados: set[str] = set()
+
+    for padrao in INCLUSAO:
+        for caminho in RAIZ.glob(padrao):
+            if not caminho.is_file():
+                continue
+            relativo = caminho.relative_to(RAIZ).as_posix()
+            if relativo in IGNORADOS:
+                continue
+            if any(caminho.match(p) for p in IGNORADOS_PADROES):
+                continue
+            encontrados.add(relativo)
+
+    return encontrados
+
+
+def analisar() -> dict:
+    entradas = ler_indice()
+    declarados = {e["caminho"]: e for e in entradas}
+    no_disco = arquivos_do_repositorio()
+
+    # arquivo existe, índice não sabe
+    lacunas = sorted(no_disco - set(declarados))
+
+    # índice declara, arquivo não existe — detalhado por test_indice.py,
+    # aqui só para o relatório independente ficar completo
+    fantasmas = sorted(
+        caminho for caminho, entrada in declarados.items()
+        if entrada["status"] != "conversa" and not (RAIZ / caminho).exists()
+    )
+
+    contagem = Counter(e["status"] for e in entradas)
+
+    return {
+        "declarados": len(entradas),
+        "porStatus": dict(sorted(contagem.items())),
+        "noDisco": len(no_disco),
+        "lacunas": lacunas,
+        "fantasmas": fantasmas,
+        "semOrigem": sorted(
+            e["caminho"] for e in entradas if not e["origem"] or e["origem"] == "?"
+        ),
+    }
+
+
+def sugerir(lacunas: list[str]) -> str:
+    """Emite linhas Markdown agrupadas por diretório de topo, com Origem vazia."""
+    grupos: dict[str, list[str]] = defaultdict(list)
+    for caminho in lacunas:
+        topo = caminho.split("/")[0] if "/" in caminho else "(raiz)"
+        grupos[topo].append(caminho)
+
+    saida = [
+        "<!-- Cole cada linha na seção correspondente do índice. -->",
+        "<!-- Preencha a coluna Origem: a Parte deste conjunto que produziu o artefato. -->",
+        "<!-- Status inicial: arquivo (existe e não tem TODO). -->",
+        "",
+    ]
+
+    for topo in sorted(grupos):
+        saida.append(f"### {topo}")
+        saida.append("")
+        saida.append("| Artefato | Origem | Status | Papel |")
+        saida.append("|---|---|---|---|")
+        for caminho in sorted(grupos[topo]):
+            saida.append(f"| `{caminho}` |  | arquivo |  |")
+        saida.append("")
+
+    return "\n".join(saida)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sugerir", action="store_true",
+                        help="emite linhas Markdown para os artefatos ausentes")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(argv)
+
+    try:
+        resultado = analisar()
+    except (OSError, ValueError) as erro:
+        print(f"erro: {erro}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(resultado, ensure_ascii=False, indent=2))
+    elif args.sugerir:
+        if not resultado["lacunas"]:
+            print("nada a sugerir: o índice já cobre todos os artefatos do repositório")
+        else:
+            print(sugerir(resultado["lacunas"]))
+    else:
+        print(f"== índice × repositório ==")
+        print(f"  declarados no índice   {resultado['declarados']}")
+        for status, quantidade in resultado["porStatus"].items():
+            print(f"    {status:<10} {quantidade}")
+        print(f"  artefatos no disco     {resultado['noDisco']}")
+        print()
+
+        if resultado["lacunas"]:
+            print(f"  LACUNA  {len(resultado['lacunas'])} arquivo(s) no repositório fora do índice:")
+            for caminho in resultado["lacunas"]:
+                print(f"            {caminho}")
+            print()
+            print("  acrescente as linhas:  ./scripts/verificar_indice.py --sugerir")
+            print()
+
+        if resultado["fantasmas"]:
+            print(f"  FANTASMA {len(resultado['fantasmas'])} artefato(s) declarado(s) sem arquivo:")
+            for caminho in resultado["fantasmas"]:
+                print(f"            {caminho}")
+            print()
+
+        if resultado["semOrigem"]:
+            print(f"  AVISO   {len(resultado['semOrigem'])} artefato(s) sem Origem preenchida")
+            print()
+
+        if not any(resultado[c] for c in ("lacunas", "fantasmas")):
+            print("  índice cobre o repositório")
+
+    if resultado["lacunas"] or resultado["fantasmas"]:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+---
+
+## 2. `docs/03-operacao/checklists/go-live.md`
+
+```markdown
+---
+titulo: Checklist — go-live
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-04-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Checklist — go-live
+
+Todo item tem comando e saída esperada. **BLOQ** significa que o go-live não
+acontece com o item vermelho; **DESEJ** pode virar ação pós-lançamento.
+
+## 1 — Build e verificação
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 1.1 | Pipeline completo | `make ci` | exit 0 | BLOQ |
+| 1.2 | Stack alinhada | `make upgrade-check` | 0 divergência | BLOQ |
+| 1.3 | Golden íntegro | `make corpus-check` | `corpus íntegro` | BLOQ |
+| 1.4 | Índice cobre o repo | `./scripts/verificar_indice.py` | exit 0 | BLOQ |
+| 1.5 | Links e âncoras | `make docs-links` | exit 0 | BLOQ |
+| 1.6 | Sem alvo órfão | `make makefile-check` | só DÍVIDA, nenhum ERRO | DESEJ |
+
+## 2 — Capacidade provada
+
+O teste de carga é o único item que prova o sistema sob pressão. Sem ele, todo
+o resto é opinião.
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 2.1 | Sustenta 2× o pico | `k6 run loadtest/pedidos.js` | thresholds verdes, p95 < 400ms | BLOQ |
+| 2.2 | Relay acompanha | `./loadtest/verificar-backlog.sh` | `OK: relay acompanhou a carga` | BLOQ |
+| 2.3 | Zero dead letter sob carga | mesma execução | `eventos em FALHA: 0` | BLOQ |
+| 2.4 | Razão de consumo | `outbox:razao_consumo_producao:5m` | ≥ 0,95 durante a janela | BLOQ |
+| 2.5 | Pool não satura | `hikaricp_connections_pending` | 0 por todo o teste | BLOQ |
+
+**Interpretação.** Latência verde com idade crescendo é o pior cenário: a API
+está saudável e a fila está afogada. Se 2.2 falhar e 2.1 passar, o gargalo é o
+relay, não a API.
+
+## 3 — Guardrails ativos
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 3.1 | Fronteiras | `mvn test -Dtest=ArquiteturaTest` | verde | BLOQ |
+| 3.2 | Nenhum N+1 | `mvn test -Dtest=SemN1Test` | ≤ 2 queries por listagem | BLOQ |
+| 3.3 | Nenhum ToOne EAGER | `mvn test -Dtest=FetchConfigurationTest` | verde | BLOQ |
+| 3.4 | Atomicidade do outbox | `mvn test -Dtest=OutboxAtomicidadeTest` | verde | BLOQ |
+| 3.5 | Falha parcial em lote | `mvn test -Dtest=OutboxFalhaParcialTest` | 3 testes verdes | BLOQ |
+| 3.6 | Paridade de classificação | `make parity-fast` | verde | BLOQ |
+| 3.7 | Mutação no domínio | `make mutation` | ≥ 75% | DESEJ |
+
+## 4 — Observabilidade viva
+
+A pergunta não é "existe dashboard", é "o alerta dispara".
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 4.1 | Backlog lido do banco | `curl -s :9187/metrics \| grep outbox_pendentes` | série presente | BLOQ |
+| 4.2 | Resolve com relay parado | parar o relay e consultar `outbox_backlog_total` | valor, não `null` | BLOQ |
+| 4.3 | Alerta de idade | forçar `pendentes` e observar | `OutboxIdadeAlta` dispara | BLOQ |
+| 4.4 | Alerta de dead letter | inserir linha `FALHA` | `OutboxEmDeadLetter` dispara | BLOQ |
+| 4.5 | Nome do alerta correto | `grep absent` nas rules | `absent(outbox_pendentes)` | BLOQ |
+| 4.6 | Painéis provisionados | abrir Grafana | 2 dashboards, dados reais | DESEJ |
+| 4.7 | Cardinalidade contida | `count(pg_)` no exporter | < 300 séries | DESEJ |
+
+**4.5 é o item que evita alerta crítico permanente.** Se o alerta ainda usar
+`absent(outbox_eventos_pendentes)` e o gauge da app for removido, ele dispara
+para sempre. Rode `./scripts/verificar_gauges_orfaos.py` antes de qualquer
+remoção de métrica — saída `BLOQUEADO` significa dependência PromQL.
+
+## 5 — Resiliência verificada
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 5.1 | Timeout de leitura | `mvn test -Dtest=AutorizacaoGatewayHttpTest` | falha em < 2s | BLOQ |
+| 5.2 | Circuito abre | mesmo teste | sem tráfego após abrir | BLOQ |
+| 5.3 | Retry funcional | mesmo teste | 2 requisições, sucesso | BLOQ |
+| 5.4 | Timeout por parceiro | revisar `*-timeout` | distintos por parceiro | DESEJ |
+| 5.5 | Grace period coerente | `kubectl get deploy -o yaml` | `grace > preStop + shutdown` | BLOQ |
+| 5.6 | `exec` no entrypoint | inspecionar Dockerfile | `ENTRYPOINT` com `exec` | BLOQ |
+| 5.7 | Shutdown real | requisição lenta + `kubectl delete pod` | requisição conclui | DESEJ |
+
+## 6 — Dados e schema
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 6.1 | `ddl-auto` | `grep ddl-auto` | `validate` em todo perfil não-local | BLOQ |
+| 6.2 | Migration reversível | revisão humana | aditiva, ou expand/contract | BLOQ |
+| 6.3 | Índices usados | `explain (analyze)` nas queries de métrica | `Index Only Scan` | BLOQ |
+| 6.4 | Orçamento de conexões | soma dos pools | < 80% de `max_connections` | BLOQ |
+| 6.5 | `open-in-view` | `grep open-in-view` | `false` | BLOQ |
+| 6.6 | Batch fetch global | `grep default_batch_fetch_size` | presente | BLOQ |
+
+**Orçamento (6.4), números de referência:** API 11 × 8 = 88, relay 6 × 8 = 48,
+administrativo 20. Total 156 de 200. Se não fechar, PgBouncer em modo
+`transaction` — não aumentar `max_connections`.
+
+## 7 — Segurança
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 7.1 | Relay inalcançável | `kubectl run netcheck -- curl relay` | timeout | BLOQ |
+| 7.2 | `ingress: []` no relay | `kubectl get netpol` | presente | BLOQ |
+| 7.3 | Não-root | `runAsNonRoot: true` | ambos Deployments | BLOQ |
+| 7.4 | Raiz somente leitura | `readOnlyRootFilesystem` + `emptyDir /tmp` | presentes | BLOQ |
+| 7.5 | Usuário de métrica | `\du outbox_monitor` | só `SELECT` em `outbox_evento` | BLOQ |
+| 7.6 | Admin protegido | `POST /v1/admin/outbox/*` | exige operador, não usuário | BLOQ |
+| 7.7 | Sem segredo em env de imagem | `docker history` | nenhum token | BLOQ |
+
+## 8 — Operação pronta
+
+| # | Item | Comando | Esperado | Tipo |
+|---|---|---|---|---|
+| 8.1 | Runbooks publicados | `make docs` | sem link quebrado | BLOQ |
+| 8.2 | Triagem executada | `make operacao-triage` | roda em produção sem erro | BLOQ |
+| 8.3 | Drill de dead letter | simular `FALHA` em staging | runbook §3 seguido ponta a ponta | BLOQ |
+| 8.4 | Reprocessamento em dry-run | `make operacao-reprocess` | plano impresso, nada alterado | BLOQ |
+| 8.5 | Rollback ensaiado | [runbook-deploy](../runbook-deploy.md) §7 | voltou em < 5 min | BLOQ |
+| 8.6 | Plantão avisado | comunicação | canal e escalonamento definidos | BLOQ |
+
+## 9 — Assinatura
+
+| Papel | Nome | Data | Itens vermelhos |
+|---|---|---|---|
+| Responsável técnico | | | |
+| Responsável de operação | | | |
+| Owner do serviço | | | |
+
+Go-live com item **BLOQ** vermelho exige decisão registrada do owner, com o
+risco aceito escrito abaixo.
+
+**Riscos aceitos:**
+
+| # | Item | Risco | Mitigação | Prazo |
+|---|---|---|---|---|
+| | | | | |
+```
+
+---
+
+## 3. `tests/test_docs_links.py`
+
+```python
+"""Valida links, âncoras e referências de seção entre documentos.
+
+O índice é o árbitro. Link para documento declarado `conversa` é pendência
+conhecida do processo de migração, não erro. Link para `stub` ou `arquivo`
+precisa resolver de fato.
+
+Isso é o que permite `mkdocs build --strict` durante a migração, em vez de
+exigir os 24 documentos de uma vez — e é o que pegou a referência
+`runbook-deploy.md §6` em um documento sem seção 6.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+
+import pytest
+
+pytestmark = pytest.mark.rapido
+
+RAIZ = pathlib.Path(__file__).parent.parent
+DOCS = RAIZ / "docs"
+INDICE = DOCS / "05-referencia" / "indice-artefatos.md"
+
+LINHA_INDICE = re.compile(r"^\|\s*`([^`]+)`\s*\|\s*([^|]*)\|\s*(conversa|stub|arquivo)\s*\|")
+LINK = re.compile(r"\[([^\]]*)\]\(([^)\s]+)\)")
+SECAO = re.compile(r"§+(\d+(?:\.\d+)*)")
+CABECALHO = re.compile(r"^#{1,6}\s+(.*)$", re.MULTILINE)
+NUMERO_CABECALHO = re.compile(r"^§?\s*(\d+(?:\.\d+)*)\b")
+
+# fontes de link que não são documentos do conjunto
+EXTERNO = ("http://", "https://", "mailto:", "tel:")
+
+
+def status_do_indice() -> dict[str, str]:
+    if not INDICE.exists():
+        pytest.skip("índice ausente — nada a arbitrar")
+
+    mapa: dict[str, str] = {}
+    for linha in INDICE.read_text(encoding="utf-8").splitlines():
+        casamento = LINHA_INDICE.match(linha.strip())
+        if casamento:
+            mapa[casamento.group(1).strip()] = casamento.group(3)
+    return mapa
+
+
+def sem_codigo(texto: str) -> str:
+    """Remove blocos cercados: markdown dentro de exemplo não é link real."""
+    linhas: list[str] = []
+    dentro = False
+    for linha in texto.splitlines():
+        if linha.lstrip().startswith("```"):
+            dentro = not dentro
+            continue
+        if not dentro:
+            linhas.append(linha)
+    return "\n".join(linhas)
+
+
+def slug(texto: str) -> str:
+    """Âncora no estilo do renderizador: minúsculas, espaços viram hífen."""
+    limpo = re.sub(r"[`*_~]", "", texto).strip().lower()
+    limpo = re.sub(r"[^\w\s-]", "", limpo, flags=re.UNICODE)
+    return re.sub(r"\s+", "-", limpo)
+
+
+def cabecalhos(caminho: pathlib.Path) -> tuple[set[str], set[str]]:
+    """Retorna (âncoras, números de seção)."""
+    texto = sem_codigo(caminho.read_text(encoding="utf-8"))
+    ancoras: set[str] = set()
+    numeros: set[str] = set()
+
+    for titulo in CABECALHO.findall(texto):
+        ancoras.add(slug(titulo))
+        casamento = NUMERO_CABECALHO.match(titulo.strip())
+        if casamento:
+            numeros.add(casamento.group(1))
+            # aceita §8.3 referenciado como §8.3 e §08.3
+            numeros.add(casamento.group(1).lstrip("0") or "0")
+
+    return ancoras, numeros
+
+
+def documentos() -> list[pathlib.Path]:
+    return sorted(DOCS.rglob("*.md"))
+
+
+def resolver(origem: pathlib.Path, alvo: str) -> pathlib.Path:
+    destino = (origem.parent / alvo).resolve()
+    return destino
+
+
+def relativo(caminho: pathlib.Path) -> str:
+    return caminho.relative_to(RAIZ).as_posix()
+
+
+def ocorrencias() -> list[dict]:
+    indice = status_do_indice()
+    achados: list[dict] = []
+
+    for documento in documentos():
+        texto = sem_codigo(documento.read_text(encoding="utf-8"))
+
+        for numero_linha, linha in enumerate(texto.splitlines(), start=1):
+            for _, alvo in LINK.findall(linha):
+                if alvo.startswith(EXTERNO) or alvo.startswith("/"):
+                    continue
+
+                caminho_parte, _, ancora = alvo.partition("#")
+                if not caminho_parte:
+                    continue  # link só de âncora no próprio documento
+
+                destino = resolver(documento, caminho_parte)
+
+                try:
+                    chave = relativo(destino)
+                except ValueError:
+                    continue  # fora do repositório
+
+                secao = None
+                posicao = texto.find(alvo)
+                if posicao >= 0:
+                    casamento = SECAO.search(texto[posicao + len(alvo):posicao + len(alvo) + 12])
+                    if casamento:
+                        secao = casamento.group(1)
+
+                achados.append({
+                    "origem": relativo(documento),
+                    "linha": numero_linha,
+                    "alvo": chave,
+                    "ancora": ancora,
+                    "secao": secao,
+                    "existe": destino.exists(),
+                    "status": indice.get(chave, "nao-declarado"),
+                })
+
+    return achados
+
+
+def pendencias_conhecidas() -> set[str]:
+    """Alvos que o índice declara conversa: ainda serão escritos."""
+    return {c for c, s in status_do_indice().items() if s == "conversa"}
+
+
+def test_todo_link_para_documento_pendente_e_declarado():
+    """Falha quando um link aponta para arquivo inexistente fora do índice.
+
+    Cobre o caso mais provável: caminho digitado errado. Um typo não está
+    declarado como conversa, então não passa como pendência.
+    """
+    quebrados = [
+        o for o in ocorrencias()
+        if not o["existe"] and o["status"] != "conversa"
+    ]
+
+    assert not quebrados, "\n".join(
+        f"  {o['origem']}:{o['linha']} -> {o['alvo']} "
+        f"(status no índice: {o['status']})"
+        for o in quebrados
+    )
+
+
+def test_ancoras_de_link_resolvem():
+    """Âncora `#secao` precisa corresponder a um título real no destino."""
+    falhas: list[str] = []
+
+    for o in ocorrencias():
+        if not o["existe"] or not o["ancora"]:
+            continue
+        ancoras, _ = cabecalhos(RAIZ / o["alvo"])
+        if o["ancora"] not in ancoras and slug(o["ancora"]) not in ancoras:
+            falhas.append(
+                f"  {o['origem']}:{o['linha']} -> {o['alvo']}#{o['ancora']} "
+                f"(títulos disponíveis: {', '.join(sorted(ancoras)[:6])}...)"
+            )
+
+    assert not falhas, "\n".join(falhas)
+
+
+def test_referencias_de_secao_existem_no_destino():
+    """`[texto](alvo.md) §N` exige título numerado N no documento alvo.
+
+    Foi este teste que expôs `runbook-deploy.md §6` em documento sem seção 6.
+    """
+    falhas: list[str] = []
+
+    for o in ocorrencias():
+        if not o["existe"] or not o["secao"]:
+            continue
+        _, numeros = cabecalhos(RAIZ / o["alvo"])
+        if o["secao"] not in numeros:
+            falhas.append(
+                f"  {o['origem']}:{o['linha']} -> {o['alvo']} §{o['secao']} "
+                f"(seções numeradas no destino: {', '.join(sorted(numeros)) or 'nenhuma'})"
+            )
+
+    assert not falhas, "\n".join(falhas)
+
+
+def test_nenhum_link_para_documento_fora_da_navegacao_sem_estar_no_indice():
+    """Documento que nunca será publicado não deve receber link."""
+    indice = status_do_indice()
+
+    orfaos = sorted({
+        o["alvo"] for o in ocorrencias()
+        if o["alvo"].startswith("docs/") and o["alvo"] not in indice
+    })
+
+    assert not orfaos, (
+        "documentos linkados mas ausentes do índice: " + ", ".join(orfaos) +
+        ". Acrescente a linha ou remova o link."
+    )
+
+
+def test_documentos_declarados_como_arquivo_nao_linkam_para_conversa_sem_aviso():
+    """Relatório, não falha: mede quanto o conjunto depende do que falta.
+
+    Um documento publicado que depende de pendência precisa deixar isso
+    explícito para o leitor, em vez de oferecer um link morto.
+    """
+    pendentes = pendencias_conhecidas()
+
+    dependentes: dict[str, list[str]] = {}
+    for o in ocorrencias():
+        if o["alvo"] in pendentes and o["status"] == "conversa":
+            dependentes.setdefault(o["origem"], []).append(o["alvo"])
+
+    publicados = {
+        caminho for caminho, status in status_do_indice().items() if status == "arquivo"
+    }
+
+    divergentes = {
+        origem: sorted(set(alvos))
+        for origem, alvos in dependentes.items()
+        if origem in publicados
+    }
+
+    if divergentes:
+        linhas = [
+            f"  {origem} -> {', '.join(alvos)}"
+            for origem, alvos in sorted(divergentes.items())
+        ]
+        pytest.skip(
+            "documentos publicados com link para pendente (adicione nota de migração):\n"
+            + "\n".join(linhas)
+        )
+```
+
+---
+
+## 4. `Makefile` e índice
+
+```makefile
+.PHONY: docs-links
+docs-links: ## Valida links, âncoras e referências de seção
+	@$(PYTEST) tests/test_docs_links.py -q
+
+.PHONY: docs-build
+docs-build: docs-check docs-links ## Build estrito do site
+	@$(PYTHON) -m mkdocs build --strict -f $(DOCS_DIR)/mkdocs.yml
+
+.PHONY: indice-auditar
+indice-auditar: ## Verifica se o índice cobre o repositório
+	@$(PYTHON) scripts/verificar_indice.py
+
+.PHONY: indice-sugerir
+indice-sugerir: ## Emite linhas do índice para os artefatos ausentes
+	@$(PYTHON) scripts/verificar_indice.py --sugerir
+```
+
+Duas correções obrigatórias no índice, no mesmo commit:
+
+**Trocar as contagens fabricadas.** Na seção "Leitura do índice", substitua os números escritos à mão — eles estavam errados:
+
+```markdown
+## Leitura do índice
+
+O total não é escrito à mão: ele sai do próprio índice.
+
+```bash
+./scripts/verificar_indice.py --json | jq '.porStatus'
+```
+
+O estado real hoje é quase totalidade `conversa`. Isso não é falha do processo —
+é a medida honesta do trabalho de migração, que o índice existe para tornar
+visível.
+
+**A ordem importa mais que a velocidade.** Migrar `PedidoController` antes de
+`Pedido.java` produz código que não compila. Migrar `ArquiteturaTest` antes das
+camadas produz teste que falha em tudo.
+
+**O ferramental das Partes XII a XX é o que verifica o resto.** Se você só puder
+migrar uma parte, migre essa.
+```
+
+**Renumerar os títulos que recebem referência.** A convenção que o teste fiscaliza:
+
+```text
+## §N — Título
+### §N.M — Título
+```
+
+Em `runbook-deploy.md`, os títulos passam a: `## §1 — Quando usar` até `## §7 — Procedimento de rollback`, e `## §8 — Casos especiais` com `### §8.1` a `### §8.4`. Assim `[deploy](runbook-deploy.md) §6` em `runbook-incidente.md` resolve para `## §6 — Critérios de rollback`.
+
+---
+
+## 5. Sequência de adoção
+
+```bash
+# 1. auditar o índice antes de criar qualquer arquivo novo
+make indice-auditar
+make indice-sugerir > /tmp/linhas.md
+
+# 2. criar go-live.md e acrescentar as linhas ao índice no MESMO commit
+#    (sem isso, test_indice.py falha: go-live.md está como conversa)
+
+# 3. validar links
+make docs-links        # deve apontar runbook-deploy.md §6
+# renumerar os títulos de runbook-deploy.md e rodar de novo
+make docs-links
+
+# 4. build
+make docs
+```
+
+O passo 3 é o que prova o valor: o teste encontra a referência quebrada que eu mesmo escrevi, antes de o build falhar com mensagem genérica.
+
+---
+
+## Resumindo
+
+- **A auditoria era de mão única.** `test_indice.py` verifica declarado → disco, mas nada exigia que um arquivo novo entrasse no índice. `verificar_indice.py` fecha o sentido inverso e é o que torna a tabela sustentável em 194 linhas.
+- **As contagens do índice estavam fabricadas:** "148 artefatos" contra 194 linhas reais. Número escrito à mão em documento grande está sempre errado — o script passa a ser a fonte.
+- **Os documentos marcados `arquivo` quebram o build.** `runbook-incidente.md` e `checklists/incidente.md` linkam para quatro documentos `conversa` e usam `§6`, que não existe em `runbook-deploy.md`.
+- **O índice é o que viabiliza a validação durante a migração:** link para `conversa` é pendência conhecida, link para `stub`/`arquivo` precisa resolver. Sem esse árbitro, nada poderia ser publicado até o último documento ficar pronto.
+- **O teste de seção encontrou um defeito real na primeira execução** — o tipo de erro que `mkdocs build --strict` não pega, porque o arquivo existe e só o número da seção está errado.
+- **Proveniência não é inferida.** `--sugerir` deixa a coluna Origem vazia de propósito: inventar 194 origens produziria informação falsa com aparência de completa.
+
+Se quiser, posso:
+
+- Escrever `runbook-outbox.md` e `runbook-dead-letter.md` com títulos numerados `§1`–`§8`, fechando os dois links mais referenciados e reduzindo as pendências do conjunto.
+- Criar `tests/test_verificar_indice.py` com repositório sintético, cobrindo lacuna, fantasma, exclusões declaradas e o modo `--sugerir`.
+- Montar o `scripts/render_docs.py` que substitui as contagens estáticas dos documentos pelos valores do índice em tempo de build do mkdocs, eliminando de vez número escrito à mão em prosa.
+
 
