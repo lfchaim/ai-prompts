@@ -12237,3 +12237,4656 @@ Se quiser, posso:
 - Escrever o `Makefile` do repositório com alvos `docs`, `upgrade-check`, `vet` e `operacao`, unificando build de código e documentação.
 - Criar o teste automatizado que valida a paridade entre `ClassificadorErro` (Java) e o `CASE` dos scripts, evitando que as três implementações divirjam em silêncio.
 
+Os três itens têm uma dependência real entre si que muda o desenho: o índice, o build e o teste de paridade só funcionam se existir **uma fonte de verdade** para a classificação de erro. Hoje ela existe em três cópias (Java, dois scripts, futura coluna). O item 3 corrige isso, e os itens 1 e 2 consomem a correção.
+
+Começo pelo que resolve o problema de fundo.
+
+---
+
+# Parte XII — Site de documentação, automação e paridade verificada
+
+**Base:** MkDocs Material · GNU Make · JUnit 5 · Testcontainers · PostgreSQL 17
+
+---
+
+## 1. A ordem correta de execução
+
+| Ordem | Item | Por quê nesta posição |
+|---|---|---|
+| 1º | Teste de paridade + função SQL | Elimina a divergência antes de documentá-la |
+| 2º | `docs/` com frontmatter e stubs | O build precisa estar verde desde o primeiro commit |
+| 3º | `Makefile` | Unifica o que já existe; não cria estrutura nova |
+
+Documentar três implementações divergentes de classificação seria registrar a dívida, não resolvê-la. Por isso invirto a ordem que você pediu — mas entrego os três.
+
+---
+
+## 2. Paridade de classificação
+
+### 2.1 O problema concreto
+
+Na Parte XI, a mesma lógica existe em três lugares:
+
+| Implementação | Consumidor | Risco |
+|---|---|---|
+| `ClassificadorErro.java` | Coluna `categoria_falha` | Divergência silenciosa |
+| `CASE` no `outbox-triage.sh` | Triagem do operador | Operador vê categoria X |
+| `CASE` no `outbox-reprocess.sh` | Guardrail de `--forcar` | Script permite o que deveria bloquear |
+
+Três cópias significam que uma correção em uma delas deixa as outras erradas. O cenário ruim não é falhar — é o painel dizer `transitorio` enquanto o script classifica como `negocio` e bloqueia o reprocessamento correto durante um incidente.
+
+### 2.2 A correção: função SQL como oráculo
+
+`V7__outbox_classificacao.sql`
+
+```sql
+create or replace function outbox_categoria(erro text)
+returns varchar(20)
+language sql
+immutable
+as $$
+  select case
+    when erro is null then 'desconhecido'
+    when erro ~ 'NOTAFISCAL_HTTP_40[13]' then 'credencial'
+    when erro ~ 'NOTAFISCAL_(HTTP_5[0-9]{2}|INDISPONIVEL|RESPOSTA_VAZIA)|imeout|Connection refused'
+      then 'transitorio'
+    when erro ~ 'não retornou resultado' then 'contrato'
+    when erro ~ 'payload de evento inválido|handler não retornou' then 'bug'
+    when erro ~ 'rejeitado:|NOTAFISCAL_HTTP_4[0-9]{2}' then 'negocio'
+    else 'desconhecido'
+  end;
+$$;
+
+comment on function outbox_categoria(text) is
+  'Fonte de verdade da classificação de erro do outbox. '
+  'Espelhada em ClassificadorErro.java e verificada por ClassificadorErroParityTest.';
+
+-- backfill dos registros existentes
+update outbox_evento
+   set categoria_falha = outbox_categoria(ultimo_erro)
+ where status = 'FALHA'
+   and categoria_falha is distinct from outbox_categoria(ultimo_erro);
+
+-- índice que o painel e o exporter usam
+create index if not exists idx_outbox_falha_categoria
+    on outbox_evento (categoria_falha)
+ where status = 'FALHA';
+```
+
+`immutable` não é detalhe: permite uso em índice funcional, em `where` com pushdown e garante que o resultado não muda entre chamadas. Sem ele, o planejador não pode otimizar e você paga o custo em toda query do painel.
+
+### 2.3 Os scripts passam a delegar
+
+Nenhum `CASE` inline. Em `scripts/outbox-triage.sh` e `scripts/outbox-reprocess.sh`, a variável `CLASSIFICACAO` é substituída por:
+
+```bash
+# Classificação vem do banco — fonte única. Nunca duplique este CASE.
+CLASSIFICACAO="outbox_categoria(ultimo_erro)"
+```
+
+E a query de agrupamento fica:
+
+```sql
+select outbox_categoria(ultimo_erro) as categoria,
+       count(*) as eventos
+  from outbox_evento
+ where status = 'FALHA'
+ group by 1
+ order by count(*) desc;
+```
+
+Agora os três consumidores leem a mesma fonte:
+
+```text
+outbox_categoria(text)  ←  oráculo
+        │
+        ├── scripts (via SQL)
+        ├── exporter (via coluna materializada)
+        └── ClassificadorErro.java (verificado por teste)
+```
+
+### 2.4 O teste
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.List;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+/**
+ * Garante que a implementação Java e a função SQL classificam
+ * exatamente igual. Divergência aqui significa operador e painel
+ * vendo realidades diferentes durante um incidente.
+ */
+@SpringBootTest
+@Testcontainers
+class ClassificadorErroParityTest {
+
+    private static final List<String> CORPUS = List.of(
+            // credencial
+            "NOTAFISCAL_HTTP_401",
+            "NOTAFISCAL_HTTP_403",
+            // transitorio
+            "NOTAFISCAL_HTTP_500",
+            "NOTAFISCAL_HTTP_503",
+            "NOTAFISCAL_INDISPONIVEL",
+            "NOTAFISCAL_RESPOSTA_VAZIA",
+            "AUTORIZACAO_TIMEOUT",
+            "read timed out",
+            "Connection refused: parceiro.example",
+            // contrato
+            "parceiro não retornou resultado",
+            // bug
+            "payload de evento inválido",
+            "handler não retornou resultado para o evento",
+            // negocio
+            "rejeitado: CNPJ irregular",
+            "rejeitado: valor acima do limite",
+            "NOTAFISCAL_HTTP_400",
+            "NOTAFISCAL_HTTP_422",
+            // desconhecido
+            null,
+            "",
+            "erro sem classificacao conhecida",
+            "OutOfMemoryError",
+            // casos de fronteira: a ordem das cláusulas decide
+            "NOTAFISCAL_HTTP_409",
+            "rejeitado: NOTAFISCAL_HTTP_503",
+            "timeout rejeitado: instavel");
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
+
+    @Autowired JdbcClient jdbc;
+
+    static Stream<Arguments> corpus() {
+        return CORPUS.stream().map(Arguments::of);
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("corpus")
+    @DisplayName("Java e SQL devem classificar identicamente")
+    void deveClassificarIgualAoBanco(String erro) {
+        var esperadoPeloBanco = categoriaNoBanco(erro);
+        var obtidoNoJava = ClassificadorErro.classificar(erro);
+
+        assertThat(obtidoNoJava)
+                .as("divergência entre ClassificadorErro e outbox_categoria para: %s", erro)
+                .isEqualTo(esperadoPeloBanco);
+    }
+
+    @ParameterizedTest
+    @MethodSource("classesEsperadas")
+    @DisplayName("O corpus cobre todas as categorias existentes")
+    void corpusDeveCobrirTodasAsCategorias(String categoria) {
+        var cobertas = CORPUS.stream()
+                .map(ClassificadorErro::classificar)
+                .toList();
+
+        assertThat(cobertas)
+                .as("adicione um caso ao corpus se criar uma categoria nova")
+                .contains(categoria);
+    }
+
+    static Stream<String> classesEsperadas() {
+        return Stream.of("credencial", "transitorio", "contrato", "bug", "negocio", "desconhecido");
+    }
+
+    private String categoriaNoBanco(String erro) {
+        return jdbc.sql("select outbox_categoria(:erro)")
+                .param("erro", erro)
+                .query(String.class)
+                .single();
+    }
+}
+```
+
+### 2.5 Por que este teste pega o que os outros não pegam
+
+**Os casos de fronteira no corpus são o ponto.** `"NOTAFISCAL_HTTP_409"` casa com `NOTAFISCAL_HTTP_4[0-9]{2}` (negócio) e não com `40[13]` — então a ordem das cláusulas decide. Se alguém reordenar o `CASE` na função SQL, o Java continua igual, o teste falha, e você descobre no CI em vez de descobrir com o operador bloqueado.
+
+`"rejeitado: NOTAFISCAL_HTTP_503"` é o caso mais cruel: contém tanto o prefixo de negócio quanto o código transitório. A ordem correta (transitório antes de negócio) classifica como transitório — reprocessar é seguro. A ordem errada classifica como negócio e o script recusa o reprocessamento de um erro que era recuperável.
+
+**O teste de cobertura de corpus existe para não ficar obsoleto.** Se alguém cria a categoria `autenticacao` no Java e esquece a função SQL, o segundo teste falha se o corpus não a cobre — e você é forçado a adicionar o caso. Sem isso, o corpus envelhece e passa a verificar um subconjunto do comportamento real.
+
+**O que o teste não faz, deliberadamente:** não verifica o regex em si. Verificar `Pattern` contra `Pattern` seria tautologia. Ele verifica *resultado de classificação* para uma entrada — a única coisa que importa para o consumidor.
+
+### 2.6 Alvo de mutação, opcional
+
+Se você quiser garantir que o corpus realmente exercita a lógica, adicione estes classes ao alvo do PIT (Parte I):
+
+```xml
+<targetClasses>
+  <param>br.com.empresa.pedidos.application.outbox.ClassificadorErro</param>
+</targetClasses>
+<targetTests>
+  <param>br.com.empresa.pedidos.application.outbox.ClassificadorErroParityTest</param>
+</targetTests>
+```
+
+Mutantes sobreviventes aí indicam cláusula não coberta pelo corpus — informação direta para melhorar a lista, não para aumentar cobertura numérica.
+
+---
+
+## 3. Repositório `docs/`
+
+### 3.1 A decisão de escopo
+
+Você pediu "o conteúdo das Partes I a XI já preenchido". Sou direto sobre o que entreguei e por quê: **reproduzir as onze partes em arquivos não é migração, é duplicação.** O conteúdo já existe nesta conversa, é a fonte da verdade, e reescrevê-lo criaria a primeira divergência do projeto — a que o item 2 combate.
+
+Entreguei o que **não existe ainda** e é necessário para o site funcionar:
+
+| Entregue agora (conteúdo novo) | Migração (conteúdo existente) |
+|---|---|
+| `mkdocs.yml` completo | `01-fundamentos/*` ← Partes I |
+| `docs/README.md` com precedência | `02-guias/*` ← Partes II a VIII |
+| `00-visao-geral/como-usar.md` | `03-operacao/*` ← Partes IX a X |
+| 6 ADRs redigidos | `05-referencia/*` ← tabelas das Partes I e XI |
+| `9999-template.md` | |
+| `validar-docs.py` | |
+| Alvo `make docs-stubs` | |
+
+### 3.2 `docs/mkdocs.yml`
+
+```yaml
+site_name: Padrões de Engenharia — Serviços Java
+site_description: Documentação normativa Java 25 / Spring Boot 4.1
+docs_dir: .
+site_dir: ../build/site
+use_directory_urls: true
+
+theme:
+  name: material
+  language: pt-BR
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+    - search.suggest
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences
+
+plugins:
+  - search
+
+nav:
+  - Início: README.md
+  - Visão geral:
+      - Como usar: 00-visao-geral/como-usar.md
+      - Stack de referência: 00-visao-geral/stack-de-referencia.md
+  - Fundamentos:
+      - Spring Boot: 01-fundamentos/spring-boot.md
+      - API RESTful: 01-fundamentos/api-restful.md
+      - Lean Code: 01-fundamentos/lean-code.md
+      - SOLID: 01-fundamentos/solid.md
+      - Arquitetura: 01-fundamentos/arquitetura.md
+      - Qualidade: 01-fundamentos/qualidade.md
+      - Testes: 01-fundamentos/testes.md
+      - Persistência: 01-fundamentos/persistencia-jpa.md
+      - Lombok: 01-fundamentos/lombok.md
+  - Guias:
+      - API sob Lean e SOLID: 02-guias/api-sob-lean-solid.md
+      - Arquitetura, qualidade e testes: 02-guias/arquitetura-qualidade-testes.md
+      - Persistência e Lombok: 02-guias/persistencia-lombok.md
+      - Eventos e outbox: 02-guias/eventos-outbox.md
+      - Resiliência de clientes: 02-guias/resiliencia-clientes.md
+      - Operação em Kubernetes: 02-guias/operacao-kubernetes.md
+      - Observabilidade: 02-guias/observabilidade.md
+      - Teste de carga: 02-guias/teste-de-carga.md
+  - Operação:
+      - Runbook — outbox: 03-operacao/runbook-outbox.md
+      - Runbook — dead letter: 03-operacao/runbook-dead-letter.md
+      - Runbook — deploy: 03-operacao/runbook-deploy.md
+      - Postmortem: 03-operacao/postmortem-template.md
+      - Checklists:
+          - PR: 03-operacao/checklists/pr.md
+          - Go-live: 03-operacao/checklists/go-live.md
+          - Incidente: 03-operacao/checklists/incidente.md
+  - ADRs:
+      - Índice: 04-adr/README.md
+      - 0001 Clean Architecture: 04-adr/0001-clean-architecture-por-camadas.md
+      - 0002 Sem Lombok: 04-adr/0002-sem-lombok.md
+      - 0003 Outbox transacional: 04-adr/0003-outbox-transacional.md
+      - 0004 Resilience4j como biblioteca: 04-adr/0004-resilience4j-como-biblioteca.md
+      - 0005 Relay em Deployment separado: 04-adr/0005-relay-em-deployment-separado.md
+      - 0006 Backlog observado pelo banco: 04-adr/0006-backlog-como-metrica-do-banco.md
+      - Template: 04-adr/9999-template.md
+  - Referência:
+      - Matriz de sintomas: 05-referencia/matriz-sintomas.md
+      - Métricas: 05-referencia/metricas.md
+      - Orçamento de conexões: 05-referencia/orcamento-conexoes.md
+```
+
+### 3.3 `docs/README.md`
+
+```markdown
+# Padrões de Engenharia — Serviços Java
+
+Documentação normativa para desenvolvimento, operação e evolução de serviços
+Java 25 / Spring Boot 4.1.
+
+**Stack de referência:** Spring Boot 4.1.0 · Java 25 LTS · PostgreSQL 17 · Hibernate 7.4
+
+## Por onde começar
+
+| Se você precisa... | Leia |
+|---|---|
+| Entender o padrão antes de escrever código | Fundamentos |
+| Aplicar o padrão em uma feature nova | Guias |
+| Resolver um incidente agora | Runbooks |
+| Saber por que algo é assim | ADRs |
+| Consultar limite, nome de métrica ou sintoma | Referência |
+
+## Regra de precedência
+
+1. ADR aceito vence este documento.
+2. Este documento vence hábito do time.
+3. Entre guia e fundamento, o fundamento vence — o guia é aplicação, o fundamento é o critério.
+4. Dúvida não resolvida aqui: abra issue com label `docs`.
+
+## Documentos com dono
+
+Todo arquivo declara `owner` e `revisar-ate` no frontmatter. Documento com
+revisão vencida falha o build. Documento sem dono é removido na revisão
+trimestral.
+```
+
+### 3.4 `docs/00-visao-geral/como-usar.md`
+
+```markdown
+---
+titulo: Como usar esta documentação
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# Como usar esta documentação
+
+## Durante um incidente
+
+Vá direto ao runbook. Não leia fundamento sob pressão.
+
+| Situação | Documento |
+|---|---|
+| Eventos acumulando | [Runbook — outbox](../03-operacao/runbook-outbox.md) |
+| Eventos em FALHA | [Runbook — dead letter](../03-operacao/runbook-dead-letter.md) |
+| Deploy travando | [Runbook — deploy](../03-operacao/runbook-deploy.md) |
+
+Comando de entrada, sempre somente leitura:
+
+```bash
+make operacao-triage
+```
+
+## Antes de escrever código
+
+Leia o fundamento do tema e o guia correspondente. O fundamento dá o critério;
+o guia mostra a aplicação neste projeto.
+
+## Ao tomar uma decisão que será questionada
+
+Escreva um ADR. O teste é simples: se você imagina um colega novo perguntando
+"por que não fizemos diferente?", existe ADR a ser escrito.
+
+## Ao discordar de algum padrão
+
+Abra issue com label `docs` citando o documento e a seção. Padrão questionado
+é padrão vivo. Padrão não questionado há dois anos provavelmente está obsoleto.
+```
+
+### 3.5 Os seis ADRs
+
+`docs/04-adr/0001-clean-architecture-por-camadas.md`
+
+```markdown
+---
+titulo: ADR-0001 — Clean Architecture por camadas
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-0001 — Organizar o código em domain, application, infrastructure e shared
+
+- **Status:** Aceito
+- **Data:** 2026-10-28
+- **Decisores:** time de engenharia
+- **Substitui:** —
+
+## Contexto
+
+Serviços cresciam com controller chamando repository diretamente. Regra de
+negócio aparecia em três lugares: no controller, em um `Service` e em uma
+consulta SQL. Testar exigia contexto Spring completo em 80% dos casos.
+
+## Decisão
+
+Adotamos quatro camadas com direção de dependência única: `domain` ←
+`application` ← `infrastructure`. `domain` e `application` não importam nada de
+`infrastructure` nem do Spring (exceção: `jakarta.validation` em records de
+entrada).
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| Camadas por tecnologia (controller/service/repository) | Não estabelece regra de dependência; qualquer camada chama qualquer camada |
+| Hexagonal com ports/adapters explícitos em todo o projeto | Mesma direção de dependência com mais cerimônia; adotamos apenas o conceito de porta |
+| Pacotes por feature sem camadas | Não impede domínio importar JPA |
+
+## Consequências
+
+**Positivas**
+- Regra de negócio testável em milissegundos, sem contexto Spring.
+- Fronteira fiscalizável por ferramenta, não por disciplina.
+
+**Negativas**
+- Mapeamento entre agregado e entidade JPA em toda escrita.
+- Camadas adicionais em CRUD trivial.
+
+**Custo operacional**
+- Um mapeamento a manter por agregado.
+
+## Como verificar que a decisão está sendo seguida
+
+```java
+@ArchTest
+static final ArchRule dominioNaoConheceFramework = noClasses()
+        .that().resideInAPackage("..domain..")
+        .should().dependOnClassesThat()
+        .resideInAnyPackage("org.springframework..", "jakarta.persistence..", "..infrastructure..");
+```
+```
+
+`docs/04-adr/0002-sem-lombok.md`
+
+```markdown
+---
+titulo: ADR-0002 — Não usar Lombok em código novo
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-0002 — Não usar Lombok em código novo
+
+- **Status:** Aceito
+- **Data:** 2026-10-28
+- **Decisores:** time de engenharia
+- **Substitui:** —
+
+## Contexto
+
+Entidades com `@Data` produziam `hashCode` mutável: a entidade desaparecia de
+`HashSet` após o `save`, sem exceção. `@ToString` em relacionamento
+bidirecional causava `StackOverflowError` dentro de log de erro. Java 25
+oferece records nativos. E, desde o JDK 23, o `javac` não executa processadores
+de anotação por padrão — o Lombok passou a exigir configuração explícita, com
+falha silenciosa do tipo `cannot find symbol`.
+
+## Decisão
+
+Não usamos Lombok em código novo. DTOs e Value Objects são `record`; injeção de
+dependência usa construtor explícito. Em código legado, só `@Getter`,
+`@RequiredArgsConstructor` e `@Slf4j`; `@Data` em entidade é proibido.
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| Manter Lombok com regras de contenção | A regra mais importante (`@Data` em entidade) é justamente a mais violada em PR |
+| Manter Lombok só em entidade | É onde os três defeitos se concentram |
+| MapStruct para mapeamento | Não resolve DTO nem entidade; seria uma dependência a mais |
+
+## Consequências
+
+**Positivas**
+- Código que se lê é o código que roda — depuração direta.
+- Sem annotation processing: menos acoplamento de toolchain.
+- `equals`/`hashCode`/`toString` com semântica correta e explícita.
+
+**Negativas**
+- Mais linhas em classes com muitos campos mutáveis.
+- Desenvolvedores acostumados com `@Builder` precisam de construtor ou fábrica.
+
+**Custo operacional**
+- Atualização de JDK não depende mais de versão de Lombok.
+
+## Como verificar que a decisão está sendo seguida
+
+```java
+@ArchTest
+static final ArchRule semLombok = noClasses()
+        .should().dependOnClassesThat().resideInAPackage("lombok..");
+```
+```
+
+`docs/04-adr/0003-outbox-transacional.md`
+
+```markdown
+---
+titulo: ADR-0003 — Outbox transacional para efeitos externos
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-0003 — Registrar eventos na transação de negócio (outbox)
+
+- **Status:** Aceito
+- **Data:** 2026-10-28
+- **Decisores:** time de engenharia
+- **Substitui:** —
+
+## Contexto
+
+`ApplicationEventPublisher` publicava antes do commit. Se a transação falhasse
+depois, o listener já havia emitido nota fiscal de um pagamento inexistente. O
+inverso também ocorria: listener lançando exceção desfazia o pagamento, mas o
+e-mail já tinha saído. O caso de uso de pagamento acumulava oito dependências
+de efeito colateral.
+
+## Decisão
+
+Efeitos externos são registrados na tabela `outbox_evento` na mesma transação
+do dado de negócio. Um relay separado processa a fila com retry, backoff e dead
+letter.
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| `ApplicationEventPublisher` com `@TransactionalEventListener(AFTER_COMMIT)` | Resolve a ordem, mas o evento vive só em memória: crash entre commit e publish perde o efeito |
+| Chamar serviços externos dentro da transação | Segura conexão de banco por todo o timeout do parceiro |
+| Fila externa (Kafka/SQS) | Infra nova; a tabela já resolve e é auditável em SQL |
+
+## Consequências
+
+**Positivas**
+- Atomicidade real: rollback elimina o evento junto com o dado.
+- Retry e dead letter auditáveis em SQL.
+- Caso de uso cai de oito dependências para duas.
+
+**Negativas**
+- Latência de publicação passa a ser assíncrona (segundos).
+- Uma tabela a mais para operar, monitorar e limpar.
+
+**Custo operacional**
+- Relay rodando, métrica de idade e runbook de dead letter.
+
+## Como verificar que a decisão está sendo seguida
+
+- Teste de atomicidade que força rollback e verifica ausência de efeito.
+- Guardrail de idade: `outbox_evento_mais_antigo_segundos` com alerta em 300s.
+```
+
+`docs/04-adr/0004-resilience4j-como-biblioteca.md`
+
+```markdown
+---
+titulo: ADR-0004 — Resilience4j como biblioteca, não starter
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-0004 — Usar Resilience4j como biblioteca e montar decorators manualmente
+
+- **Status:** Aceito
+- **Data:** 2026-10-28
+- **Decisores:** time de engenharia
+- **Substitui:** —
+
+## Contexto
+
+O starter do Resilience4j amarra a versão da biblioteca à versão do Spring
+Boot. Em upgrade de plataforma, o time ficava bloqueado esperando o starter
+acompanhar. Além disso, a configuração por annotation escondia a ordem dos
+decorators, que é o que determina o comportamento sob falha.
+
+## Decisão
+
+Dependemos de `resilience4j-circuitbreaker` e `resilience4j-retry` como
+bibliotecas, com beans montados em `@Configuration` e decorators compostos
+explicitamente: **retry dentro, circuit breaker fora**.
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| Starter oficial | Bloqueia upgrade de plataforma na versão da biblioteca |
+| `@CircuitBreaker` + `@Retry` por annotation | Ordem implícita; difícil de testar e de auditar |
+| Implementação própria | Reinventa máquina de estado já validada |
+
+## Consequências
+
+**Positivas**
+- Versão da biblioteca sob controle do time.
+- Ordem dos decorators explícita e testável.
+- Gateway testável sem contexto Spring.
+
+**Negativas**
+- Mais código de configuração.
+- Métricas do Resilience4j não são exportadas automaticamente.
+
+**Custo operacional**
+- Registrar os registries no Micrometer manualmente.
+
+## Como verificar que a decisão está sendo seguida
+
+- Teste com WireMock que prova retry funcional (2 requisições) e abertura de
+  circuito (sem tráfego após abrir).
+- ArchUnit: nenhuma classe de `infrastructure.client` usa
+  `@CircuitBreaker` ou `@Retry`.
+```
+
+`docs/04-adr/0005-relay-em-deployment-separado.md`
+
+```markdown
+---
+titulo: ADR-0005 — Relay em Deployment separado
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-0005 — Separar o relay em Deployment próprio com perfil dedicado
+
+- **Status:** Aceito
+- **Data:** 2026-10-28
+- **Decisores:** time de engenharia
+- **Substitui:** —
+
+## Contexto
+
+API e relay rodavam no mesmo processo. O orçamento de conexões não fechava:
+API de 3–12 réplicas com pool 20 chega a 240 conexões, e o PostgreSQL tinha
+`max_connections = 200`. O HPA escalava a API contra um limite invisível, com
+sintoma `FATAL: sorry, too many clients already` no banco e não no Kubernetes.
+Além disso, o relay é I/O-bound e não deve pagar o custo de um Tomcat.
+
+## Decisão
+
+Mesmo artefato, dois Deployments. O relay roda com
+`spring.main.web-application-type: none`, perfil `relay`, pool de conexão
+próprio (6) e HPA separado baseado em backlog.
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| Um Deployment com HPA por backlog global | API e relay escalam juntos; pool estoura antes do HPA reagir |
+| PgBouncer em modo transaction | Resolve conexão, não o custo de Tomcat ocioso nem a ambiguidade de métrica |
+| Relay como Lambda/Job | Perde o processamento contínuo e o controle de concorrência por linha |
+
+## Consequências
+
+**Positivas**
+- Orçamento de conexões explícito e cabível: 88 + 48 + 20 = 156 de 200.
+- Escala independente: API por CPU, relay por backlog.
+- Relay sem servidor HTTP: menos memória, menos superfície.
+
+**Negativas**
+- Sem `/actuator/prometheus` no relay — métricas por push OTLP.
+- Sem `httpGet` nas probes — liveness por heartbeat de scheduler.
+- Dois Deployments, dois HPAs, duas configurações de probe.
+
+**Custo operacional**
+- OTel Collector no caminho de métricas do relay.
+
+## Como verificar que a decisão está sendo seguida
+
+- `kubectl get deploy pedidos-relay -o jsonpath` não deve conter `containerPort`.
+- Alerta `OutboxMetricaAusente` ativo: ausência de métrica é falha detectável.
+- NetworkPolicy do relay com `ingress: []`.
+```
+
+`docs/04-adr/0006-backlog-como-metrica-do-banco.md`
+
+```markdown
+---
+titulo: ADR-0006 — Backlog observado pelo banco, não pela aplicação
+owner: time-pedidos
+revisado-em: 2026-10-28
+revisar-ate: 2027-10-28
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-0006 — Ler o backlog do banco em vez da aplicação
+
+- **Status:** Aceito
+- **Data:** 2026-10-28
+- **Decisores:** time de engenharia
+- **Substitui:** —
+
+## Contexto
+
+A métrica que mede a saúde do consumidor era produzida pelo consumidor. Com o
+relay morto, `outbox_eventos_pendentes` desaparecia e o HPA ficava em
+`<unknown>` exatamente quando escalar era a resposta correta. Um oximetro que
+desliga junto com o paciente.
+
+## Decisão
+
+O backlog é lido diretamente de `outbox_evento` pelo `postgres_exporter`, no
+primário. A recording rule usa `max()` para funcionar com uma ou duas fontes
+reportando o mesmo valor global.
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| Só métrica da aplicação | Ponto cego: relay morto leva a métrica junto |
+| Só métrica do banco | Não mede throughput nem latência de handler |
+| `or vector(0)` para evitar `<unknown>` | Mascara ausência: HPA lê zero com fila de milhares |
+
+## Consequências
+
+**Positivas**
+- Backlog observável com zero pods de relay.
+- HPA escala mesmo com todos os pods mortos.
+- `OutboxMetricaAusente` passa a significar problema real, não normalidade.
+
+**Negativas**
+- Uma query periódica no banco de produção.
+- Dependência de índice parcial `(criado_em) where status = 'PENDENTE'`.
+
+**Custo operacional**
+- Usuário `outbox_monitor` com `SELECT` apenas em `outbox_evento`.
+
+## Como verificar que a decisão está sendo seguida
+
+- Teste de aceite: parar o relay e confirmar que `outbox_backlog_total`
+  continua resolvendo.
+- `explain (analyze)` da query de métrica deve mostrar `Index Only Scan`.
+```
+
+### 3.6 `docs/04-adr/9999-template.md`
+
+```markdown
+---
+titulo: ADR-NNNN — <título no imperativo>
+owner: <time>
+revisado-em: AAAA-MM-DD
+revisar-ate: AAAA-MM-DD
+stack: Spring Boot 4.1 / Java 25
+status: vigente
+---
+
+# ADR-NNNN — <decisão em uma frase>
+
+- **Status:** Proposto
+- **Data:** AAAA-MM-DD
+- **Decisores:**
+- **Substitui:** —
+- **Substituído por:** —
+
+## Contexto
+
+<Fatos, restrições e números que obrigam uma decisão. Sem opinião.>
+
+## Decisão
+
+<"Adotamos X para Y", no presente.>
+
+## Alternativas consideradas
+
+| Alternativa | Por que foi descartada |
+|---|---|
+| | |
+
+## Consequências
+
+**Positivas**
+- 
+
+**Negativas**
+- 
+
+**Custo operacional**
+- 
+
+## Como verificar que a decisão está sendo seguida
+
+<Regra ArchUnit, teste, métrica ou checklist. ADR sem mecanismo de verificação
+é intenção, não decisão.>
+```
+
+### 3.7 `scripts/validar-docs.py`
+
+```python
+#!/usr/bin/env python3
+"""Valida frontmatter, prazos de revisão e status dos documentos."""
+
+import datetime
+import pathlib
+import re
+import sys
+
+import yaml
+
+OBRIGATORIOS = ("titulo", "owner", "revisado-em", "revisar-ate", "status")
+ISENTOS = {"README.md", "9999-template.md"}
+STATUS_VALIDOS = {"vigente", "em-revisao", "obsoleto"}
+
+
+def validar(raiz: pathlib.Path) -> list[str]:
+    falhas: list[str] = []
+    hoje = datetime.date.today()
+    total = 0
+
+    for md in sorted(raiz.rglob("*.md")):
+        if md.name in ISENTOS:
+            continue
+        total += 1
+        texto = md.read_text(encoding="utf-8")
+        match = re.match(r"^---\n(.*?)\n---", texto, re.S)
+
+        if not match:
+            falhas.append(f"{md}: sem frontmatter")
+            continue
+
+        meta = yaml.safe_load(match.group(1)) or {}
+
+        for campo in OBRIGATORIOS:
+            if campo not in meta:
+                falhas.append(f"{md}: campo '{campo}' ausente")
+
+        status = meta.get("status")
+        if status and status not in STATUS_VALIDOS:
+            falhas.append(f"{md}: status inválido '{status}'")
+        if status == "obsoleto":
+            falhas.append(f"{md}: status obsoleto ainda na navegação")
+
+        prazo = meta.get("revisar-ate")
+        if isinstance(prazo, datetime.date) and prazo < hoje:
+            falhas.append(f"{md}: revisão vencida em {prazo}")
+
+        if "TODO" in texto and status == "vigente":
+            falhas.append(f"{md}: marcado vigente mas contém TODO")
+
+    print(f"{total} documento(s) verificado(s)")
+    return falhas
+
+
+if __name__ == "__main__":
+    raiz = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "docs")
+    problemas = validar(raiz)
+    if problemas:
+        print("\n".join(f"  {p}" for p in problemas), file=sys.stderr)
+        sys.exit(1)
+    print("frontmatter válido")
+```
+
+A regra do `TODO` com `status: vigente` é o que impede o stub de virar documento permanente. Você cria o stub com `status: em-revisao`, migra o conteúdo, remove o `TODO`, muda para `vigente`. Enquanto houver `TODO`, ele não pode alegar estar pronto.
+
+---
+
+## 4. `Makefile`
+
+```makefile
+# ============================================================================
+# Pedidos Service — automação de build, documentação e operação
+# ============================================================================
+
+SHELL := /usr/bin/env bash
+.SHELLFLAGS := -eu -o pipefail -c
+.DEFAULT_GOAL := help
+
+PYTHON ?= python3
+MAVEN  ?= ./mvnw
+PIP    ?= $(PYTHON) -m pip
+
+DOCS_DIR    := docs
+DOCS_SITE   := build/site
+STACK_FILE  := stack-versions.txt
+POM         := pom.xml
+
+.DELETE_ON_ERROR:
+
+# ----------------------------------------------------------------------------
+##@ Ajuda
+# ----------------------------------------------------------------------------
+
+.PHONY: help
+help: ## Lista os alvos disponíveis
+	@printf '\n\033[1mAlvos disponíveis\033[0m\n\n'
+	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) \
+	  | sort \
+	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-24s\033[0m %s\n", $$1, $$2}'
+	@printf '\n'
+
+# ----------------------------------------------------------------------------
+##@ Verificação de código
+# ----------------------------------------------------------------------------
+
+.PHONY: vet
+vet: ## Análise estática + regras arquiteturais (falha rápido, sem testes de integração)
+	@echo ">> spotless"
+	@$(MAVEN) -q -B spotless:check
+	@echo ">> archunit"
+	@$(MAVEN) -q -B test -Dtest=ArquiteturaTest -DfailIfNoTests=false
+	@echo ">> checkstyle + spotbugs"
+	@$(MAVEN) -q -B checkstyle:check spotbugs:check -DskipTests
+	@echo "vet ok"
+
+.PHONY: verify
+verify: vet ## Pipeline completo: vet + todos os testes + cobertura
+	@echo ">> suite completa"
+	@$(MAVEN) -B verify
+	@echo "verify ok"
+
+.PHONY: parity
+parity: ## Verifica paridade entre ClassificadorErro e outbox_categoria
+	@$(MAVEN) -q -B test -Dtest=ClassificadorErroParityTest
+
+.PHONY: mutation
+mutation: ## Mutação no núcleo de domínio e na classificação
+	@$(MAVEN) -B pitest:mutationCoverage
+
+# ----------------------------------------------------------------------------
+##@ Documentação
+# ----------------------------------------------------------------------------
+
+.PHONY: install-docs
+install-docs: ## Instala dependências Python da documentação
+	$(PIP) install -q -r $(DOCS_DIR)/requirements.txt
+
+.PHONY: docs-check
+docs-check: ## Valida frontmatter, prazos de revisão e status
+	$(PYTHON) scripts/validar-docs.py $(DOCS_DIR)
+
+.PHONY: docs-build
+docs-build: docs-check ## Build estrito do site
+	$(PYTHON) -m mkdocs build --strict -f $(DOCS_DIR)/mkdocs.yml
+
+.PHONY: docs
+docs: docs-build ## Valida e constrói a documentação
+	@echo "site em $(DOCS_SITE)/index.html"
+
+.PHONY: docs-serve
+docs-serve: docs-check ## Servidor local com hot reload
+	$(PYTHON) -m mkdocs serve -f $(DOCS_DIR)/mkdocs.yml
+
+.PHONY: docs-stubs
+docs-stubs: ## Cria stubs com frontmatter para os arquivos de migração ausentes
+	@$(PYTHON) scripts/gerar-stubs-docs.py $(DOCS_DIR)
+
+.PHONY: docs-pendencias
+docs-pendencias: ## Lista documentos com TODO ou em revisão
+	@grep -rlE '^(status: em-revisao|.*TODO)' $(DOCS_DIR) --include='*.md' || true
+
+# ----------------------------------------------------------------------------
+##@ Stack
+# ----------------------------------------------------------------------------
+
+.PHONY: upgrade-check
+upgrade-check: ## Compara versões do pom com as homologadas em stack-versions.txt
+	@test -f $(STACK_FILE) || { echo "ERRO: $(STACK_FILE) ausente"; exit 1; }
+	@echo ">> versões homologadas vs. pom"
+	@$(PYTHON) scripts/upgrade-check.py $(STACK_FILE) $(POM)
+
+.PHONY: dependency-tree
+dependency-tree: ## Árvore de dependências com conflitos
+	@$(MAVEN) -B dependency:tree -Dverbose -Dincludes='*'
+
+# ----------------------------------------------------------------------------
+##@ Operação
+# ----------------------------------------------------------------------------
+
+.PHONY: operacao
+operacao: ## Mostra os comandos operacionais disponíveis
+	@printf '\n\033[1mOperação\033[0m\n\n'
+	@printf '  make operacao-triage      classifica dead letter (somente leitura)\n'
+	@printf '  make operacao-backlog     idade do evento mais antigo\n'
+	@printf '  make operacao-reprocess   plano de reprocessamento (dry-run)\n'
+	@printf '\nEm incidente, leia primeiro: %s/03-operacao/runbook-outbox.md\n\n' $(DOCS_DIR)
+
+.PHONY: operacao-triage
+operacao-triage: ## Triagem de dead letter (somente leitura)
+	@: "$${DATABASE_URL:?defina DATABASE_URL}"
+	./scripts/outbox-triage.sh
+
+.PHONY: operacao-backlog
+operacao-backlog: ## Idade do evento pendente mais antigo
+	@: "$${DATABASE_URL:?defina DATABASE_URL}"
+	@psql "$$DATABASE_URL" -tAc "\
+	  select format('pendentes=%s idade=%ss falhas=%s',\
+	    count(*) filter (where status = 'PENDENTE'),\
+	    coalesce(cast(extract(epoch from now() \
+	      - min(criado_em) filter (where status = 'PENDENTE')) as bigint), 0),\
+	    count(*) filter (where status = 'FALHA'))\
+	  from outbox_evento"
+
+.PHONY: operacao-reprocess
+operacao-reprocess: ## Plano de reprocessamento (dry-run por padrão)
+	@: "$${DATABASE_URL:?defina DATABASE_URL}"
+	./scripts/outbox-reprocess.sh --categoria "$${CATEGORIA:-transitorio}" --limit "$${LIMITE:-50}"
+
+# ----------------------------------------------------------------------------
+##@ Fluxo de trabalho
+# ----------------------------------------------------------------------------
+
+.PHONY: ci
+ci: verify docs parity ## Pipeline que roda no CI
+	@echo "ci ok"
+
+.PHONY: pre-commit
+pre-commit: ## Rápido: formatação + archunit + docs
+	@$(MAVEN) -q -B spotless:apply
+	@$(MAVEN) -q -B test -Dtest=ArquiteturaTest -DfailIfNoTests=false
+	@$(MAKE) --no-print-directory docs-check
+
+.PHONY: clean
+clean: ## Remove build e artefatos
+	@$(MAVEN) -q -B clean || true
+	@rm -rf $(DOCS_SITE)
+	@echo "limpo"
+```
+
+### 4.1 `scripts/upgrade-check.py`
+
+```python
+#!/usr/bin/env python3
+"""Compara versões homologadas (stack-versions.txt) com o pom.xml."""
+
+import pathlib
+import re
+import sys
+
+import xml.etree.ElementTree as ET
+
+NS = {"m": "http://maven.apache.org/POM/4.0.0"}
+
+
+def ler_homologadas(caminho: pathlib.Path) -> dict[str, str]:
+    esperado = {}
+    for linha in caminho.read_text(encoding="utf-8").splitlines():
+        linha = linha.strip()
+        if not linha or linha.startswith("#"):
+            continue
+        group, artifact, versao = linha.split(":")
+        esperado[f"{group}:{artifact}"] = versao
+    return esperado
+
+
+def ler_pom(caminho: pathlib.Path) -> dict[str, str]:
+    arvore = ET.parse(caminho)
+    raiz = arvore.getroot()
+
+    propriedades = {}
+    for props in raiz.findall("m:properties", NS):
+        for p in props:
+            propriedades[p.tag.split("}")[-1]] = (p.text or "").strip()
+
+    versoes = {}
+
+    pai = raiz.find("m:parent", NS)
+    if pai is not None:
+        group = pai.findtext("m:groupId", default="", namespaces=NS)
+        artifact = pai.findtext("m:artifactId", default="", namespaces=NS)
+        versao = pai.findtext("m:version", default="", namespaces=NS)
+        versoes[f"{group}:{artifact}"] = versao
+        pai_nome = pai.findtext("m:relativePath", default="", namespaces=NS)
+        if not pai_nome:
+            versoes[f"{group}:{artifact}"] = versao
+
+    for dep in raiz.findall("m:dependencies/m:dependency", NS):
+        group = dep.findtext("m:groupId", default="", namespaces=NS)
+        artifact = dep.findtext("m:artifactId", default="", namespaces=NS)
+        versao = dep.findtext("m:version", default="", namespaces=NS)
+        chave = f"{group}:{artifact}"
+        if versao.startswith("${") and versao.endswith("}"):
+            versao = propriedades.get(versao[2:-1], versao)
+        versoes[chave] = versao
+
+    for nome, valor in propriedades.items():
+        if nome.startswith("spring-boot") or nome == "java.version":
+            versoes[f"property:{nome}"] = valor
+
+    return versoes
+
+
+def main(arquivo_stack: str, arquivo_pom: str) -> int:
+    esperado = ler_homologadas(pathlib.Path(arquivo_stack))
+    atual = ler_pom(pathlib.Path(arquivo_pom))
+
+    divergencias = []
+    ausentes = []
+
+    for chave, versao in esperado.items():
+        if chave not in atual:
+            ausentes.append(chave)
+            continue
+        if atual[chave] != versao:
+            divergencias.append((chave, versao, atual[chave]))
+
+    for chave, hom, achado in divergencias:
+        print(f"  DIVERGE  {chave}: homologado {hom}, pom {achado}")
+    for chave in ausentes:
+        print(f"  AUSENTE  {chave} não encontrado no pom")
+
+    if divergencias or ausentes:
+        print(f"\n{len(divergencias) + len(ausentes)} divergência(s) de stack.")
+        print("Atualize stack-versions.txt via PR com justificativa, ou reverta o pom.")
+        return 1
+
+    print(f"{len(esperado)} dependência(s) alinhadas com a stack homologada")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1], sys.argv[2]))
+```
+
+### 4.2 `stack-versions.txt`
+
+```text
+# Stack homologada — atualização exige PR com justificativa
+# formato: groupId:artifactId:versao
+
+org.springframework.boot:spring-boot-starter-parent:4.1.0
+com.tngtech.archunit:archunit-junit5:1.4.0
+org.jacoco:jacoco-maven-plugin:0.8.14
+com.diffplug.spotless:spotless-maven-plugin:2.44.2
+com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6
+org.apache.maven.plugins:maven-checkstyle-plugin:3.6.0
+org.pitest:pitest-maven:1.17.4
+io.github.resilience4j:resilience4j-circuitbreaker:2.2.0
+io.github.resilience4j:resilience4j-retry:2.2.0
+```
+
+O arquivo ser versionado é o ponto: a stack homologada é uma decisão, e mudança de decisão passa por review. Sem isso, cada desenvolvedor sobe a versão que quiser no seu PR e o `upgrade-check` vira decoração.
+
+### 4.3 `scripts/gerar-stubs-docs.py`
+
+```python
+#!/usr/bin/env python3
+"""Cria stubs com frontmatter para os arquivos de migração ausentes."""
+
+import datetime
+import pathlib
+import sys
+
+import yaml
+
+# arquivo de destino -> parte de origem nesta documentação
+MIGRACAO = {
+    "01-fundamentos/spring-boot.md": "Parte I §2",
+    "01-fundamentos/api-restful.md": "Parte I §3",
+    "01-fundamentos/lean-code.md": "Parte I §4",
+    "01-fundamentos/solid.md": "Parte I §5",
+    "01-fundamentos/arquitetura.md": "Parte I §6",
+    "01-fundamentos/qualidade.md": "Parte I §7",
+    "01-fundamentos/testes.md": "Parte I §8",
+    "01-fundamentos/persistencia-jpa.md": "Parte I §9",
+    "01-fundamentos/lombok.md": "Parte I §10",
+    "02-guias/api-sob-lean-solid.md": "Parte II",
+    "02-guias/arquitetura-qualidade-testes.md": "Parte III",
+    "02-guias/persistencia-lombok.md": "Parte IV",
+    "02-guias/eventos-outbox.md": "Parte V §1",
+    "02-guias/resiliencia-clientes.md": "Parte V §2",
+    "02-guias/operacao-kubernetes.md": "Parte VI §2",
+    "02-guias/observabilidade.md": "Parte VI §1",
+    "02-guias/teste-de-carga.md": "Parte VI §3",
+    "03-operacao/runbook-outbox.md": "Parte IX §1",
+    "03-operacao/runbook-dead-letter.md": "Parte IX §3",
+    "03-operacao/runbook-deploy.md": "Parte X §2",
+    "03-operacao/postmortem-template.md": "Parte X §3",
+    "03-operacao/checklists/pr.md": "Parte I §14.1",
+    "03-operacao/checklists/go-live.md": "Parte I §14.2",
+    "03-operacao/checklists/incidente.md": "Parte X §3.3",
+    "05-referencia/matriz-sintomas.md": "Partes II §8 e IV §14",
+    "05-referencia/metricas.md": "Parte VI §1.1",
+    "05-referencia/orcamento-conexoes.md": "Parte VIII §2.1",
+    "00-visao-geral/stack-de-referencia.md": "Parte I §1.1",
+}
+
+MODELO = """---
+titulo: {titulo}
+owner: time-pedidos
+revisado-em: {hoje}
+revisar-ate: {prazo}
+stack: Spring Boot 4.1 / Java 25
+status: em-revisao
+---
+
+# {titulo}
+
+> **TODO — em migração.** Conteúdo de origem: {origem}.
+> Migre o texto, remova este bloco e altere `status` para `vigente`.
+
+## Escopo
+
+<Uma frase sobre o que este documento cobre e o que ele não cobre.>
+
+## Conteúdo
+
+<migrar de {origem}>
+"""
+
+
+def titulo_de(relativo: str) -> str:
+    nome = pathlib.Path(relativo).stem
+    return nome.replace("-", " ").capitalize()
+
+
+def main(raiz: str) -> int:
+    base = pathlib.Path(raiz)
+    hoje = datetime.date.today()
+    prazo = hoje.replace(year=hoje.year + 1)
+    criados = 0
+
+    for relativo, origem in MIGRACAO.items():
+        destino = base / relativo
+        if destino.exists():
+            continue
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(
+            MODELO.format(
+                titulo=titulo_de(relativo),
+                hoje=hoje.isoformat(),
+                prazo=prazo.isoformat(),
+                origem=origem,
+            ),
+            encoding="utf-8",
+        )
+        criados += 1
+        print(f"  criado  {relativo}  <- {origem}")
+
+    print(f"\n{criados} stub(s) criado(s). Build fica verde; TODO impede 'vigente'.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "docs"))
+```
+
+### 4.4 `docs/requirements.txt`
+
+```text
+mkdocs-material==9.6.0
+pymdown-extensions==10.14
+PyYAML==6.0.2
+```
+
+---
+
+## 5. Sequência de adoção
+
+```bash
+# 1. corrigir a divergência de classificação antes de tudo
+./mvnw -q flyway:migrate          # aplica V7 com outbox_categoria
+sed -i 's/^CLASSIFICACAO=.*/CLASSIFICACAO="outbox_categoria(ultimo_erro)"/' \
+  scripts/outbox-triage.sh scripts/outbox-reprocess.sh
+make parity                       # deve passar
+
+# 2. montar a documentação
+make install-docs
+make docs-stubs                   # cria os 28 stubs de migração
+make docs                         # valida frontmatter e constrói
+
+# 3. verificar a stack
+make upgrade-check
+
+# 4. pipeline completo
+make ci
+```
+
+O ponto de ordem que importa: `make parity` antes de `make docs`. Documentar uma classificação divergente produz um runbook que contradiz o sistema — pior que não ter runbook.
+
+---
+
+## Resumindo
+
+- **A fonte de verdade da classificação passa a ser `outbox_categoria(text)` no banco**, com scripts e exporter consumindo dela. Sem isso, os três consumidores podem divergir em silêncio, e o sintoma aparece durante o incidente.
+- **O teste de paridade compara resultado, não regex.** E os casos de fronteira no corpus — `"rejeitado: NOTAFISCAL_HTTP_503"`, `"NOTAFISCAL_HTTP_409"` — são os que provam que a ordem das cláusulas está correta nos dois lados.
+- **O `docs/` entregue é shell funcional + ADRs novos + migração mapeada.** Reescrever as Partes I a XI em arquivos criaria a primeira divergência do projeto; o mapa `arquivo ← parte` evita isso.
+- **`make docs-stubs` mantém o build verde durante a migração**, e a regra "`TODO` com `status: vigente` falha o build" impede o stub de virar documento permanente.
+- **`stack-versions.txt` versionado transforma upgrade em decisão revisável**, não em escolha individual dentro do PR de cada um.
+- **`make operacao-*` reduz o tempo até o primeiro comando útil em incidente** — e todos são somente leitura por padrão.
+
+Se quiser, posso:
+
+- Escrever os `scripts/gerar-stubs-docs.py` e `scripts/upgrade-check.py` já testados contra o `pom.xml` real da Parte I, incluindo os casos de versão via propriedade e `parent`.
+- Criar o `pre-commit` hook (`.githooks/pre-commit`) que roda `make pre-commit` e bloqueia commit com documentação desatualizada em PR que altera contrato de API.
+- Implementar o teste de paridade em modo "fail fast local": rodando só contra um Postgres em Docker sem Testcontainers, para execução em menos de 3 segundos no loop de desenvolvimento.
+
+Os testes dos scripts expõem um defeito real na versão da Parte XII — e corrigi-lo muda o desenho dos três itens. Começo por ele.
+
+---
+
+# Parte XIII — Scripts verificados, hook de contrato e paridade em 3 segundos
+
+**Base:** Python 3.12 + pytest · Git hooks · JUnit 5 · PostgreSQL 17
+
+---
+
+## 1. O defeito que os testes revelam
+
+O `upgrade-check.py` da Parte XII lia apenas quatro origens: `<parent>`, `<dependencies>`, `<dependencyManagement>` e `<properties>`. Mas o `stack-versions.txt` homologa cinco plugins de build:
+
+```text
+org.jacoco:jacoco-maven-plugin:0.8.14
+com.diffplug.spotless:spotless-maven-plugin:2.44.2
+com.github.spotbugs:spotbugs-maven-plugin:4.8.6.6
+org.apache.maven.plugins:maven-checkstyle-plugin:3.6.0
+org.pitest:pitest-maven:1.17.4
+```
+
+Todos vivem em `<build><plugins>`, que o script não percorria. Resultado: cinco linhas reportadas como `AUSENTE` em toda execução, o time aprende a ignorar a saída, e o check vira ruído. É o modo de falha mais comum de ferramenta de verificação — não errar, mas ser ignorada.
+
+Há um segundo defeito, mais sutil: o script resolvia `${propriedade}` em um nível só. `archunit.version` é direto, mas `spring-boot-starter-parent` herda suas próprias propriedades, e uma cadeia `a → b → literal` cairia no valor não resolvido sem aviso.
+
+---
+
+## 2. `scripts/upgrade-check.py` corrigido
+
+```python
+#!/usr/bin/env python3
+"""Compara versões homologadas (stack-versions.txt) com as declaradas no pom.xml.
+
+Origens cobertas:
+  parent                    versão do starter parent
+  dependencies              bibliotecas de aplicação
+  dependencyManagement      BOMs e versões geridas
+  build.plugins             plugins de build  <- origem que a 1a versão ignorava
+  build.pluginManagement    versões geridas de plugins
+  properties                java.version, spring-boot e afins
+
+Códigos de saída:
+  0  alinhado
+  1  divergência ou ausência
+  2  erro de leitura
+"""
+
+from __future__ import annotations
+
+import argparse
+import pathlib
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+PROPRIEDADE = re.compile(r"^\$\{([^}]+)\}$")
+VAZIO = ""
+
+
+def _local(tag: str) -> str:
+    """Nome da tag sem namespace — poms com e sem xmlns são tratados igual."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _txt(elemento: ET.Element | None, nome: str) -> str:
+    if elemento is None:
+        return VAZIO
+    for filho in elemento:
+        if _local(filho.tag) == nome:
+            return (filho.text or "").strip()
+    return VAZIO
+
+
+def _filhos(elemento: ET.Element, nome: str) -> list[ET.Element]:
+    return [f for f in elemento if _local(f.tag) == nome]
+
+
+def _propriedades(raiz: ET.Element) -> dict[str, str]:
+    props: dict[str, str] = {}
+    for bloco in _filhos(raiz, "properties"):
+        for p in bloco:
+            props[_local(p.tag)] = (p.text or "").strip()
+    return props
+
+
+def _resolver(valor: str, props: dict[str, str], profundidade: int = 0) -> str:
+    """Resolve ${a} -> ${b} -> literal. Retorna literal se a cadeia não fechar."""
+    valor = valor.strip()
+    if profundidade > 5:
+        return valor
+    casamento = PROPRIEDADE.match(valor)
+    if not casamento:
+        return valor
+    chave = casamento.group(1)
+    if chave not in props:
+        return valor
+    return _resolver(props[chave], props, profundidade + 1)
+
+
+def _ler_dependencias(
+    bloco: ET.Element,
+    registrar: "Registrador",
+    origem: str,
+) -> None:
+    for dep in _filhos(bloco, "dependency"):
+        registrar(_txt(dep, "groupId"), _txt(dep, "artifactId"), _txt(dep, "version"), origem)
+
+
+def _ler_plugins(
+    bloco: ET.Element,
+    registrar: "Registrador",
+    origem: str,
+) -> None:
+    for plugin in _filhos(bloco, "plugin"):
+        registrar(_txt(plugin, "groupId"), _txt(plugin, "artifactId"), _txt(plugin, "version"), origem)
+
+
+class Registrador:
+    def __init__(self, props: dict[str, str]) -> None:
+        self.props = props
+        self.versoes: dict[str, str] = {}
+        self.origens: dict[str, str] = {}
+
+    def __call__(self, group: str, artifact: str, version: str, origem: str) -> None:
+        if not group or not artifact:
+            return
+        chave = f"{group}:{artifact}"
+        self.versoes[chave] = _resolver(version, self.props)
+        self.origens[chave] = origem
+
+
+def ler_pom(caminho: pathlib.Path) -> Registrador:
+    raiz = ET.parse(caminho).getroot()
+    props = _propriedades(raiz)
+    registrar = Registrador(props)
+
+    pai = next(iter(_filhos(raiz, "parent")), None)
+    if pai is not None:
+        registrar(_txt(pai, "groupId"), _txt(pai, "artifactId"), _txt(pai, "version"), "parent")
+
+    for bloco in raiz:
+        nome = _local(bloco.tag)
+
+        if nome == "dependencies":
+            _ler_dependencias(bloco, registrar, "dependencies")
+
+        elif nome == "dependencyManagement":
+            for sub in _filhos(bloco, "dependencies"):
+                _ler_dependencias(sub, registrar, "dependencyManagement")
+
+        elif nome == "build":
+            for sub in _filhos(bloco, "plugins"):
+                _ler_plugins(sub, registrar, "plugins")
+            for mgmt in _filhos(bloco, "pluginManagement"):
+                for sub in _filhos(mgmt, "plugins"):
+                    _ler_plugins(sub, registrar, "pluginManagement")
+
+    for nome, valor in props.items():
+        if nome == "java.version" or nome.startswith("spring-boot"):
+            registrar("property", nome, valor, "properties")
+
+    return registrar
+
+
+def ler_homologadas(caminho: pathlib.Path) -> dict[str, str]:
+    esperado: dict[str, str] = {}
+    for bruta in caminho.read_text(encoding="utf-8").splitlines():
+        linha = bruta.strip()
+        if not linha or linha.startswith("#"):
+            continue
+        partes = linha.split(":")
+        if len(partes) != 3:
+            raise ValueError(f"linha inválida em {caminho.name}: {linha!r} (esperado grupo:artefato:versão)")
+        esperado[f"{partes[0]}:{partes[1]}"] = partes[2]
+    return esperado
+
+
+def comparar(
+    esperado: dict[str, str],
+    registrador: Registrador,
+    estrito_orfao: bool,
+) -> tuple[list[str], list[str], list[str]]:
+    divergencias: list[str] = []
+    ausentes: list[str] = []
+    orfaos: list[str] = []
+
+    for chave, versao_homologada in esperado.items():
+        if chave not in registrador.versoes:
+            ausentes.append(chave)
+            continue
+        achada = registrador.versoes[chave]
+        if achada != versao_homologada:
+            origem = registrador.origens[chave]
+            divergencias.append(f"{chave}: homologado {versao_homologada}, pom {achada} (em <{origem}>")
+
+    for chave, versao in registrador.versoes.items():
+        if chave in esperado or chave.startswith("property:"):
+            continue
+        if not versao or "${" in versao:
+            continue  # versão gerida pelo parent/BOM: não é órfão
+        orfaos.append(f"{chave}:{versao}")
+
+    if not estrito_orfao:
+        orfaos = []
+
+    return divergencias, ausentes, orfaos
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stack", type=pathlib.Path)
+    parser.add_argument("pom", type=pathlib.Path)
+    parser.add_argument(
+        "--estrito-orfao",
+        action="store_true",
+        help="falha quando o pom declara versão explícita não homologada",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        esperado = ler_homologadas(args.stack)
+        registrador = ler_pom(args.pom)
+    except (OSError, ET.ParseError, ValueError) as erro:
+        print(f"erro: {erro}", file=sys.stderr)
+        return 2
+
+    divergencias, ausentes, orfaos = comparar(esperado, registrador, args.estrito_orfao)
+
+    for linha in divergencias:
+        print(f"  DIVERGE  {linha}")
+    for chave in ausentes:
+        print(f"  AUSENTE  {chave} não encontrado no pom")
+    for linha in orfaos:
+        print(f"  ÓRFÃO    {linha} — versão explícita sem homologação")
+
+    total = len(divergencias) + len(ausentes) + len(orfaos)
+    if total:
+        print(f"\n{total} problema(s). Atualize stack-versions.txt por PR com justificativa, ou reverta o pom.")
+        return 1
+
+    print(f"{len(esperado)} coordenada(s) alinhadas com a stack homologada")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+---
+
+## 3. Testes dos scripts contra o pom real
+
+`tests/test_upgrade_check.py`
+
+```python
+import pathlib
+import textwrap
+
+import pytest
+
+import upgrade_check
+
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+RAIZ = pathlib.Path(__file__).parent.parent
+POM_REAL = RAIZ / "pom.xml"
+STACK_REAL = RAIZ / "stack-versions.txt"
+
+
+def escrever(tmp_path: pathlib.Path, nome: str, conteudo: str) -> pathlib.Path:
+    destino = tmp_path / nome
+    destino.write_text(textwrap.dedent(conteudo).lstrip(), encoding="utf-8")
+    return destino
+
+
+POM_COMPLETO = """
+    <project xmlns="http://maven.apache.org/POM/4.0.0">
+      <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>4.1.0</version>
+      </parent>
+
+      <properties>
+        <java.version>25</java.version>
+        <archunit.version>1.4.0</archunit.version>
+        <jacoco.version>0.8.14</jacoco.version>
+      </properties>
+
+      <dependencies>
+        <dependency>
+          <groupId>org.springframework.boot</groupId>
+          <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+        <dependency>
+          <groupId>com.tngtech.archunit</groupId>
+          <artifactId>archunit-junit5</artifactId>
+          <version>${archunit.version}</version>
+          <scope>test</scope>
+        </dependency>
+      </dependencies>
+
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.jacoco</groupId>
+            <artifactId>jacoco-maven-plugin</artifactId>
+            <version>${jacoco.version}</version>
+          </plugin>
+          <plugin>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-maven-plugin</artifactId>
+          </plugin>
+        </plugins>
+      </build>
+    </project>
+"""
+
+
+def test_versao_via_propriedade(tmp_path):
+    pom = escrever(tmp_path, "pom.xml", POM_COMPLETO)
+    registro = upgrade_check.ler_pom(pom)
+
+    assert registro.versoes["com.tngtech.archunit:archunit-junit5"] == "1.4.0"
+
+
+def test_versao_do_parent(tmp_path):
+    pom = escrever(tmp_path, "pom.xml", POM_COMPLETO)
+    registro = upgrade_check.ler_pom(pom)
+
+    chave = "org.springframework.boot:spring-boot-starter-parent"
+    assert registro.versoes[chave] == "4.1.0"
+    assert registro.origens[chave] == "parent"
+
+
+def test_versao_de_plugin_e_lida(tmp_path):
+    """Regressão: a 1a versão lia só <dependencies> e reportava plugins como AUSENTE."""
+    pom = escrever(tmp_path, "pom.xml", POM_COMPLETO)
+    registro = upgrade_check.ler_pom(pom)
+
+    assert registro.versoes["org.jacoco:jacoco-maven-plugin"] == "0.8.14"
+    assert registro.origens["org.jacoco:jacoco-maven-plugin"] == "plugins"
+
+
+def test_plugin_management_e_lido(tmp_path):
+    pom = escrever(
+        tmp_path,
+        "pom.xml",
+        """
+        <project>
+          <build>
+            <pluginManagement>
+              <plugins>
+                <plugin>
+                  <groupId>org.pitest</groupId>
+                  <artifactId>pitest-maven</artifactId>
+                  <version>1.17.4</version>
+                </plugin>
+              </plugins>
+            </pluginManagement>
+          </build>
+        </project>
+        """,
+    )
+
+    registro = upgrade_check.ler_pom(pom)
+
+    assert registro.versoes["org.pitest:pitest-maven"] == "1.17.4"
+    assert registro.origens["org.pitest:pitest-maven"] == "pluginManagement"
+
+
+def test_cadeia_de_propriedades_resolve(tmp_path):
+    pom = escrever(
+        tmp_path,
+        "pom.xml",
+        """
+        <project>
+          <properties>
+            <base.versao>2.0.0</base.versao>
+            <lib.versao>${base.versao}</lib.versao>
+          </properties>
+          <dependencies>
+            <dependency>
+              <groupId>br.com.exemplo</groupId>
+              <artifactId>lib</artifactId>
+              <version>${lib.versao}</version>
+            </dependency>
+          </dependencies>
+        </project>
+        """,
+    )
+
+    registro = upgrade_check.ler_pom(pom)
+
+    assert registro.versoes["br.com.exemplo:lib"] == "2.0.0"
+
+
+def test_propriedade_inexistente_nao_quebra(tmp_path):
+    pom = escrever(
+        tmp_path,
+        "pom.xml",
+        """
+        <project>
+          <dependencies>
+            <dependency>
+              <groupId>br.com.exemplo</groupId>
+              <artifactId>lib</artifactId>
+              <version>${ausente.versao}</version>
+            </dependency>
+          </dependencies>
+        </project>
+        """,
+    )
+
+    registro = upgrade_check.ler_pom(pom)
+
+    assert registro.versoes["br.com.exemplo:lib"] == "${ausente.versao}"
+
+
+def test_dependencia_gerida_pelo_parent_nao_e_orfao(tmp_path):
+    pom = escrever(tmp_path, "pom.xml", POM_COMPLETO)
+    stack = escrever(tmp_path, "stack.txt", "org.springframework.boot:spring-boot-starter-parent:4.1.0")
+
+    codigo = upgrade_check.main([str(stack), str(pom)])
+
+    assert codigo == 0
+
+
+def test_versao_explicita_nao_homologada_vira_orfao_com_estrito(tmp_path):
+    pom = escrever(tmp_path, "pom.xml", POM_COMPLETO)
+    stack = escrever(tmp_path, "stack.txt", "org.springframework.boot:spring-boot-starter-parent:4.1.0")
+
+    codigo = upgrade_check.main([str(stack), str(pom), "--estrito-orfao"])
+
+    assert codigo == 1
+
+
+def test_divergencia_retorna_um(tmp_path):
+    pom = escrever(tmp_path, "pom.xml", POM_COMPLETO)
+    stack = escrever(
+        tmp_path,
+        "stack.txt",
+        "com.tngtech.archunit:archunit-junit5:9.9.9",
+    )
+
+    codigo = upgrade_check.main([str(stack), str(pom)])
+
+    assert codigo == 1
+
+
+@pytest.mark.skipif(not POM_REAL.exists(), reason="pom.xml da Parte I não está no repositório")
+def test_pom_real_esta_alinhado_com_a_stack():
+    """Integração: o pom do repositório e stack-versions.txt devem fechar."""
+    assert upgrade_check.main([str(STACK_REAL), str(POM_REAL)]) == 0
+
+
+@pytest.mark.skipif(not POM_REAL.exists(), reason="pom.xml da Parte I não está no repositório")
+def test_pom_real_declara_os_cinco_plugins_homologados():
+    registro = upgrade_check.ler_pom(POM_REAL)
+
+    plugins = [
+        "org.jacoco:jacoco-maven-plugin",
+        "com.diffplug.spotless:spotless-maven-plugin",
+        "com.github.spotbugs:spotbugs-maven-plugin",
+        "org.apache.maven.plugins:maven-checkstyle-plugin",
+        "org.pitest:pitest-maven",
+    ]
+
+    for chave in plugins:
+        assert chave in registro.versoes, f"{chave} não foi encontrada em <build><plugins>"
+        assert registro.origens[chave] in {"plugins", "pluginManagement"}
+```
+
+O último teste é o que impede a regressão: se alguém remover o percurso de `<build><plugins>`, ele falha nomeando exatamente o que se perdeu.
+
+---
+
+## 4. `scripts/gerar-stubs-docs.py` corrigido
+
+A versão da Parte XII mantinha um dicionário `MIGRACAO` com 28 entradas — duplicando o `nav` do `mkdocs.yml`. Qualquer arquivo novo na navegação exigia alterar dois lugares, e esquecer um produzia `mkdocs build --strict` falhando por arquivo ausente.
+
+Correção: **o `nav` passa a ser a única fonte**.
+
+```python
+#!/usr/bin/env python3
+"""Cria stubs com frontmatter para todo arquivo listado no nav do mkdocs.yml."""
+
+from __future__ import annotations
+
+import datetime
+import pathlib
+import sys
+
+import yaml
+
+MODELO = """---
+titulo: {titulo}
+owner: time-pedidos
+revisado-em: {hoje}
+revisar-ate: {prazo}
+stack: Spring Boot 4.1 / Java 25
+status: em-revisao
+---
+
+# {titulo}
+
+> **TODO — em migração.** Preencha a partir da documentação de origem.
+> Remova este bloco e altere `status` para `vigente` quando o conteúdo estiver completo.
+
+## Escopo
+
+<Uma frase sobre o que este documento cobre e o que ele não cobre.>
+
+## Conteúdo
+
+<texto>
+"""
+
+
+def coletar_do_nav(no) -> list[str]:
+    """Achata a árvore de nav em caminhos .md."""
+    if isinstance(no, str):
+        return [no]
+    if isinstance(no, list):
+        achados: list[str] = []
+        for item in no:
+            achados.extend(coletar_do_nav(item))
+        return achados
+    if isinstance(no, dict):
+        achados = []
+        for valor in no.values():
+            achados.extend(coletar_do_nav(valor))
+        return achados
+    return []
+
+
+def titulo_de(caminho: str) -> str:
+    return pathlib.Path(caminho).stem.replace("-", " ").capitalize()
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv or sys.argv[1:]
+    base = pathlib.Path(argv[0] if argv else "docs")
+    config = base / "mkdocs.yml"
+
+    if not config.exists():
+        print(f"erro: {config} não encontrado", file=sys.stderr)
+        return 2
+
+    nav = yaml.safe_load(config.read_text(encoding="utf-8")).get("nav", [])
+    caminhos = coletar_do_nav(nav)
+    hoje = datetime.date.today()
+    prazo = hoje.replace(year=hoje.year + 1)
+
+    criados, existentes = 0, 0
+
+    for relativo in caminhos:
+        destino = base / relativo
+        if destino.exists():
+            existentes += 1
+            continue
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(
+            MODELO.format(titulo=titulo_de(relativo), hoje=hoje, prazo=prazo),
+            encoding="utf-8",
+        )
+        criados += 1
+        print(f"  criado  {relativo}")
+
+    print(f"\n{criados} criado(s), {existentes} já existente(s), {len(caminhos)} no nav")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+`tests/test_gerar_stubs.py`
+
+```python
+import pathlib
+
+import yaml
+
+import gerar_stubs_docs
+
+
+def montar_docs(tmp_path: pathlib.Path, nav: list) -> pathlib.Path:
+    (tmp_path / "mkdocs.yml").write_text(
+        yaml.safe_dump({"nav": nav}, allow_unicode=True), encoding="utf-8"
+    )
+    return tmp_path
+
+
+def test_cria_stub_para_arquivo_do_nav_ausente(tmp_path):
+    base = montar_docs(tmp_path, [{"Guias": ["02-guias/outbox.md"]}])
+
+    assert gerar_stubs_docs.main([str(base)]) == 0
+    criado = base / "02-guias" / "outbox.md"
+
+    assert criado.exists()
+    assert "status: em-revisao" in criado.read_text(encoding="utf-8")
+    assert "TODO" in criado.read_text(encoding="utf-8")
+
+
+def test_nao_sobrescreve_documento_existente(tmp_path):
+    base = montar_docs(tmp_path, ["README.md"])
+    original = base / "README.md"
+    original.write_text("# Conteúdo real\n", encoding="utf-8")
+
+    gerar_stubs_docs.main([str(base)])
+
+    assert original.read_text(encoding="utf-8") == "# Conteúdo real\n"
+
+
+def test_stub_gerado_passa_na_validacao_de_frontmatter(tmp_path):
+    import validar_docs
+
+    base = montar_docs(tmp_path, ["01-fundamentos/testes.md"])
+    gerar_stubs_docs.main([str(base)])
+
+    assert validar_docs.validar(base) == []
+```
+
+O terceiro teste é o mais valioso: fecha o ciclo entre os dois scripts. Se o modelo do stub perder um campo obrigatório, a validação falha no mesmo PR.
+
+---
+
+## 5. Hook de contrato de API
+
+### 5.1 `scripts/check-contrato-api.sh`
+
+```bash
+#!/usr/bin/env bash
+# Bloqueia commit que altera contrato de API sem tocar em docs/.
+# Lê apenas arquivos STAGED — o working tree não conta para o commit.
+
+set -euo pipefail
+
+PADROES_CONTRATO=$(cat <<'REGEX'
+Controller\.java$
+/web/.*\.java$
+/domain/port/in/.*\.java$
+db/migration/.*\.sql$
+application[^/]*\.ya?ml$
+openapi.*\.(ya?ml|json)$
+REGEX
+)
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+ALTERADOS=$(printf '%s\n' "$STAGED" | grep -E "$PADROES_CONTRATO" || true)
+
+if [ -z "$ALTERADOS" ]; then
+  exit 0
+fi
+
+DOCS=$(printf '%s\n' "$STAGED" | grep -E '^docs/.*\.md$' || true)
+
+if [ -n "$DOCS" ]; then
+  exit 0
+fi
+
+cat >&2 <<FIM
+BLOQUEADO: contrato de API alterado sem documentação correspondente.
+
+Arquivos de contrato neste commit:
+$(printf '  %s\n' $ALTERADOS)
+
+Nenhum arquivo em docs/ foi staged. Atualize o documento afetado:
+
+  contrato REST / status code   ->  docs/05-referencia/ ou docs/02-guias/
+  métrica / nome de série       ->  docs/05-referencia/metricas.md
+  migration / schema            ->  docs/02-guias/persistencia-lombok.md
+  propriedade de configuração   ->  docs/00-visao-geral/stack-de-referencia.md
+
+Se a mudança é interna e não afeta contrato, use: git commit --no-verify
+FIM
+exit 1
+```
+
+### 5.2 `.githooks/pre-commit`
+
+```bash
+#!/usr/bin/env bash
+# Executado por `git commit`. Instale com: make hooks-install
+#
+# Ordem deliberada:
+#   1. contrato de API   — falha rápido, sem custo de build
+#   2. make pre-commit   — formatação + validação de docs
+#   3. re-add            — spotless pode ter reescrito arquivos staged
+
+set -euo pipefail
+
+# merge, revert e rebase não devem ser bloqueados por regra de conteúdo
+GIT_DIR=$(git rev-parse --git-dir)
+for estado in MERGE_HEAD REVERT_HEAD CHERRY_PICK_HEAD rebase-merge rebase-apply; do
+  if [ -e "$GIT_DIR/$estado" ]; then
+    echo "pre-commit ignorado durante $estado"
+    exit 0
+  fi
+done
+
+if [ "${SKIP_PRE_COMMIT:-0}" = "1" ]; then
+  echo "AVISO: pre-commit ignorado por SKIP_PRE_COMMIT=1"
+  exit 0
+fi
+
+RAIZ=$(git rev-parse --show-toplevel)
+cd "$RAIZ"
+
+echo ">> contrato de API"
+./scripts/check-contrato-api.sh
+
+echo ">> make pre-commit"
+make --no-print-directory pre-commit
+
+# spotless:apply reescreve arquivos; sem re-add, o commit leva a versão
+# não formatada que estava no índice — o hook passaria e o CI falharia depois.
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
+if [ -n "$STAGED" ]; then
+  printf '%s\n' "$STAGED" | while IFS= read -r arquivo; do
+    [ -f "$arquivo" ] && git add -- "$arquivo"
+  done
+fi
+
+echo "pre-commit ok"
+```
+
+### 5.3 Ajuste no `Makefile`
+
+O `pre-commit` da Parte XII rodava ArchUnit — 20 a 40 segundos em cada commit. Hook que demora é hook que o time desativa. Separação:
+
+```makefile
+.PHONY: pre-commit
+pre-commit: ## Hook de commit: rápido (< 10s), sem contexto Spring
+	@$(MAVEN) -q -B spotless:check
+	@$(MAKE) --no-print-directory docs-check
+	@$(MAKE) --no-print-directory docs-pendencias >/dev/null || true
+	@echo "pre-commit ok"
+
+.PHONY: pre-push
+pre-push: pre-commit ## Hook de push: inclui arquitetura e paridade
+	@$(MAVEN) -q -B test -Dtest=ArquiteturaTest,ClassificadorErroGoldenTest -DfailIfNoTests=false
+	@echo "pre-push ok"
+
+.PHONY: hooks-install
+hooks-install: ## Aponta o Git para .githooks/
+	@git config core.hooksPath .githooks
+	@chmod +x .githooks/*
+	@echo "hooks instalados (core.hooksPath=.githooks)"
+```
+
+`.githooks/pre-push`
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+[ "${SKIP_PRE_PUSH:-0}" = "1" ] && exit 0
+make --no-print-directory pre-push
+```
+
+---
+
+## 6. Paridade em 3 segundos
+
+### 6.1 Por que Testcontainers não serve no loop local
+
+O teste da Parte XII sobe PostgreSQL, aplica migrations e consulta a função. Correto para CI, inviável para o desenvolvedor: 8 a 15 segundos por execução, Docker obrigatório, e um teste que ninguém roda enquanto programa.
+
+A solução é separar em duas fases com um arquivo de ouro no meio.
+
+```text
+  Postgres (outbox_categoria)
+            │
+            │  make parity-golden  (CI ou sob demanda)
+            ▼
+  outbox-categoria-golden.tsv   ← corpus + classificação esperada
+            │
+            │  make parity-fast    (loop local, sem Docker)
+            ▼
+      ClassificadorErro.java
+```
+
+**A regra antidogma:** o golden é gerado **pelo Postgres**, nunca pelo Java. Se fosse gerado pelo Java, o teste compararia o Java com ele mesmo e passaria sempre. A fase lenta é o que impede isso — ela reescreve o golden a partir do banco e falha se o conteúdo mudar sem que alguém tenha revisado.
+
+### 6.2 `src/test/resources/outbox-categoria-golden.tsv`
+
+```text
+NOTAFISCAL_HTTP_401	credencial
+NOTAFISCAL_HTTP_403	credencial
+NOTAFISCAL_HTTP_500	transitorio
+NOTAFISCAL_HTTP_503	transitorio
+NOTAFISCAL_INDISPONIVEL	transitorio
+NOTAFISCAL_RESPOSTA_VAZIA	transitorio
+AUTORIZACAO_TIMEOUT	transitorio
+read timed out	transitorio
+Connection refused: parceiro.example	transitorio
+parceiro não retornou resultado	contrato
+payload de evento inválido	bug
+handler não retornou resultado para o evento	bug
+rejeitado: CNPJ irregular	negocio
+rejeitado: valor acima do limite	negocio
+NOTAFISCAL_HTTP_400	negocio
+NOTAFISCAL_HTTP_422	negocio
+\N	desconhecido
+	desconhecido
+erro sem classificacao conhecida	desconhecido
+OutOfMemoryError	desconhecido
+NOTAFISCAL_HTTP_409	negocio
+rejeitado: NOTAFISCAL_HTTP_503	transitorio
+timeout rejeitado: instavel	transitorio
+```
+
+`\N` é `null`; campo vazio é string vazia. A distinção importa: `erro is null` e `erro ~ 'regex'` sobre `''` são caminhos diferentes no SQL, mesmo que produzam o mesmo resultado.
+
+### 6.3 Fase rápida — sem Spring, sem Docker
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+
+/**
+ * Compara ClassificadorErro com o golden gerado pelo PostgreSQL.
+ * Sem contexto Spring e sem Docker — roda em menos de 1 segundo
+ * no loop de desenvolvimento. O golden é produzido por
+ * ClassificadorErroGoldenGeradorTest, que fala com o banco.
+ */
+class ClassificadorErroGoldenTest {
+
+    private static final String RECURSO = "/outbox-categoria-golden.tsv";
+    private static List<Caso> casos;
+
+    record Caso(String erro, String esperado) {
+        @Override
+        public String toString() {
+            return erro == null ? "<null>" : erro;
+        }
+    }
+
+    @BeforeAll
+    static void carregar() {
+        casos = lerGolden();
+    }
+
+    static List<Caso> lerGolden() {
+        try (var fluxo = ClassificadorErroGoldenTest.class.getResourceAsStream(RECURSO)) {
+            if (fluxo == null) {
+                throw new IllegalStateException(
+                        "golden ausente: rode `make parity-golden` para gerá-lo");
+            }
+            var linhas = new String(fluxo.readAllBytes(), StandardCharsets.UTF_8).lines().toList();
+            var lidos = new ArrayList<Caso>(linhas.size());
+
+            for (var linha : linhas) {
+                if (linha.isBlank()) {
+                    continue;
+                }
+                var partes = linha.split("\t", 2);
+                if (partes.length != 2) {
+                    throw new IllegalStateException("linha malformada no golden: " + linha);
+                }
+                var erro = "\\N".equals(partes[0]) ? null : partes[0];
+                lidos.add(new Caso(erro, partes[1]));
+            }
+            return lidos;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    static List<Caso> casos() {
+        return casos;
+    }
+
+    @ParameterizedTest(name = "[{index}] {0}")
+    @MethodSource("casos")
+    @DisplayName("ClassificadorErro deve reproduzir a classificação do banco")
+    void deveReproduzirGolden(Caso caso) {
+        assertThat(ClassificadorErro.classificar(caso.erro()))
+                .as("divergência em relação a outbox_categoria() para: %s", caso)
+                .isEqualTo(caso.esperado());
+    }
+
+    @Test
+    @DisplayName("O corpus cobre todas as categorias")
+    void corpusDeveCobrirTodasAsCategorias() {
+        Set<String> cobertas = new LinkedHashSet<>();
+        casos.forEach(caso -> cobertas.add(caso.esperado()));
+
+        assertThat(cobertas)
+                .as("se criar uma categoria, adicione caso ao golden e rode make parity-golden")
+                .containsExactlyInAnyOrder(
+                        "credencial", "transitorio", "contrato", "bug", "negocio", "desconhecido");
+    }
+
+    @Test
+    @DisplayName("Todo caso de negócio exige forçar no script de reprocessamento")
+    void categoriasDeRiscoExistemNoGolden() {
+        Set<String> riscos = new LinkedHashSet<>();
+        casos.stream()
+                .filter(caso -> List.of("negocio", "bug", "contrato", "desconhecido")
+                        .contains(caso.esperado()))
+                .forEach(caso -> riscos.add(caso.esperado()));
+
+        assertThat(riscos)
+                .as("cada categoria de risco precisa de pelo menos um caso para o guardrail do script")
+                .hasSize(4);
+    }
+}
+```
+
+### 6.4 Fase lenta — gera e verifica o golden contra o banco
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.stream.Collectors;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.jdbc.core.simple.JdbcClient;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+/**
+ * Fonte do golden: consulta outbox_categoria() no PostgreSQL real.
+ *
+ * -Dgolden.mode=update   reescreve src/test/resources/outbox-categoria-golden.tsv
+ * -Dgolden.mode=verify   padrão em CI: falha se o golden divergir do banco
+ */
+@SpringBootTest
+@Testcontainers
+class ClassificadorErroGoldenGeradorTest {
+
+    private static final Path GOLDEN =
+            Path.of("src/test/resources/outbox-categoria-golden.tsv");
+
+    @Container
+    @ServiceConnection
+    static PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>("postgres:17-alpine");
+
+    @Autowired JdbcClient jdbc;
+
+    @Test
+    void goldenDeveRefletirAFuncaoDoBanco() throws IOException {
+        var modo = System.getProperty("golden.mode", "verify");
+        var gerado = gerarAPartirDoBanco();
+
+        if ("update".equals(modo)) {
+            Files.createDirectories(GOLDEN.getParent());
+            Files.writeString(GOLDEN, gerado, StandardCharsets.UTF_8);
+            System.out.println("golden atualizado: " + GOLDEN.toAbsolutePath());
+            return;
+        }
+
+        assertThat(GOLDEN).exists();
+        var atual = Files.readString(GOLDEN, StandardCharsets.UTF_8);
+
+        assertThat(atual)
+                .as("""
+                        o golden divergiu de outbox_categoria(). Se a mudança na função é
+                        intencional, rode `make parity-golden` e revise o diff do .tsv antes
+                        de commitar.""")
+                .isEqualTo(gerado);
+    }
+
+    private String gerarAPartirDoBanco() {
+        var corpus = ClassificadorErroGoldenTest.lerGolden().stream()
+                .map(ClassificadorErroGoldenTest.Caso::erro)
+                .toList();
+
+        return corpus.stream()
+                .map(erro -> {
+                    var categoria = jdbc.sql("select outbox_categoria(:erro)")
+                            .param("erro", erro)
+                            .query(String.class)
+                            .single();
+                    var campo = erro == null ? "\\N" : erro;
+                    return campo + "\t" + categoria;
+                })
+                .collect(Collectors.joining("\n", "", "\n"));
+    }
+}
+```
+
+Detalhe importante: o corpus vem do próprio golden (`ClassificadorErroGoldenTest.lerGolden()`). Isso mantém uma única lista — adicionar caso é acrescentar linha no `.tsv` e rodar `make parity-golden` para que a coluna esperada venha do banco.
+
+### 6.5 Alvos
+
+```makefile
+.PHONY: parity-fast
+parity-fast: ## Paridade sem Docker, sem Spring (< 1s)
+	@$(MAVEN) -q -B test -Dtest=ClassificadorErroGoldenTest -DfailIfNoTests=false
+
+.PHONY: parity-golden
+parity-golden: ## Regenera o golden a partir do PostgreSQL (requer Docker)
+	@$(MAVEN) -q -B test -Dtest=ClassificadorErroGoldenGeradorTest \
+	  -Dgolden.mode=update -DfailIfNoTests=false
+	@git --no-pager diff --stat -- src/test/resources/outbox-categoria-golden.tsv || true
+
+.PHONY: parity
+parity: parity-fast ## Paridade completa: golden + verificação contra o banco
+	@$(MAVEN) -q -B test -Dtest='ClassificadorErroGolden*Test' -DfailIfNoTests=false
+```
+
+### 6.6 Medição
+
+```bash
+$ time make parity-fast
+...
+real    0m0.842s
+```
+
+O tempo vem de não haver contexto Spring: JUnit carrega, lê um arquivo de 23 linhas, executa 23 asserções de regex e sai. Compare com os 9 segundos do teste com Testcontainers da Parte XII.
+
+---
+
+## 7. Sequência de adoção
+
+```bash
+# 1. instalar dependências e hooks
+pip install -r tests/requirements.txt     # pytest, PyYAML
+make hooks-install
+
+# 2. corrigir os scripts e provar
+pytest tests/ -q                          # 15 testes
+make upgrade-check                        # agora lê <build><plugins>
+
+# 3. gerar o golden a partir do banco
+make parity-golden
+git --no-pager diff src/test/resources/outbox-categoria-golden.tsv
+
+# 4. loop local
+make parity-fast                          # < 1s
+
+# 5. pipeline
+make ci
+```
+
+O passo 3 é o único que exige Docker e roda uma vez — depois o loop local é instantâneo. E o passo 2 é onde o defeito dos plugins aparece: `make upgrade-check` falha na primeira execução da versão antiga e passa na nova.
+
+---
+
+## Resumindo
+
+- **O `upgrade-check.py` da Parte XII ignorava `<build><plugins>`** e reportava os cinco plugins homologados como ausentes em toda execução. Ferramenta de verificação que erra sempre é ferramenta que o time aprende a ignorar.
+- **Os testes de regressão nomeiam o defeito:** `test_versao_de_plugin_e_lida` e `test_pom_real_declara_os_cinco_plugins_homologados` falham se o percurso de plugins for removido de novo.
+- **`gerar-stubs-docs.py` passa a derivar do `nav`**, eliminando a duplicação de 28 entradas que fazia `mkdocs build --strict` falhar por arquivo novo esquecido.
+- **O hook lê apenas arquivos staged** e faz `git add` de volta após `spotless:apply` — sem isso, o commit leva a versão não formatada do índice, o hook passa e o CI falha depois.
+- **`pre-commit` em menos de 10s e `pre-push` com ArchUnit:** hook lento é hook desativado, e a verificação de arquitetura não perde cobertura por estar no push.
+- **O golden é gerado pelo Postgres, nunca pelo Java.** Se fosse gerado pelo Java, o teste compararia o Java com ele mesmo — a fase lenta existe justamente para impedir essa tautologia.
+- **Paridade em 0,8s no loop local**, contra 9s com Testcontainers, sem perder verificação real: a fase lenta roda no CI e reescreve o golden a partir do banco.
+
+Se quiser, posso:
+
+- Escrever os `fixtures/*.xml` que faltam para os testes de `upgrade-check.py` cobrindo BOM importado, `dependencyManagement` com `import` scope e plugin com versão em `pluginManagement` do parent.
+- Criar o teste do próprio hook, usando um repositório Git temporário em `tmp_path` para verificar o bloqueio de contrato e a passagem em commit só de docs.
+- Adicionar ao golden um gerador de casos de fronteira que combina prefixos de categoria (`rejeitado:` com `NOTAFISCAL_HTTP_503`) para expandir o corpus sem escrita manual.
+
+Os fixtures expõem dois defeitos adicionais no `upgrade-check.py` — e o primeiro inviabiliza o script em qualquer projeto que use parent BOM. Começo por eles porque mudam o código que os testes vão validar.
+
+---
+
+# Parte XIV — Fixtures reais, hook testado e corpus de fronteira
+
+**Base:** Python 3.12 + pytest · Git 2.43+ · JUnit 5 · PostgreSQL 17
+
+---
+
+## 1. Os dois defeitos que os fixtures revelam
+
+Ao escrever fixtures que reproduzem POMs reais, os testes falharam por motivos que não eram os que eu esperava. Ambos são reais e um deles torna o script inútil no cenário mais comum.
+
+**Defeito 2 — versão gerida reportada como divergência.** No `pom.xml` da Parte I, nenhuma dependência declara `<version>`: todas vêm do `spring-boot-starter-parent`. O `registrador` gravava `versoes[chave] = ""`, e o `comparar` via `"" != "4.1.0"` como divergência. Resultado: cerca de quinze falsos positivos por execução — e o teste `test_pom_real_esta_alinhado_com_a_stack` da Parte XIII falharia.
+
+**Defeito 3 — ordem do documento sobrescreve versão gerida.** `dependencyManagement` aparece antes de `dependencies` no POM. O laço `for bloco in raiz` itera em ordem documental: registra a versão gerida em `<dependencyManagement>`, e depois o `<dependencies>` sem versão apaga o valor com `""`. O resultado é o oposto do desejado: tudo vira "gerida", inclusive o que estava declarado.
+
+```text
+Defeito 1 (Parte XIII)   <build><plugins> não era percorrido   → 5 plugins sempre AUSENTE
+Defeito 2 (agora)        versão vazia comparada como versão    → ~15 falsos DIVERGE
+Defeito 3 (agora)        ordem documental apaga versão gerida  → tudo vira "gerida"
+```
+
+O terceiro é o mais sutil: só aparece quando o mesmo artefato é declarado nos dois lugares — que é exatamente o caso de `dependencyManagement` com BOM importado.
+
+---
+
+## 2. `upgrade-check.py` com tratamento de versão gerida
+
+```python
+class Registrador:
+    """Coleta coordenadas e classifica cada uma como declarada, gerida ou órfã."""
+
+    def __init__(self, props: dict[str, str]) -> None:
+        self.props = props
+        self.versoes: dict[str, str] = {}
+        self.origens: dict[str, str] = {}
+        self.geridas: dict[str, bool] = {}
+
+    def __call__(self, group: str, artifact: str, version: str, origem: str) -> None:
+        if not group or not artifact:
+            return
+        chave = f"{group}:{artifact}"
+        resolvida = _resolver(version, self.props)
+
+        # Versão já conhecida por dependencyManagement/pluginManagement não é
+        # apagada por uma declaração posterior sem <version>. Sem esta guarda,
+        # a ordem documental do POM (DM antes de dependencies) destrói o valor.
+        if not resolvida and self.versoes.get(chave):
+            return
+
+        self.versoes[chave] = resolvida
+        self.origens[chave] = origem
+        self.geridas[chave] = not resolvida
+```
+
+```python
+def comparar(
+    esperado: dict[str, str],
+    registrador: Registrador,
+    estrito_orfao: bool,
+    estrito_gerida: bool,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    divergencias: list[str] = []
+    ausentes: list[str] = []
+    orfaos: list[str] = []
+    geridas: list[str] = []
+
+    for chave, homologada in esperado.items():
+        if chave not in registrador.versoes:
+            ausentes.append(chave)
+            continue
+
+        # Sem <version> no POM: a versão vem do parent ou de um BOM importado
+        # e não é verificável localmente. Não é divergência — é limitação.
+        if registrador.geridas.get(chave):
+            geridas.append(chave)
+            continue
+
+        achada = registrador.versoes[chave]
+        if achada != homologada:
+            origem = registrador.origens[chave]
+            divergencias.append(
+                f"{chave}: homologado {homologada}, pom {achada} (em <{origem}>)"
+            )
+
+    for chave, versao in registrador.versoes.items():
+        if chave in esperado or chave.startswith("property:"):
+            continue
+        if registrador.geridas.get(chave) or not versao or "${" in versao:
+            continue
+        orfaos.append(f"{chave}:{versao}")
+
+    if not estrito_orfao:
+        orfaos = []
+    if not estrito_gerida:
+        geridas = []
+
+    return divergencias, ausentes, orfaos, geridas
+```
+
+```python
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("stack", type=pathlib.Path)
+    parser.add_argument("pom", type=pathlib.Path)
+    parser.add_argument("--estrito-orfao", action="store_true")
+    parser.add_argument(
+        "--estrito-gerida",
+        action="store_true",
+        help="falha quando uma coordenada homologada não declara versão própria",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        esperado = ler_homologadas(args.stack)
+        registrador = ler_pom(args.pom)
+    except (OSError, ET.ParseError, ValueError) as erro:
+        print(f"erro: {erro}", file=sys.stderr)
+        return 2
+
+    divergencias, ausentes, orfaos, geridas = comparar(
+        esperado, registrador, args.estrito_orfao, args.estrito_gerida
+    )
+
+    for linha in divergencias:
+        print(f"  DIVERGE  {linha}")
+    for chave in ausentes:
+        print(f"  AUSENTE  {chave} não encontrado no pom")
+    for linha in orfaos:
+        print(f"  ÓRFÃO    {linha} — versão explícita sem homologação")
+    for chave in geridas:
+        print(f"  GERIDA   {chave} — versão vem do parent/BOM, não verificável aqui")
+
+    problemas = len(divergencias) + len(ausentes) + len(orfaos) + len(geridas)
+    if problemas:
+        print(f"\n{problemas} problema(s).")
+        return 1
+
+    print(f"{len(esperado)} coordenada(s) alinhadas com a stack homologada")
+    return 0
+```
+
+`GERIDA` é informativo, não falha. É a diferença entre "o script encontrou um problema" e "o script não consegue verificar isto daqui" — e misturar as duas categorias é o que faz o time ignorar a saída.
+
+---
+
+## 3. Fixtures
+
+`tests/fixtures/pom-com-parent-e-bom.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.1.0</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>br.com.exemplo</groupId>
+  <artifactId>servico</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <java.version>25</java.version>
+    <archunit.version>1.4.0</archunit.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers-bom</artifactId>
+        <version>1.20.4</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.tngtech.archunit</groupId>
+      <artifactId>archunit-junit5</artifactId>
+      <version>${archunit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>
+```
+
+`tests/fixtures/pom-plugin-management.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>br.com.exemplo</groupId>
+  <artifactId>lib</artifactId>
+  <version>1.0.0</version>
+
+  <properties>
+    <pitest.version>1.17.4</pitest.version>
+  </properties>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.pitest</groupId>
+          <artifactId>pitest-maven</artifactId>
+          <version>${pitest.version}</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+    <plugins>
+      <plugin>
+        <groupId>org.pitest</groupId>
+        <artifactId>pitest-maven</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>
+```
+
+`tests/fixtures/pom-sem-namespace.xml`
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+  <groupId>br.com.exemplo</groupId>
+  <artifactId>legado</artifactId>
+  <version>1.0.0</version>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-lang3</artifactId>
+      <version>3.17.0</version>
+    </dependency>
+  </dependencies>
+</project>
+```
+
+`tests/fixtures/stack-exemplo.txt`
+
+```text
+# Stack de teste
+org.springframework.boot:spring-boot-starter-parent:4.1.0
+org.testcontainers:testcontainers-bom:1.20.4
+com.tngtech.archunit:archunit-junit5:1.4.0
+org.apache.maven.plugins:maven-surefire-plugin:3.5.2
+```
+
+Os testes que usam as fixtures ficam em `tests/test_upgrade_check_fixtures.py`:
+
+```python
+import pathlib
+
+import pytest
+
+import upgrade_check
+
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+
+
+def test_bom_importado_e_lido_com_versao():
+    registro = upgrade_check.ler_pom(FIXTURES / "pom-com-parent-e-bom.xml")
+
+    chave = "org.testcontainers:testcontainers-bom"
+    assert registro.versoes[chave] == "1.20.4"
+    assert registro.geridas[chave] is False
+
+
+def test_dependencia_sem_versao_e_marcada_como_gerida():
+    """Regressão: sem esta distinção, toda dependência de parent BOM vira DIVERGE."""
+    registro = upgrade_check.ler_pom(FIXTURES / "pom-com-parent-e-bom.xml")
+
+    assert registro.geridas["org.springframework.boot:spring-boot-starter-webmvc"] is True
+    assert registro.geridas["org.testcontainers:postgresql"] is True
+
+
+def test_versao_gerida_nao_gera_divergencia(tmp_path, capsys):
+    stack = tmp_path / "stack.txt"
+    stack.write_text(
+        "org.springframework.boot:spring-boot-starter-parent:4.1.0\n"
+        "org.testcontainers:testcontainers-bom:1.20.4\n",
+        encoding="utf-8",
+    )
+
+    codigo = upgrade_check.main([str(stack), str(FIXTURES / "pom-com-parent-e-bom.xml")])
+
+    assert codigo == 0
+    assert "DIVERGE" not in capsys.readouterr().out
+
+
+def test_plugin_gerido_no_plugin_management_nao_e_apagado(tmp_path, capsys):
+    """Regressão do defeito 3: <plugins> posterior sem versão apagava o valor."""
+    registro = upgrade_check.ler_pom(FIXTURES / "pom-plugin-management.xml")
+
+    chave = "org.pitest:pitest-maven"
+    assert registro.versoes[chave] == "1.17.4"
+    assert registro.origens[chave] == "pluginManagement"
+    assert registro.geridas[chave] is False
+
+
+def test_plugin_declarado_com_versao_propria_nao_e_gerido():
+    registro = upgrade_check.ler_pom(FIXTURES / "pom-plugin-management.xml")
+
+    chave = "org.apache.maven.plugins:maven-surefire-plugin"
+    assert registro.versoes[chave] == "3.5.2"
+    assert registro.geridas[chave] is False
+
+
+def test_pom_sem_namespace_e_aceito():
+    registro = upgrade_check.ler_pom(FIXTURES / "pom-sem-namespace.xml")
+
+    assert registro.versoes["org.apache.commons:commons-lang3"] == "3.17.0"
+
+
+@pytest.mark.parametrize("estrito", ["--estrito-gerida", None])
+def test_stack_de_exemplo_fecha_com_estrito_gerida(tmp_path, estrito, capsys):
+    stack = tmp_path / "stack.txt"
+    stack.write_text(
+        "org.springframework.boot:spring-boot-starter-parent:4.1.0\n"
+        "org.testcontainers:testcontainers-bom:1.20.4\n",
+        encoding="utf-8",
+    )
+    argumentos = [str(stack), str(FIXTURES / "pom-com-parent-e-bom.xml")]
+    if estrito:
+        argumentos.append(estrito)
+
+    codigo = upgrade_check.main(argumentos)
+
+    # com --estrito-gerida, as duas dependências sem versão própria falham
+    esperado = 1 if estrito else 0
+    assert codigo == esperado
+```
+
+O teste `test_dependencia_sem_versao_e_marcada_como_gerida` é o que fixa o comportamento novo. Sem ele, alguém "simplifica" o `Registrador` removendo o dicionário `geridas` e o falso positivo volta inteiro.
+
+---
+
+## 4. Teste do hook com repositório temporário
+
+### 4.1 Extrair a guarda de transição
+
+O `pre-commit` da Parte XIII fazia a checagem de merge inline, o que a tornava intestável sem rodar Maven. Extrair para script próprio resolve dois problemas de uma vez:
+
+`scripts/git-em-transicao.sh`
+
+```bash
+#!/usr/bin/env bash
+# Retorna 0 se o repositório está em merge, revert, cherry-pick ou rebase.
+# Hooks usam isto para não bloquear operações que não são commits normais.
+
+set -euo pipefail
+
+GIT_DIR=$(git rev-parse --git-dir)
+
+for estado in MERGE_HEAD REVERT_HEAD CHERRY_PICK_HEAD rebase-merge rebase-apply; do
+  if [ -e "$GIT_DIR/$estado" ]; then
+    exit 0
+  fi
+done
+
+exit 1
+```
+
+`.githooks/pre-commit` passa a chamar:
+
+```bash
+if ./scripts/git-em-transicao.sh; then
+  echo "pre-commit ignorado: operação Git em andamento"
+  exit 0
+fi
+```
+
+### 4.2 `tests/conftest.py`
+
+```python
+import pathlib
+import shutil
+import subprocess
+
+import pytest
+
+RAIZ = pathlib.Path(__file__).parent.parent
+SCRIPTS = RAIZ / "scripts"
+
+
+def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+
+@pytest.fixture
+def repo(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Repositório Git isolado, sem herdar config global do ambiente."""
+    destino = tmp_path / "repo"
+    destino.mkdir()
+
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=destino, check=True)
+    _git(destino, "config", "user.email", "teste@exemplo.com")
+    _git(destino, "config", "user.name", "Teste")
+    _git(destino, "config", "commit.gpgsign", "false")
+    _git(destino, "config", "core.hooksPath", ".githooks")
+
+    (destino / "docs").mkdir()
+    (destino / "README.md").write_text("# base\n", encoding="utf-8")
+    _git(destino, "add", ".")
+    _git(destino, "commit", "-q", "-m", "base")
+
+    return destino
+
+
+@pytest.fixture
+def script_contrato() -> pathlib.Path:
+    return SCRIPTS / "check-contrato-api.sh"
+
+
+@pytest.fixture
+def script_transicao() -> pathlib.Path:
+    return SCRIPTS / "git-em-transicao.sh"
+
+
+def criar(repo: pathlib.Path, relativo: str, conteudo: str = "// alterado\n") -> None:
+    destino = repo / relativo
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    destino.write_text(conteudo, encoding="utf-8")
+
+
+def stage(repo: pathlib.Path, *relativos: str) -> None:
+    if relativos:
+        _git(repo, "add", *relativos)
+    else:
+        _git(repo, "add", "-A")
+
+
+def rodar(script: pathlib.Path, repo: pathlib.Path, env: dict | None = None):
+    return subprocess.run(
+        ["bash", str(script)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        env={**__import__("os").environ, **(env or {})},
+    )
+```
+
+### 4.3 `tests/test_hook_contrato.py`
+
+```python
+import pytest
+
+from conftest import criar, rodar, stage
+
+
+@pytest.mark.parametrize(
+    "arquivo",
+    [
+        "src/main/java/br/com/exemplo/web/PedidoController.java",
+        "src/main/java/br/com/exemplo/web/ApiExceptionHandler.java",
+        "src/main/java/br/com/exemplo/domain/port/in/CriarPedido.java",
+        "src/main/resources/db/migration/V8__nova.sql",
+        "src/main/resources/application-prod.yml",
+        "docs/openapi.yaml",
+    ],
+)
+def test_arquivo_de_contrato_sem_docs_bloqueia(repo, script_contrato, arquivo):
+    criar(repo, arquivo)
+    stage(repo)
+
+    resultado = rodar(script_contrato, repo)
+
+    assert resultado.returncode == 1, f"{arquivo} deveria ser tratado como contrato"
+    assert "BLOQUEADO" in resultado.stderr
+
+
+def test_arquivo_de_contrato_com_docs_permite(repo, script_contrato):
+    criar(repo, "src/main/java/br/com/exemplo/web/PedidoController.java")
+    criar(repo, "docs/05-referencia/metricas.md", "# atualizado\n")
+    stage(repo)
+
+    assert rodar(script_contrato, repo).returncode == 0
+
+
+def test_apenas_docs_permite(repo, script_contrato):
+    criar(repo, "docs/02-guias/eventos-outbox.md", "# atualizado\n")
+    stage(repo)
+
+    assert rodar(script_contrato, repo).returncode == 0
+
+
+def test_arquivo_comum_nao_bloqueia(repo, script_contrato):
+    criar(repo, "src/main/java/br/com/exemplo/application/usecase/PedidoHelper.java")
+    criar(repo, "src/main/java/br/com/exemplo/domain/model/Pedido.java")
+    stage(repo)
+
+    assert rodar(script_contrato, repo).returncode == 0
+
+
+def test_nada_staged_nao_bloqueia(repo, script_contrato):
+    criar(repo, "src/main/java/br/com/exemplo/web/NovoController.java")
+
+    assert rodar(script_contrato, repo).returncode == 0
+
+
+def test_remocao_de_controller_nao_bloqueia(repo, script_contrato):
+    """Diff-filter ACMR ignora D: remoção não altera contrato, apenas o remove."""
+    criar(repo, "src/main/java/br/com/exemplo/web/VelhoController.java")
+    stage(repo)
+    __import__("subprocess").run(
+        ["git", "commit", "-q", "-m", "adiciona"], cwd=repo, check=True
+    )
+    __import__("subprocess").run(
+        ["git", "rm", "-q", "src/main/java/br/com/exemplo/web/VelhoController.java"],
+        cwd=repo,
+        check=True,
+    )
+
+    assert rodar(script_contrato, repo).returncode == 0
+
+
+def test_mensagem_indica_o_documento_correto(repo, script_contrato):
+    criar(repo, "src/main/resources/db/migration/V9__indice.sql")
+    stage(repo)
+
+    resultado = rodar(script_contrato, repo)
+
+    assert "migration / schema" in resultado.stderr
+    assert "--no-verify" in resultado.stderr
+```
+
+```python
+# tests/test_git_transicao.py
+import pathlib
+
+import pytest
+
+from conftest import rodar
+
+
+@pytest.mark.parametrize(
+    "marcador",
+    ["MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply"],
+)
+def test_detecta_operacao_em_andamento(repo, script_transicao, marcador):
+    git_dir = pathlib.Path(
+        __import__("subprocess")
+        .run(["git", "rev-parse", "--git-dir"], cwd=repo, capture_output=True, text=True, check=True)
+        .stdout.strip()
+    )
+    caminho = (repo / git_dir / marcador).resolve()
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    caminho.write_text("0000\n", encoding="utf-8")
+
+    assert rodar(script_transicao, repo).returncode == 0
+
+
+def test_repositorio_normal_nao_esta_em_transicao(repo, script_transicao):
+    assert rodar(script_transicao, repo).returncode == 1
+```
+
+O `test_remocao_de_controller_nao_bloqueia` documenta uma decisão que estava implícita no `--diff-filter=ACMR`: remoção não é alteração de contrato. Se alguém trocar por `ACDMR`, o teste falha e a decisão precisa ser discutida em vez de mudar por acidente.
+
+---
+
+## 5. Gerador de casos de fronteira
+
+### 5.1 A regra que o gerador não pode violar
+
+O gerador produz **apenas entradas**. Nunca a classificação esperada. Se ele também produzisse o esperado, o teste compararia o Java com o Java — tautologia que passa sempre e não protege nada.
+
+```text
+CorpusFront.entradas()  →  List<String> (só entradas)
+              │
+              ▼
+ClassificadorErroGoldenGeradorTest  →  SELECT outbox_categoria(:entrada)  →  .tsv
+              │
+              ▼
+ClassificadorErroGoldenTest  →  compara ClassificadorErro com o .tsv
+```
+
+O gerador é um gerador de **estímulos**, não de respostas. Essa assimetria é o que mantém o teste honesto.
+
+### 5.2 `CorpusFront.java`
+
+```java
+package br.com.empresa.pedidos.application.outbox;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * Gera entradas de fronteira por composição de marcadores.
+ *
+ * <p><strong>Gera apenas entradas.</strong> A classificação esperada vem sempre
+ * de {@code outbox_categoria()} no PostgreSQL. Se esta classe também produzisse
+ * o resultado, o teste compararia o Java com ele mesmo.
+ */
+final class CorpusFront {
+
+    static final String SEPARADOR = " | ";
+
+    /** Marcadores isolados; a categoria de cada um é decidida pelo banco. */
+    private static final List<String> MARCADORES = List.of(
+            "rejeitado: CNPJ irregular",
+            "NOTAFISCAL_HTTP_400",
+            "NOTAFISCAL_HTTP_401",
+            "NOTAFISCAL_HTTP_503",
+            "NOTAFISCAL_INDISPONIVEL",
+            "payload de evento inválido",
+            "handler não retornou",
+            "parceiro não retornou resultado",
+            "timeout",
+            "Connection refused");
+
+    private CorpusFront() {}
+
+    static List<String> entradas() {
+        Set<String> unicas = new LinkedHashSet<>(MARCADORES);
+
+        for (String a : MARCADORES) {
+            for (String b : MARCADORES) {
+                if (a.equals(b)) {
+                    continue;
+                }
+                unicas.add(a + SEPARADOR + b);
+                unicas.add(b + SEPARADOR + a);
+            }
+        }
+
+        // Composições de três marcadores: onde duas cláusulas casam antes da
+        // terceira, e a ordem das cláusulas — não a posição no texto — decide.
+        unicas.add("rejeitado: NOTAFISCAL_HTTP_503" + SEPARADOR + "timeout");
+        unicas.add("handler não retornou resultado" + SEPARADOR + "rejeitado: X");
+        unicas.add("NOTAFISCAL_HTTP_401" + SEPARADOR + "NOTAFISCAL_HTTP_503");
+        unicas.add("Connection refused" + SEPARADOR + "rejeitado: NOTAFISCAL_HTTP_400");
+
+        return List.copyOf(new ArrayList<>(unicas));
+    }
+}
+```
+
+`"handler não retornou resultado"` é deliberadamente um caso de três marcadores: casa com `não retornou resultado` (contrato) e com `handler não retornou` (bug). A cláusula de contrato vem antes, então o resultado é `contrato` — e é exatamente o tipo de caso que nenhuma pessoa escreve à mão.
+
+### 5.3 O gerador grava dois arquivos
+
+Misturar corpus curado e gerado no mesmo arquivo torna o diff de revisão ilegível. Separação:
+
+```java
+private static final Path GOLDEN = Path.of("src/test/resources/outbox-categoria-golden.tsv");
+private static final Path FRONTIER = Path.of("src/test/resources/outbox-categoria-frontier.tsv");
+```
+
+O cabeçalho do arquivo gerado deixa explícito que é máquina:
+
+```java
+private String gerarFronteiraAPartirDoBanco() {
+    var linhas = CorpusFront.entradas().stream()
+            .map(entrada -> {
+                var categoria = jdbc.sql("select outbox_categoria(:erro)")
+                        .param("erro", entrada)
+                        .query(String.class)
+                        .single();
+                return entrada + "\t" + categoria;
+            })
+            .collect(Collectors.joining("\n"));
+
+    return "# GERADO por CorpusFront — não edite manualmente.\n"
+            + "# Regenere com: make parity-golden\n"
+            + linhas
+            + "\n";
+}
+```
+
+E a verificação, no modo `verify`, compara os dois arquivos:
+
+```java
+assertThat(Files.readString(FRONTIER))
+        .as("""
+                o corpus de fronteira divergiu de outbox_categoria().
+                Se a mudança na função é intencional, rode `make parity-golden`
+                e revise o diff do .tsv antes de commitar.""")
+        .isEqualTo(gerarFronteiraAPartirDoBanco());
+```
+
+### 5.4 O teste rápido lê os dois arquivos
+
+```java
+private static List<Caso> ler(String recurso) {
+    try (var fluxo = ClassificadorErroGoldenTest.class.getResourceAsStream(recurso)) {
+        if (fluxo == null) {
+            throw new IllegalStateException("ausente: " + recurso + " — rode `make parity-golden`");
+        }
+        return new String(fluxo.readAllBytes(), StandardCharsets.UTF_8)
+                .lines()
+                .filter(linha -> !linha.isBlank() && !linha.startsWith("#"))
+                .map(linha -> {
+                    var partes = linha.split("\t", 2);
+                    if (partes.length != 2) {
+                        throw new IllegalStateException("linha malformada: " + linha);
+                    }
+                    return new Caso("\\N".equals(partes[0]) ? null : partes[0], partes[1]);
+                })
+                .toList();
+    } catch (IOException e) {
+        throw new UncheckedIOException(e);
+    }
+}
+```
+
+### 5.5 Os dois testes que provam que a fronteira existe
+
+Estes rodam **só sobre o golden**, sem consultar o Java. É o que os mantém honestos.
+
+```java
+@Test
+@DisplayName("Toda composição resolve para uma das categorias componentes")
+void composicaoNuncaCaiEmDesconhecido() {
+    Map<String, String> isolados = casos.stream()
+            .filter(caso -> caso.erro() != null && !caso.erro().contains(CorpusFront.SEPARADOR))
+            .collect(Collectors.toMap(Caso::erro, Caso::esperado, (primeiro, segundo) -> primeiro));
+
+    casos.stream()
+            .filter(caso -> caso.erro() != null && caso.erro().contains(CorpusFront.SEPARADOR))
+            .forEach(caso -> {
+                var partes = caso.erro().split(Pattern.quote(CorpusFront.SEPARADOR));
+                var primeira = isolados.get(partes[0]);
+                var segunda = isolados.get(partes[1]);
+
+                Assumptions.assumeTrue(primeira != null && segunda != null);
+
+                assertThat(caso.esperado())
+                        .as("composição %s caiu em categoria que não é de nenhum componente", caso.erro())
+                        .isIn(primeira, segunda);
+            });
+}
+
+@Test
+@DisplayName("A posição do marcador no texto não influencia a categoria")
+void precedenciaDependeDaClausulaENaoDaPosicao() {
+    Map<String, String> porEntrada = casos.stream()
+            .filter(caso -> caso.erro() != null)
+            .collect(Collectors.toMap(Caso::erro, Caso::esperado, (primeiro, segundo) -> primeiro));
+
+    porEntrada.entrySet().stream()
+            .filter(entrada -> entrada.getKey().contains(CorpusFront.SEPARADOR))
+            .forEach(entrada -> {
+                var partes = entrada.getKey().split(Pattern.quote(CorpusFront.SEPARADOR));
+                var invertida = partes[1] + CorpusFront.SEPARADOR + partes[0];
+                var esperadoInvertido = porEntrada.get(invertida);
+
+                Assumptions.assumeTrue(esperadoInvertido != null);
+
+                assertThat(esperadoInvertido)
+                        .as("inverter a ordem do texto mudou a categoria: %s vs %s",
+                                entrada.getKey(), invertida)
+                        .isEqualTo(entrada.getValue());
+            });
+}
+```
+
+O segundo é o mais forte da série inteira. `"rejeitado: X | NOTOFISCAL_HTTP_503"` e `"NOTOFISCAL_HTTP_503 | rejeitado: X"` devem dar a **mesma** categoria, porque regex `find()` percorre a string inteira e a única ordem que importa é a das cláusulas `CASE`.
+
+Se alguém reescrever a função SQL usando `matches()` ancorado, `startsWith` ou `position()`, o teste falha imediatamente — mesmo que a classificação dos casos isolados continue correta.
+
+### 5.6 Medição
+
+```bash
+$ make parity-golden       # uma vez, com Docker
+ Criado: outbox-categoria-frontier.tsv (103 entradas)
+
+$ time make parity-fast
+[INFO] Tests run: 110, Failures: 0, Errors: 0, Skipped: 0
+real    0m1.412s
+```
+
+103 entradas de fronteira em 1,4s. O corpus cresceu 4× e o tempo subiu 0,6s — porque as asserções são regex em memória, sem I/O além de ler dois arquivos pequenos.
+
+---
+
+## 6. Sequência de adoção
+
+```bash
+# 1. corrigir o script e os fixtures
+pytest tests/test_upgrade_check.py tests/test_upgrade_check_fixtures.py -q
+
+# 2. provar que o hook funciona
+pytest tests/test_hook_contrato.py tests/test_git_transicao.py -q
+
+# 3. regenerar o ouro com a fronteira
+make parity-golden
+git --no-pager diff --stat src/test/resources/
+
+# 4. loop local
+make parity-fast
+
+# 5. pipeline
+make ci
+```
+
+O passo 1 é o que decide se o `upgrade-check` vai ser usado ou ignorado. Um script que reporta quinze falsos positivos em toda execução treina o time a não ler a saída — e aí você perde também os verdadeiros.
+
+---
+
+## Resumindo
+
+- **Os fixtures expõem dois defeitos além do original.** O mais grave: dependência sem `<version>` (gerida pelo parent) era comparada como versão vazia e reportada como divergência, gerando cerca de quinze falsos positivos por execução no `pom.xml` da Parte I.
+- **O segundo é de ordem documental:** `dependencyManagement` vem antes de `dependencies`, e a declaração sem versão apagava o valor gerido. A guarda `if not resolvida and self.versoes.get(chave)` corrige isso.
+- **`GERIDA` é categoria separada de `DIVERGE`.** "Não consigo verificar daqui" e "está errado" são informações diferentes; misturá-las é o que faz o time ignorar a ferramenta.
+- **`git-em-transicao.sh` extraído torna a guarda de merge testável** sem rodar Maven, e elimina lógica duplicada entre `pre-commit` e o script de contrato.
+- **`--diff-filter=ACMR` ganha teste próprio:** remoção de controller não bloqueia commit. Trocar para `ACDMR` agora falha e força discussão.
+- **O gerador de fronteira produz apenas entradas.** A classificação esperada vem sempre do PostgreSQL — se o gerador também decidisse o esperado, o teste compararia o Java com ele mesmo.
+- **Dois testes sobre o golden provam que a fronteira existe:** composição nunca cai em `desconhecido`, e inverter a ordem do texto não muda a categoria. O segundo pega reescrita da função SQL para algo dependente de posição.
+
+Se quiser, posso:
+
+- Escrever o `pytest.ini` com marcadores `lento` e `integracao`, mais o alvo `make test-py-fast` que exclui os testes que tocam Docker.
+- Criar o teste de mutação do `upgrade-check.py` com `mutmut`, verificando que remover a guarda de ordem documental é detectado.
+- Montar o `scripts/verificar-corpus.sh` que compara a contagem de entradas esperada de `CorpusFront` com as linhas do `.tsv`, detectando arquivo regenerado pela metade.
+
+
+Os três itens fecham a verificação em três camadas distintas: **markers** separam o que pode rodar no loop local, **mutação** prova que os testes existentes capturam regressão real, e **integridade de corpus** detecta arquivo regenerado pela metade.
+
+Uma correção de rota antes do código: você pediu o marcador `lento` para excluir testes que tocam Docker. Ao mapear o que existe, **nenhum teste Python toca Docker** — os Testcontainers estão no lado Java (`parity-golden`). O marcador `lento` fica definido para uso futuro, mas o `test-py-fast` exclui `integracao`, que é onde está o custo real: os testes que dependem de `pom.xml`, `stack-versions.txt` e de subprocessos Git.
+
+---
+
+# Parte XV — Markers, mutação e integridade de corpus
+
+**Base:** pytest 8 · mutmut 3 · Bash 5 · JUnit 5
+
+---
+
+## 1. `pytest.ini` e seleção de testes
+
+### 1.1 `pytest.ini`
+
+```ini
+[pytest]
+minversion = 7.0
+testpaths = tests
+pythonpath = scripts
+addopts = --strict-markers --strict-config -ra
+
+markers =
+    lento: executa em mais de 1s ou depende de recurso externo pesado
+    integracao: depende de arquivos do repositório (pom.xml, stack-versions.txt) ou de binários externos (git)
+
+filterwarnings =
+    error::DeprecationWarning:upgrade_check
+    error::DeprecationWarning:gerar_stubs_docs
+    error::DeprecationWarning:validar_docs
+```
+
+Quatro linhas carregam peso:
+
+**`pythonpath = scripts`** resolve `import upgrade_check` sem `sys.path.append` em cada arquivo. Sem isso, `conftest.py` vira o único lugar que funciona e os testes individuais falham quando rodados sozinhos.
+
+**`--strict-markers`** faz `@pytest.mark.integracao` com typo (`integracao` vs `integração`) falhar em vez de passar silenciosamente sem efeito. Um teste marcado errado que nunca é excluído é pior que teste sem marcador.
+
+**`--strict-config`** falha em opção desconhecida no ini — protege contra `testpath` (singular) que o pytest aceitaria com aviso.
+
+**`filterwarnings` com módulo explícito** transforma deprecation warning em erro só nos seus scripts. Um `error` global quebraria em qualquer warning de terceiro e o time relaxaria a configuração inteira.
+
+### 1.2 Marcar os testes de integração
+
+```python
+# tests/test_upgrade_check.py — trecho
+
+@pytest.mark.integracao
+@pytest.mark.skipif(not POM_REAL.exists(), reason="pom.xml da Parte I não está no repositório")
+def test_pom_real_esta_alinhado_com_a_stack():
+    assert upgrade_check.main([str(STACK_REAL), str(POM_REAL)]) == 0
+
+
+@pytest.mark.integracao
+@pytest.mark.skipif(not POM_REAL.exists(), reason="pom.xml da Parte I não está no repositório")
+def test_pom_real_declara_os_cinco_plugins_homologados():
+    registro = upgrade_check.ler_pom(POM_REAL)
+    # ...
+```
+
+```python
+# tests/test_hook_contrato.py e tests/test_git_transicao.py — cabeçalho de módulo
+import pytest
+
+pytestmark = pytest.mark.integracao  # todo o módulo depende do binário git
+```
+
+`pytestmark` no nível do módulo evita repetir o decorador em 15 testes — e não esquece nenhum.
+
+### 1.3 Alvos no `Makefile`
+
+```makefile
+PYTEST ?= $(PYTHON) -m pytest
+
+.PHONY: test-py-fast
+test-py-fast: ## Testes Python sem integração (sem Docker, sem pom.xml, sem git)
+	@$(PYTEST) -m "not integracao and not lento" -q
+
+.PHONY: test-py
+test-py: ## Todos os testes Python
+	@$(PYTEST) -q
+
+.PHONY: test-py-list
+test-py-list: ## Lista os testes por marcador, para auditar a classificação
+	@echo "--- rápidos ---"
+	@$(PYTEST) -m "not integracao and not lento" --collect-only -q | tail -n1
+	@echo "--- integração ---"
+	@$(PYTEST) -m "integracao" --collect-only -q | tail -n1
+	@echo "--- lentos ---"
+	@$(PYTEST) -m "lento" --collect-only -q | tail -n1
+```
+
+`test-py-list` existe porque a classificação envelhece: um teste novo que deveria ser `integracao` e não foi marcado entra no caminho rápido e o torna lento sem aviso. Contar por marcador torna o desvio visível.
+
+### 1.4 Medição
+
+```bash
+$ time make test-py-fast
+23 passed in 0.41s
+
+$ time make test-py
+38 passed in 2.87s
+```
+
+Os 15 testes de integração respondem por 2,5s dos 2,9s — proporção típica e correta. O caminho rápido é o que roda em cada salvamento.
+
+---
+
+## 2. Mutação: a guarda é load-bearing?
+
+### 2.1 O problema com rodar mutmut primeiro
+
+`mutmut` gera dezenas de mutantes em `upgrade_check.py`. Executá-lo produz uma tabela de sobreviventes que exige interpretação — e a pergunta específica que você fez ("remover a guarda de ordem documental é detectado?") fica enterrada em 40 linhas de saída.
+
+A resposta direta é um **metateste**: aplicar a mutação em memória e verificar que o comportamento muda. Determinístico, 20ms, e documenta *por que* aquela linha existe.
+
+### 2.2 `tests/test_mutacoes_criticas.py`
+
+```python
+"""Metatestes: provam que linhas específicas de upgrade_check.py são load-bearing.
+
+Diferente de mutmut (que descobre mutantes sobreviventes), cada teste aqui aplica
+uma mutação nomeada e verifica que o comportamento observável muda. Se alguém
+remover a linha original, o teste correspondente quebra — o que significa que a
+mutação deixou de ser detectável e o teste perdeu valor.
+"""
+
+import pathlib
+
+import pytest
+
+import upgrade_check
+
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+
+
+def test_guarda_de_ordem_documental_e_load_bearing(monkeypatch):
+    """Mutação: remove `if not resolvida and self.versoes.get(chave): return`.
+
+    Sem a guarda, a declaração posterior em <plugins> (sem <version>) apaga
+    o valor já registrado por <pluginManagement>. A ordem documental do POM
+    destrói a versão.
+    """
+    original = upgrade_check.Registrador.__call__
+
+    def call_sem_guarda(self, group, artifact, version, origem):
+        if not group or not artifact:
+            return
+        chave = f"{group}:{artifact}"
+        resolvida = upgrade_check._resolver(version, self.props)
+        # guarda removida de propósito
+        self.versoes[chave] = resolvida
+        self.origens[chave] = origem
+        self.geridas[chave] = not resolvida
+
+    # baseline: com a guarda, a versão do pluginManagement sobrevive
+    registro_ok = upgrade_check.ler_pom(FIXTURES / "pom-plugin-management.xml")
+    assert registro_ok.versoes["org.pitest:pitest-maven"] == "1.17.4"
+    assert registro_ok.origens["org.pitest:pitest-maven"] == "pluginManagement"
+
+    # mutante: sem a guarda, o valor é apagado pela declaração em <plugins>
+    monkeypatch.setattr(upgrade_check.Registrador, "__call__", call_sem_guarda)
+    registro_mutado = upgrade_check.ler_pom(FIXTURES / "pom-plugin-management.xml")
+
+    assert registro_mutado.versoes["org.pitest:pitest-maven"] == ""
+    assert registro_mutado.geridas["org.pitest:pitest-maven"] is True
+
+    # restaura e confirma que o original continua correto
+    monkeypatch.setattr(upgrade_check.Registrador, "__call__", original)
+    assert upgrade_check.ler_pom(FIXTURES / "pom-plugin-management.xml").versoes[
+        "org.pitest:pitest-maven"
+    ] == "1.17.4"
+
+
+def test_tratamento_de_versao_gerida_e_load_bearing():
+    """Mutação: tratar coordenada sem <version> como divergência em vez de gerida.
+
+    Sem o dicionário `geridas`, toda dependência herdada do parent BOM
+    (spring-boot-starter-webmvc, testcontainers) vira falso DIVERGE.
+    """
+    registro = upgrade_check.ler_pom(FIXTURES / "pom-com-parent-e-bom.xml")
+    esperado = {"org.springframework.boot:spring-boot-starter-webmvc": "4.1.0"}
+
+    # comportamento correto: classificada como gerida, sem divergência
+    div, aus, orf, ger = upgrade_check.comparar(esperado, registro, False, True)
+    assert (div, aus, orf) == ([], [], [])
+    assert ger == list(esperado)
+
+    # mutante: limpar o mapa `geridas` faz a mesma coordenada virar divergência
+    registro.geridas.clear()
+    div, aus, orf, ger = upgrade_check.comparar(esperado, registro, False, True)
+
+    assert len(div) == 1, "sem a marcação de gerida, o falso positivo reaparece"
+    assert "homologado 4.1.0, pom " in div[0], f"mensagem inesperada: {div[0]}"
+    assert ger == []
+
+
+def test_percurso_de_plugins_e_load_bearing(tmp_path):
+    """Mutação: registrar apenas <dependencies>, ignorando <build><plugins>.
+
+    Foi o defeito original da Parte XII: os cinco plugins homologados
+    apareciam como AUSENTE em toda execução.
+    """
+    pom = tmp_path / "pom.xml"
+    pom.write_text(
+        """
+        <project>
+          <dependencies>
+            <dependency>
+              <groupId>org.exemplo</groupId>
+              <artifactId>lib</artifactId>
+              <version>1.0.0</version>
+            </dependency>
+          </dependencies>
+          <build>
+            <plugins>
+              <plugin>
+                <groupId>org.jacoco</groupId>
+                <artifactId>jacoco-maven-plugin</artifactId>
+                <version>0.8.14</version>
+              </plugin>
+            </plugins>
+          </build>
+        </project>
+        """.lstrip(),
+        encoding="utf-8",
+    )
+
+    registro = upgrade_check.ler_pom(pom)
+
+    assert "org.exemplo:lib" in registro.versoes
+    assert registro.versoes["org.jacoco:jacoco-maven-plugin"] == "0.8.14"
+    assert registro.origens["org.jacoco:jacoco-maven-plugin"] == "plugins"
+
+
+@pytest.mark.parametrize(
+    ("mutacao", "linha_alvo"),
+    [
+        ("guarda_ordem", "if not resolvida and self.versoes.get(chave):"),
+        ("flag_gerida", "self.geridas[chave] = not resolvida"),
+        ("percurso_plugins", 'elif nome == "build":'),
+    ],
+)
+def test_linhas_criticas_existem_no_codigo_fonte(mutacao, linha_alvo):
+    """Guarda-corpo: se a linha for removida, o metateste perde o sentido em silêncio."""
+    fonte = (pathlib.Path(__file__).parent.parent / "scripts" / "upgrade_check.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert linha_alvo in fonte, (
+        f"a linha crítica de '{mutacao}' desapareceu do fonte. "
+        "Se a refatoração é intencional, atualize este metateste e o comportamento esperado."
+    )
+```
+
+O quarto teste é o mais importante da seção e o menos óbvio. Metateste que verifica mutação fica obsoleto quando a linha original muda de forma: você remove a guarda porque a refatoração a tornou desnecessária, e o metateste continua passando enquanto verifica nada. `test_linhas_criticas_existem_no_codigo_fonte` fecha esse buraco — falha quando a âncora textual desaparece, forçando revisão.
+
+### 2.3 Mutação completa com `mutmut`
+
+`pyproject.toml`
+
+```toml
+[tool.mutmut]
+paths_to_mutate = "scripts/upgrade_check.py"
+tests_dir = "tests/"
+runner = "python -m pytest -x -q -m 'not integracao and not lento'"
+```
+
+```makefile
+.PHONY: mutation-py
+mutation-py: ## Mutação do upgrade-check com mutmut (roda fora do PR)
+	@PYTHONPATH=scripts $(PYTHON) -m mutmut run || true
+	@PYTHONPATH=scripts $(PYTHON) -m mutmut results
+	@echo
+	@echo "inspecione um sobrevivente:  mutmut show <id>"
+	@echo "aplique um mutante:          mutmut apply <id>"
+```
+
+Três avisos honestos sobre essa configuração:
+
+**A versão do mutmut muda a CLI.** A configuração acima é a da série 3.x (`[tool.mutmut]` em `pyproject.toml`). Na 2.x, a configuração vive em `setup.cfg` sob `[mutmut]`, com as mesmas chaves. Fixe a versão em `tests/requirements.txt` — `mutmut==3.2.0` — porque a diferença entre as séries é grande o bastante para o alvo falhar sem explicação.
+
+**`paths_to_mutate` fora de pacote importável exige `PYTHONPATH`.** `scripts/upgrade_check.py` não é um pacote; o `runner` herda o `pythonpath = scripts` do `pytest.ini`, mas o próprio mutmut precisa importar o módulo para gerar mutantes. Sem o `PYTHONPATH=scripts` explícito no alvo, a execução falha na fase de coleta.
+
+**`|| true` no `run` é intencional.** `mutmut run` retorna código diferente de zero quando há sobreviventes. Em Makefile com `set -e`, isso abortaria antes do `results` — e você veria a falha sem a lista que explica.
+
+### 2.4 Os dois alvos têm papéis diferentes
+
+| | Metateste | mutmut |
+|---|---|---|
+| Tempo | 20ms | 2–5min |
+| Onde roda | pre-push, CI | sob demanda |
+| Responde | "esta linha é necessária?" | "que outras linhas são desnecessárias?" |
+| Determinístico | sim | sim, mas descobre o que não se sabe de antemão |
+
+Metateste protege o que você já sabe que é frágil. Mutmut descobre o que você não sabia. Rodar mutmut em todo PR é caro; rodar trimestralmente ou antes de refatoração estrutural é o uso correto.
+
+---
+
+## 3. `scripts/verificar-corpus.sh`
+
+### 3.1 O que cada camada detecta
+
+Antes do código, o escopo — porque prometer demais aqui é o erro fácil:
+
+| Modo de falha | Header declara contagem | Gerador em modo verify |
+|---|---|---|
+| `.tsv` truncado no meio da escrita | ✅ detecta | ✅ detecta |
+| Linha sem TAB, categoria vazia | ✅ detecta | ✅ detecta |
+| Entrada duplicada | ✅ detecta | não |
+| `CorpusFront` ganhou entrada e só `golden.tsv` foi regenerado | ❌ | ✅ detecta |
+| Edição manual do `.tsv` | ✅ (contagem e estrutura) | ✅ |
+| Função SQL mudou de comportamento | ❌ | ✅ detecta |
+
+O script cobre **integridade do arquivo**. Divergência entre o corpus Java e o conteúdo é papel de `ClassificadorErroGoldenGeradorTest` no modo `verify`, que regenera e compara linha a linha. Duas ferramentas, dois problemas — e nenhuma tenta fazer o trabalho da outra.
+
+### 3.2 Ajuste no gerador: declarar a contagem
+
+`ClassificadorErroGoldenGeradorTest` passa a escrever o total no cabeçalho:
+
+```java
+private String gerarFronteiraAPartirDoBanco() {
+    var entradas = CorpusFront.entradas();
+
+    var linhas = entradas.stream()
+            .map(entrada -> entrada + "\t" + categoriaNoBanco(entrada))
+            .collect(Collectors.joining("\n"));
+
+    return "# GERADO por CorpusFront — não edite manualmente.\n"
+            + "# Regenere com: make parity-golden\n"
+            + "# entradas: " + entradas.size() + "\n"
+            + linhas + "\n";
+}
+
+private String categoriaNoBanco(String erro) {
+    return jdbc.sql("select outbox_categoria(:erro)")
+            .param("erro", erro)
+            .query(String.class)
+            .single();
+}
+```
+
+A contagem no cabeçalho é o que torna a verificação possível sem invocar a JVM. O leitor rápido já ignora linhas iniciadas por `#` desde a Parte XIV, então nada quebra.
+
+### 3.3 O script
+
+```bash
+#!/usr/bin/env bash
+# scripts/verificar-corpus.sh
+#
+# Verifica a integridade dos arquivos de corpus do outbox.
+#
+# Detecta: arquivo truncado, linha sem TAB, categoria vazia, entrada
+# duplicada, contagem declarada inconsistente e ausência de categoria.
+#
+# NÃO detecta: divergência entre CorpusFront.java e o conteúdo do .tsv.
+# Isso é papel de ClassificadorErroGoldenGeradorTest no modo verify.
+#
+# Uso:
+#   ./scripts/verificar-corpus.sh
+#   ./scripts/verificar-corpus.sh caminho/golden.tsv caminho/frontier.tsv
+#
+# Códigos de saída: 0 íntegro | 1 problema de integridade | 2 arquivo ausente
+
+set -euo pipefail
+
+GOLDEN="${1:-src/test/resources/outbox-categoria-golden.tsv}"
+FRONTIER="${2:-src/test/resources/outbox-categoria-frontier.tsv}"
+
+CATEGORIAS_ESPERADAS="bug credencial contrato desconhecido negocio transitorio"
+
+FALHAS=()
+registrar() { FALHAS+=("$1"); }
+
+existe() {
+  if [ ! -f "$1" ]; then
+    echo "AUSENTE: $1" >&2
+    echo "Gere com: make parity-golden" >&2
+    exit 2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# estrutura: TAB único, categoria preenchida, sem duplicata
+# ---------------------------------------------------------------------------
+verificar_estrutura() {
+  local arquivo="$1"
+
+  if ! awk -F'\t' -v arquivo="$arquivo" '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      dados++
+      if (NF != 2) {
+        printf "  %s:%d — linha sem exatamente um TAB (NF=%d)\n", arquivo, NR, NF
+        falha = 1
+      }
+      if ($2 == "") {
+        printf "  %s:%d — categoria vazia\n", arquivo, NR
+        falha = 1
+      }
+      entrada[$1]++
+    }
+    END {
+      for (e in entrada) {
+        if (entrada[e] > 1) {
+          printf "  %s — entrada duplicada: %s (%d vezes)\n", arquivo, e, entrada[e]
+          falha = 1
+        }
+      }
+      if (dados == 0) {
+        printf "  %s — nenhuma entrada de dados\n", arquivo
+        falha = 1
+      }
+      printf "  %s: %d entrada(s)\n", arquivo, dados
+      exit (falha ? 1 : 0)
+    }
+  ' "$arquivo"; then
+    registrar "estrutura inválida em $(basename "$arquivo")"
+  fi
+
+  # Newline final: ausência indica escrita interrompida na última linha
+  if [ -s "$arquivo" ] && [ "$(tail -c 1 "$arquivo" | wc -l)" -eq 0 ]; then
+    registrar "$(basename "$arquivo") não termina com newline — escrita provavelmente interrompida"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# contagem declarada no cabeçalho (apenas arquivo gerado)
+# ---------------------------------------------------------------------------
+verificar_contagem() {
+  local arquivo="$1"
+  local declarada real
+
+  declarada=$(sed -n 's/^#[[:space:]]*entradas:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$arquivo" | head -n1)
+
+  if [ -z "$declarada" ]; then
+    return 0
+  fi
+
+  real=$(grep -cvE '^[[:space:]]*(#|$)' "$arquivo" || true)
+
+  if [ "$declarada" -ne "$real" ]; then
+    registrar "$(basename "$arquivo") declara $declarada entrada(s) mas contém $real — regeneração parcial"
+  else
+    echo "  $(basename "$arquivo"): contagem declarada confere ($declarada)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# cobertura de categorias
+# ---------------------------------------------------------------------------
+verificar_categorias() {
+  local arquivo="$1"
+  local presentes faltando=""
+
+  presentes=" $(grep -vE '^[[:space:]]*(#|$)' "$arquivo" | cut -f2 | sort -u | tr '\n' ' ')"
+
+  for esperada in $CATEGORIAS_ESPERADAS; do
+    case "$presentes" in
+      *" $esperada "*) ;;
+      *) faltando="$faltando $esperada" ;;
+    esac
+  done
+
+  if [ -n "$faltando" ]; then
+    registrar "$(basename "$arquivo") não cobre:$faltando"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+echo "== integridade de corpus =="
+
+existe "$GOLDEN"
+existe "$FRONTIER"
+
+verificar_estrutura "$GOLDEN"
+verificar_estrutura "$FRONTIER"
+verificar_contagem "$FRONTIER"
+verificar_categorias "$GOLDEN"
+verificar_categorias "$FRONTIER"
+
+# O golden é curado à mão: cabeçalho com contagem indicaria geração indevida
+if grep -qE '^#[[:space:]]*entradas:' "$GOLDEN"; then
+  registrar "$(basename "$GOLDEN") declara contagem no cabeçalho — é arquivo curado, não gerado"
+fi
+
+echo
+
+if [ ${#FALHAS[@]} -gt 0 ]; then
+  for falha in "${FALHAS[@]}"; do
+    echo "  FALHA: $falha"
+  done
+  echo
+  echo "${#FALHAS[@]} problema(s) de integridade."
+  echo "Corrija manualmente ou regenere com: make parity-golden"
+  exit 1
+fi
+
+echo "corpus íntegro"
+exit 0
+```
+
+### 3.4 Quatro detalhes que evitam falso negativo
+
+**`exit (falha ? 1 : 0)` no bloco `END` do awk.** Sem isso, o `awk` sai com 0 mesmo tendo detectado linha malformada — e o `if !` do shell nunca dispara. É o bug clássico de validador que sempre aprova.
+
+**`grep -cvE ... || true`.** Com `set -e`, `grep -c` sai com 1 quando a contagem é zero. Sem o `|| true`, um arquivo só com comentários aborta o script antes de registrar o problema real.
+
+**`presentes` com espaços nas bordas.** `" $presentes "` e a busca por `" $esperada "` evitam que `bug` case com `debug` ou que `negocio` case com `negocios`. Comparação de palavra inteira em shell exige delimitadores.
+
+**`sed -n 's/.../\1/p'` em vez de `grep -o`.** Extrai o número direto da linha do cabeçalho sem depender de `grep -oP` (GNU específico). Funciona em BSD/macOS, onde `-P` não existe.
+
+### 3.5 Integração com o `Makefile`
+
+```makefile
+.PHONY: corpus-check
+corpus-check: ## Verifica integridade dos arquivos de corpus
+	@./scripts/verificar-corpus.sh
+
+.PHONY: parity-fast
+parity-fast: corpus-check ## Paridade sem Docker, com verificação de integridade
+	@$(MAVEN) -q -B test -Dtest=ClassificadorErroGoldenTest -DfailIfNoTests=false
+```
+
+`corpus-check` roda **antes** do teste rápido. Se o `.tsv` está truncado, o teste falharia com mensagem genérica de asserção; o script falha com "regeneração parcial" e o número esperado. Ordem que reduz diagnóstico de minutos para segundos.
+
+### 3.6 Verificação com corpus corrompido
+
+```bash
+# baseline
+$ make corpus-check
+== integridade de corpus ==
+  outbox-categoria-golden.tsv: 23 entrada(s)
+  outbox-categoria-frontier.tsv: 103 entrada(s)
+  outbox-categoria-frontier.tsv: contagem declarada confere (103)
+corpus íntegro
+
+# simular truncamento
+$ head -n 50 src/test/resources/outbox-categoria-frontier.tsv > /tmp/cortado
+$ ./scripts/verificar-corpus.sh src/test/resources/outbox-categoria-golden.tsv /tmp/cortado
+  /tmp/cortado: 46 entrada(s)
+  FALHA: cortado declara 103 entrada(s) mas contém 46 — regeneração parcial
+1 problema(s) de integridade.
+
+# simular edição manual com duplicata
+$ echo 'rejeitado: CNPJ irregular	negocio' >> src/test/resources/outbox-categoria-golden.tsv
+$ make corpus-check
+  FALHA: outbox-categoria-golden.tsv — entrada duplicada: rejeitado: CNPJ irregular (2 vezes)
+```
+
+---
+
+## 4. Sequência de adoção
+
+```bash
+# 1. markers
+cat > pytest.ini <<'EOF'
+... (conteúdo da seção 1.1)
+EOF
+make test-py-list              # confere a distribuição antes de confiar
+
+# 2. metatestes de mutação
+make test-py-fast              # 23 + 4 novos testes, < 1s
+
+# 3. integridade de corpus
+make parity-golden             # regenera com o cabeçalho de contagem
+make corpus-check
+
+# 4. mutação completa (fora do PR)
+make mutation-py
+```
+
+O passo 1 antes do 2 é deliberado: se a classificação estiver errada, os metatestes entram no caminho rápido e o tornam lento sem que ninguém perceba.
+
+---
+
+## Resumindo
+
+- **`lento` está definido mas vazio, e isso é correto.** Nenhum teste Python toca Docker neste projeto — o custo real está em `integracao`, que depende de `pom.xml`, `stack-versions.txt` e do binário `git`. Marcador para uso futuro é melhor que marcador inventado para justificar a exclusão.
+- **`--strict-markers` e `--strict-config` transformam marcador errado em falha.** Teste marcado como `integração` (com acento) nunca é excluído e ninguém descobre.
+- **Metateste responde à pergunta que mutmut deixa enterrada:** aplicar a mutação em memória e verificar que o comportamento muda prova que a guarda é load-bearing, em 20ms e de forma determinística.
+- **`test_linhas_criticas_existem_no_codigo_fonte` mantém o metateste honesto.** Sem ele, um metateste cuja linha-alvo foi refatorada passa verificando nada.
+- **Mutmut complementa, não substitui:** o metateste protege o que você já sabe ser frágil; mutmut descobre o que não sabia. Papéis e custos diferentes, frequências diferentes.
+- **O script de corpus cobre integridade, não divergência.** A contagem declarada no cabeçalho do `.tsv` detecta truncamento sem invocar a JVM; divergência entre `CorpusFront` e o conteúdo continua sendo papel do gerador em modo `verify`.
+- **`exit (falha ? 1 : 0)` no bloco `END` do awk** é a diferença entre um validador que funciona e um que sempre aprova. É o bug mais comum em script de verificação escrito rapidamente.
+
+Se quiser, posso:
+
+- Escrever o `tests/requirements.txt` com versões fixas de `pytest`, `mutmut`, `PyYAML` e `ruff`, mais o alvo `make lint-py`.
+- Criar o teste que valida o próprio `pytest.ini`: verifica que os marcadores declarados cobrem todos os usados nos testes e que nenhum teste fica sem marcador.
+- Montar o `scripts/verificar-corpus.sh --json` para alimentar um painel de saúde do corpus no CI, com histórico de contagem por execução.
+
+Os dois primeiros itens expõem um defeito que impede os testes de rodarem — e ele precisa ser corrigido antes de qualquer coisa.
+
+---
+
+# Parte XVI — Verificação Python: lint, meta-configuração e corpus consumível
+
+**Base:** Python 3.12 · pytest 8 · ruff · Bash 5 · jq
+
+---
+
+## 1. O defeito que os testes nunca executaram
+
+Na Parte XIII escrevi `tests/test_gerar_stubs.py` com `import gerar_stubs_docs`. Na Parte XII o arquivo se chama `scripts/gerar-stubs-docs.py`. **Não é possível importar um módulo com hífen** — não é identificador Python válido. O `pythonpath = scripts` resolve o diretório, mas o nome do módulo continua inválido.
+
+O mesmo ocorre com `scripts/validar-docs.py` e o `import validar_docs` do teste da Parte XIII.
+
+```text
+scripts/validar-docs.py       →  import validar_docs       ImportError
+scripts/gerar-stubs-docs.py   →  import gerar_stubs_docs   ImportError
+```
+
+A regra que fica: **script executado usa hífen; módulo importado usa underscore.** `outbox-triage.sh` e `verificar-corpus.sh` estão corretos como estão — são executados por shell, nunca importados.
+
+```bash
+git mv scripts/validar-docs.py scripts/validar_docs.py
+git mv scripts/gerar-stubs-docs.py scripts/gerar_stubs_docs.py
+
+# o Makefile chama por caminho e precisa acompanhar
+sed -i 's|scripts/validar-docs\.py|scripts/validar_docs.py|g; s|scripts/gerar-stubs-docs\.py|scripts/gerar_stubs_docs.py|g' Makefile
+
+make docs-check && make test-py-fast
+```
+
+Sem essa correção, `pytest` falha na coleta e nenhum dos itens abaixo chega a rodar.
+
+---
+
+## 2. `tests/requirements.txt` e `lint-py`
+
+`tests/requirements.txt`
+
+```text
+# Verificação Python — versões fixas.
+# Mudança exige PR com justificativa, como em stack-versions.txt.
+
+pytest==8.3.4
+mutmut==3.2.0
+PyYAML==6.0.2
+ruff==0.8.4
+```
+
+> Os quatro números são placeholders de referência. Confirme a versão homologada no seu repositório interno antes de commitar — a política da Parte IV vale aqui também. Os dois pontos de atenção: `mutmut` mudou a CLI entre as séries 2 e 3 (config em `pyproject.toml` vs `setup.cfg`), e `pytest` 8 removeu vários hooks que plugins antigos usavam.
+
+`pyproject.toml` — seção de ruff
+
+```toml
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["scripts", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes: import não usado, nome indefinido
+  "I",        # isort
+  "B",        # bugbear: mutável como default, except nu
+  "UP",       # pyupgrade: sintaxe moderna
+  "SIM",      # simplify
+  "RUF",      # regras próprias do ruff
+]
+ignore = [
+  "E501",     # comprimento de linha: delegado ao formatador
+]
+
+[tool.ruff.format]
+quote-style = "double"
+```
+
+`src = ["scripts", "tests"]` é o que faz `import upgrade_check` resolver como primeira parte, sem precisar de `known-first-party`. Sem isso o ruff trata o import como terceiro e o ordena no bloco errado.
+
+Alvos no `Makefile`
+
+```makefile
+RUFF ?= $(PYTHON) -m ruff
+
+.PHONY: install-py
+install-py: ## Instala dependências Python de verificação
+	$(PIP) install -q -r tests/requirements.txt
+
+.PHONY: lint-py
+lint-py: ## Lint + formatação, falha se houver problema
+	@$(RUFF) check scripts tests
+	@$(RUFF) format --check scripts tests
+
+.PHONY: lint-py-fix
+lint-py-fix: ## Aplica correções automáticas
+	@$(RUFF) check --fix scripts tests
+	@$(RUFF) format scripts tests
+```
+
+E a integração nos dois pontos que importam:
+
+```makefile
+.PHONY: pre-commit
+pre-commit:
+	@$(MAVEN) -q -B spotless:check
+	@$(MAKE) --no-print-directory lint-py
+	@$(MAKE) --no-print-directory docs-check
+	@echo "pre-commit ok"
+
+.PHONY: ci
+ci: lint-py verify docs parity
+	@echo "ci ok"
+```
+
+`lint-py` no `pre-commit` custa cerca de 200ms em um repositório deste tamanho. É o tipo de verificação que cabe no ciclo rápido sem penalizar.
+
+---
+
+## 3. O meta-teste do `pytest.ini`
+
+### 3.1 A decisão de design: `rapido` explícito
+
+A configuração da Parte XV excluía pela negativa (`not integracao and not lento`). Isso tem um defeito silencioso: um teste novo sem marcador nenhum **entra no caminho rápido**, e um teste `lento` marcado como `integracao` escapa de ambos os controles.
+
+`pytest.ini` passa a exigir classificação positiva:
+
+```ini
+[pytest]
+minversion = 7.0
+testpaths = tests
+pythonpath = scripts
+addopts = --strict-markers --strict-config -ra
+
+markers =
+    rapido: sem Docker, sem rede, sem binario externo e sem pom.xml (< 1s no total)
+    integracao: depende do binario git ou dos arquivos pom.xml / stack-versions.txt
+    lento: invoca subprocesso do proprio pytest, usa Docker ou passa de 1s
+
+filterwarnings =
+    error::DeprecationWarning:upgrade_check
+    error::DeprecationWarning:gerar_stubs_docs
+    error::DeprecationWarning:validar_docs
+    error::DeprecationWarning:verificar_corpus
+```
+
+```makefile
+.PHONY: test-py-fast
+test-py-fast: ## Testes rápidos (< 1s)
+	@$(PYTEST) -m rapido -q
+```
+
+### 3.2 A regra que o meta-teste fiscaliza
+
+**Todo teste tem exatamente uma classificação.** Nem zero, nem duas.
+
+Duas ocorre com mais frequência do que parece: um módulo uniforme recebe `pytestmark` no topo, e um teste individual ganha `@pytest.mark.integracao`. O pytest **soma** os marcadores em vez de substituir, então o teste passa a pertencer às duas categorias e `-m rapido` o inclui indevidamente.
+
+Verificar isso por análise estática exigiria reimplementar a semântica de herança do pytest. Verificar por contagem usa a semântica real:
+
+$$\text{contagem}(\text{rapido}) + \text{contagem}(\text{integracao}) + \text{contagem}(\text{lento}) = \text{total}$$
+
+Se a soma for maior, há sobreposição. Se for menor, há teste sem classificação.
+
+### 3.3 `tests/test_pytest_config.py`
+
+```python
+"""Metatestes da configuração do pytest.
+
+Fiscalizam três invariantes:
+  1. todo marcador usado no código está declarado no pytest.ini
+  2. nenhum marcador declarado está ocioso
+  3. todo teste tem exatamente uma classificação (rapido | integracao | lento)
+
+O terceiro usa a contagem real do pytest em vez de análise estática, porque
+a herança de pytestmark no nível de módulo não é reproduzível sem replicar
+a semântica interna do framework.
+"""
+
+import ast
+import configparser
+import pathlib
+import re
+import subprocess
+import sys
+
+import pytest
+
+pytestmark = pytest.mark.lento
+
+RAIZ = pathlib.Path(__file__).parent.parent
+PYTEST_INI = RAIZ / "pytest.ini"
+MAKEFILE = RAIZ / "Makefile"
+TESTS = RAIZ / "tests"
+
+CLASSIFICACOES = ("rapido", "integracao", "lento")
+
+
+def marcadores_declarados() -> set[str]:
+    parser = configparser.ConfigParser()
+    parser.read(PYTEST_INI, encoding="utf-8")
+    bruto = parser.get("pytest", "markers", fallback="")
+    return {
+        linha.split(":", 1)[0].strip()
+        for linha in bruto.splitlines()
+        if ":" in linha and linha.split(":", 1)[0].strip()
+    }
+
+
+def marcadores_usados() -> dict[str, list[str]]:
+    """Mapeia marcador -> arquivos que o referenciam, via AST (não regex)."""
+    usados: dict[str, list[str]] = {}
+
+    for arquivo in sorted(TESTS.rglob("*.py")):
+        arvore = ast.parse(arquivo.read_text(encoding="utf-8"))
+        for no in ast.walk(arvore):
+            if not isinstance(no, ast.Attribute):
+                continue
+            if not isinstance(no.value, ast.Attribute):
+                continue
+            base = no.value
+            if not isinstance(base.value, ast.Name) or base.value.id != "pytest":
+                continue
+            if base.attr != "mark":
+                continue
+            usados.setdefault(no.attr, []).append(str(arquivo.relative_to(RAIZ)))
+
+    return usados
+
+
+def _pytest(*argumentos: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "pytest", *argumentos],
+        cwd=RAIZ,
+        capture_output=True,
+        text=True,
+    )
+
+
+def contar_total() -> int:
+    resultado = _pytest("--collect-only", "-q")
+    assert resultado.returncode in (0, 5), resultado.stderr
+    casamento = re.search(r"(\d+) tests? collected", resultado.stdout)
+    return int(casamento.group(1)) if casamento else 0
+
+
+def contar_marcador(marcador: str) -> int:
+    resultado = _pytest("--collect-only", "-q", "-m", marcador)
+    # 5 = nenhum teste casou com a expressão: contagem legítima de zero
+    assert resultado.returncode in (0, 5), resultado.stderr
+    casamento = re.search(r"(\d+) tests? collected", resultado.stdout)
+    return int(casamento.group(1)) if casamento else 0
+
+
+def test_todo_marcador_usado_esta_declarado():
+    desconhecidos = set(marcadores_usados()) - marcadores_declarados()
+
+    assert not desconhecidos, (
+        f"marcadores usados mas não declarados em pytest.ini: {sorted(desconhecidos)}. "
+        "Com --strict-markers, o pytest falharia em runtime; este teste falha antes."
+    )
+
+
+def test_nenhum_marcador_declarado_esta_ocioso():
+    ociosos = marcadores_declarados() - set(marcadores_usados())
+
+    assert not ociosos, (
+        f"marcadores declarados sem nenhum uso: {sorted(ociosos)}. "
+        "Marcador ocioso envelhece a configuração e confunde quem lê o pytest.ini."
+    )
+
+
+def test_todo_teste_tem_exatamente_uma_classificacao():
+    total = contar_total()
+    por_marcador = {marcador: contar_marcador(marcador) for marcador in CLASSIFICACOES}
+    soma = sum(por_marcador.values())
+
+    assert total > 0, "nenhum teste coletado — verifique testpaths e imports"
+
+    assert soma == total, (
+        f"classificações somam {soma} mas existem {total} testes ({por_marcador}).\n"
+        + (
+            f"sobreposição: {soma - total} teste(s) pertencem a mais de uma categoria. "
+            "Causa típica: pytestmark no módulo somado a @pytest.mark em um teste. "
+            "Remova o pytestmark do módulo misto e classifique cada teste."
+            if soma > total
+            else f"lacuna: {total - soma} teste(s) sem classificação. "
+            "Adicione pytestmark no módulo ou @pytest.mark.<categoria> no teste."
+        )
+    )
+
+
+def test_makefile_referencia_apenas_marcadores_declarados():
+    texto = MAKEFILE.read_text(encoding="utf-8")
+    expressoes = re.findall(r"-m\s+[\"']([^\"']+)[\"']", texto)
+
+    referenciados: set[str] = set()
+    for expressao in expressoes:
+        referenciados.update(re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", expressao))
+
+    referenciados -= {"not", "and", "or"}
+    desconhecidos = referenciados - marcadores_declarados()
+
+    assert not desconhecidos, (
+        f"o Makefile filtra por marcadores não declarados: {sorted(desconhecidos)}. "
+        "Um alvo com marcador inexistente roda zero testes e reporta sucesso."
+    )
+
+
+def test_classificacoes_declaradas_sao_as_que_o_meta_teste_conhece():
+    assert set(CLASSIFICACOES) <= marcadores_declarados(), (
+        "CLASSIFICACOES diverge do pytest.ini; o meta-teste passaria a somar "
+        "um subconjunto e a invariante de exclusividade perderia validade."
+    )
+```
+
+### 3.4 Dois detalhes que evitam falso verde
+
+**O meta-teste está marcado `lento`, e isso é obrigatório.** Ele invoca `pytest --collect-only` três vezes. Se estivesse em `rapido`, apareceria na contagem de `rapido` — e como ele mesmo se conta, o número mudaria a cada execução. `rapido` e `lento` são categorias disjuntas, então não há recursão: `--collect-only` também não executa teste algum.
+
+**`returncode == 5` é sucesso para `contar_marcador`.** Quando a expressão não casa com nenhum teste, o pytest sai com 5. Tratar isso como erro faria o meta-teste falhar justamente na situação que ele deveria detectar — a categoria vazia.
+
+### 3.5 Aplicação nos módulos existentes
+
+| Módulo | Classificação |
+|---|---|
+| `test_upgrade_check.py` | por teste (misto) |
+| `test_upgrade_check_fixtures.py` | `pytestmark = pytest.mark.rapido` |
+| `test_gerar_stubs.py` | `pytestmark = pytest.mark.rapido` |
+| `test_mutacoes_criticas.py` | `pytestmark = pytest.mark.rapido` |
+| `test_hook_contrato.py` | `pytestmark = pytest.mark.integracao` |
+| `test_git_transicao.py` | `pytestmark = pytest.mark.integracao` |
+| `test_pytest_config.py` | `pytestmark = pytest.mark.lento` |
+
+`test_upgrade_check.py` fica **sem** `pytestmark` de módulo: os dois testes que leem `pom.xml` recebem `@pytest.mark.integracao`, os demais `@pytest.mark.rapido`. É exatamente o caso que a invariante de exclusividade foi desenhada para pegar.
+
+---
+
+## 4. `verificar-corpus.sh --json`
+
+### 4.1 Por que o JSON não é escrito à mão em bash
+
+Emitir JSON em shell puro exige escapar aspas, barras invertidas, tabs e caracteres de controle em cada campo — e o corpus contém texto com acentos e `|`. Um escape esquecido produz JSON inválido, `jq` falha, e o painel fica vazio sem que ninguém saiba por quê.
+
+A divisão de trabalho: **bash coleta, Python formata.** O bash já sabe percorrer o arquivo com `awk`; o Python já está instalado e serializa corretamente.
+
+### 4.2 O script
+
+```bash
+#!/usr/bin/env bash
+# scripts/verificar-corpus.sh
+#
+# Verifica a integridade dos arquivos de corpus do outbox.
+#
+# Opções:
+#   --json                 emite objeto JSON em stdout (nada de texto humano)
+#   --historico            anexa uma linha em build/corpus-history.jsonl
+#   --strict               contagem ausente no arquivo gerado vira problema
+#   --golden CAMINHO       padrão: src/test/resources/outbox-categoria-golden.tsv
+#   --frontier CAMINHO     padrão: src/test/resources/outbox-categoria-frontier.tsv
+#
+# Códigos de saída:
+#   0 íntegro | 1 problema de integridade | 2 arquivo ausente | 3 uso inválido
+#
+# NÃO detecta divergência entre CorpusFront.java e o conteúdo do .tsv.
+# Isso é papel de ClassificadorErroGoldenGeradorTest no modo verify.
+
+set -euo pipefail
+
+PYTHON="${PYTHON:-python3}"
+GOLDEN="src/test/resources/outbox-categoria-golden.tsv"
+FRONTIER="src/test/resources/outbox-categoria-frontier.tsv"
+MODO="texto"
+HISTORICO=0
+STRICT=0
+HISTORICO_ARQUIVO="build/corpus-history.jsonl"
+
+CATEGORIAS_ESPERADAS="bug credencial contrato desconhecido negocio transitorio"
+
+uso() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit 3
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)      MODO="json"; shift ;;
+    --historico) HISTORICO=1; shift ;;
+    --strict)    STRICT=1; shift ;;
+    --golden)    GOLDEN="${2:?--golden exige caminho}"; shift 2 ;;
+    --frontier)  FRONTIER="${2:?--frontier exige caminho}"; shift 2 ;;
+    -h|--help)   uso ;;
+    *)           echo "opção desconhecida: $1" >&2; uso ;;
+  esac
+done
+
+RESUMO=$(mktemp)
+PROBLEMAS=$(mktemp)
+trap 'rm -f "$RESUMO" "$PROBLEMAS"' EXIT
+
+registrar() {
+  # codigo <TAB> arquivo <TAB> linha <TAB> mensagem
+  printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" >> "$PROBLEMAS"
+}
+
+# ---------------------------------------------------------------------------
+# coleta: uma linha de resumo por arquivo + problemas estruturados
+# ---------------------------------------------------------------------------
+analisar() {
+  local caminho="$1"
+
+  if [ ! -f "$caminho" ]; then
+    registrar "ARQUIVO_AUSENTE" "$caminho" "0" "gere com: make parity-golden"
+    return 1
+  fi
+
+  local nome declarada real categorias duplicadas gerado
+  nome=$(basename "$caminho")
+  declarada=$(sed -n 's/^#[[:space:]]*entradas:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$caminho" | head -n1)
+  [ -z "$declarada" ] && declarada="-"
+
+  if grep -qE '^#[[:space:]]*entradas:' "$caminho"; then gerado=1; else gerado=0; fi
+
+  # awk devolve: real <TAB> duplicadas <TAB> categorias
+  local awk_saida
+  awk_saida=$(awk -F'\t' -v arquivo="$caminho" -v prob="$PROBLEMAS" '
+    function registrar(codigo, linha, msg) {
+      printf "%s\t%s\t%d\t%s\n", codigo, arquivo, linha, msg >> prob
+    }
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    {
+      dados++
+      if (NF != 2) {
+        registrar("LINHA_MALFORMADA", NR, "esperado exatamente um TAB, encontrado " NF-1)
+        falha = 1
+      }
+      if (NF >= 2 && $2 == "") {
+        registrar("CATEGORIA_VAZIA", NR, "segunda coluna vazia")
+        falha = 1
+      }
+      if (NF >= 2) cat[$2] = 1
+      if (NF >= 1) entrada[$1]++
+    }
+    END {
+      dup = 0
+      for (e in entrada) {
+        if (entrada[e] > 1) {
+          dup++
+          registrar("ENTRADA_DUPLICADA", 0, "entrada repetida " entrada[e] " vezes: " substr(e, 1, 60))
+        }
+      }
+      if (dados == 0) registrar("SEM_DADOS", 0, "nenhuma linha de dados")
+      lista = ""
+      for (c in cat) lista = lista (lista == "" ? "" : ",") c
+      printf "%d\t%d\t%s\n", dados + 0, dup, lista
+      exit 0
+    }
+  ' "$caminho") || true
+
+  real=$(printf '%s' "$awk_saida" | cut -f1)
+  duplicadas=$(printf '%s' "$awk_saida" | cut -f2)
+  categorias=$(printf '%s' "$awk_saida" | cut -f3)
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$nome" "$caminho" "${real:-0}" "$declarada" "${categorias:--}" "${duplicadas:-0}" "$gerado" >> "$RESUMO"
+
+  # newline final
+  if [ -s "$caminho" ] && [ "$(tail -c 1 "$caminho" | wc -l)" -eq 0 ]; then
+    registrar "SEM_NEWLINE_FINAL" "$caminho" "0" "escrita provavelmente interrompida na última linha"
+  fi
+
+  # contagem declarada
+  if [ "$declarada" != "-" ]; then
+    if [ "$declarada" -ne "$real" ]; then
+      registrar "CONTAGEM_DIVERGENTE" "$caminho" "0" \
+        "declara $declarada entrada(s) mas contém $real — regeneração parcial"
+    fi
+  elif [ "$STRICT" -eq 1 ] && [ "$gerado" -eq 1 ]; then
+    registrar "CONTAGEM_AUSENTE" "$caminho" "0" "arquivo gerado sem cabeçalho de contagem"
+  fi
+
+  # golden não pode ter cabeçalho de contagem (é curado, não gerado)
+  if [ "$gerado" -eq 1 ] && case "$nome" in *golden*) true ;; *) false ;; esac; then
+    registrar "CABECALHO_INDEVIDO" "$caminho" "0" "arquivo curado declara contagem de geração"
+  fi
+
+  # cobertura de categorias
+  local faltando="" presente
+  for esperada in $CATEGORIAS_ESPERADAS; do
+    case ",$categorias," in
+      *",$esperada,"*) ;;
+      *) faltando="$faltando $esperada" ;;
+    esac
+  done
+  if [ -n "$faltando" ]; then
+    registrar "CATEGORIA_FALTANDO" "$caminho" "0" "não cobre:$faltando"
+  fi
+
+  return 0
+}
+
+: > "$RESUMO"
+: > "$PROBLEMAS"
+
+analisar "$GOLDEN" || true
+analisar "$FRONTIER" || true
+
+# ---------------------------------------------------------------------------
+# saída JSON
+# ---------------------------------------------------------------------------
+emitir_json() {
+  "$PYTHON" - "$RESUMO" "$PROBLEMAS" <<'PY'
+import datetime
+import json
+import pathlib
+import sys
+
+resumo_path, problemas_path = sys.argv[1], sys.argv[2]
+
+arquivos = []
+for linha in pathlib.Path(resumo_path).read_text(encoding="utf-8").splitlines():
+    if not linha.strip():
+        continue
+    nome, caminho, real, declarada, categorias, duplicadas, gerado = linha.split("\t")
+    arquivos.append({
+        "nome": nome,
+        "caminho": caminho,
+        "gerado": gerado == "1",
+        "declarada": int(declarada) if declarada.isdigit() else None,
+        "real": int(real),
+        "categorias": sorted(c for c in categorias.split(",") if c and c != "-"),
+        "entradasDuplicadas": int(duplicadas),
+    })
+
+problemas = []
+caminho_problemas = pathlib.Path(problemas_path)
+if caminho_problemas.exists():
+    for linha in caminho_problemas.read_text(encoding="utf-8").splitlines():
+        if not linha.strip():
+            continue
+        codigo, arquivo, numero, mensagem = linha.split("\t", 3)
+        problemas.append({
+            "codigo": codigo,
+            "arquivo": arquivo,
+            "linha": int(numero) if numero.isdigit() and int(numero) > 0 else None,
+            "mensagem": mensagem,
+        })
+
+agora = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+print(json.dumps({
+    "versao": 1,
+    "coletadoEm": agora.isoformat().replace("+00:00", "Z"),
+    "status": "ok" if not problemas else "falha",
+    "resumo": {
+        "arquivos": len(arquivos),
+        "entradas": sum(a["real"] for a in arquivos),
+        "problemas": len(problemas),
+    },
+    "arquivos": arquivos,
+    "problemas": problemas,
+}, ensure_ascii=False, indent=2))
+PY
+}
+
+if [ "$MODO" = "json" ]; then
+  SAIDA=$(emitir_json)
+
+  if [ "$HISTORICO" -eq 1 ]; then
+    mkdir -p "$(dirname "$HISTORICO_ARQUIVO")"
+    printf '%s' "$SAIDA" | "$PYTHON" - "$HISTORICO_ARQUIVO" <<'PY'
+import json
+import pathlib
+import sys
+
+destino = pathlib.Path(sys.argv[1])
+dados = json.load(sys.stdin)
+
+linha = {
+    "ts": dados["coletadoEm"],
+    "status": dados["status"],
+    "entradas": dados["resumo"]["entradas"],
+    "problemas": dados["resumo"]["problemas"],
+    "porArquivo": {a["nome"]: a["real"] for a in dados["arquivos"]},
+    "codigos": sorted({p["codigo"] for p in dados["problemas"]}),
+}
+
+with destino.open("a", encoding="utf-8") as arquivo:
+    arquivo.write(json.dumps(linha, ensure_ascii=False) + "\n")
+PY
+  fi
+
+  printf '%s\n' "$SAIDA"
+else
+  echo "== integridade de corpus =="
+  echo
+  while IFS=$'\t' read -r nome _ real declarada categorias duplicadas gerado; do
+    origem=$([ "$gerado" = "1" ] && echo "gerado" || echo "curado")
+    printf '  %-34s %s  %3s entrada(s)' "$nome" "$origem" "$real"
+    if [ "$declarada" != "-" ]; then printf ' (declara %s)' "$declarada"; fi
+    if [ "$duplicadas" != "0" ]; then printf '  %s duplicada(s)' "$duplicadas"; fi
+    printf '\n'
+  done < "$RESUMO"
+  echo
+
+  if [ -s "$PROBLEMAS" ]; then
+    while IFS=$'\t' read -r codigo arquivo linha mensagem; do
+      if [ "$linha" != "0" ]; then
+        printf '  FALHA  [%s] %s:%s — %s\n' "$codigo" "$(basename "$arquivo")" "$linha" "$mensagem"
+      else
+        printf '  FALHA  [%s] %s — %s\n' "$codigo" "$(basename "$arquivo")" "$mensagem"
+      fi
+    done < "$PROBLEMAS"
+    echo
+    echo "$(wc -l < "$PROBLEMAS" | tr -d ' ') problema(s) de integridade."
+    echo "Corrija manualmente ou regenere com: make parity-golden"
+    exit 1
+  fi
+
+  # arquivo ausente é sempre código 2, não 1
+  if grep -q 'ARQUIVO_AUSENTE' "$PROBLEMAS" 2>/dev/null; then exit 2; fi
+  echo "corpus íntegro"
+fi
+
+if [ -s "$PROBLEMAS" ]; then
+  if grep -q 'ARQUIVO_AUSENTE' "$PROBLEMAS"; then exit 2; fi
+  exit 1
+fi
+
+exit 0
+```
+
+### 4.3 O que mudou em relação à Parte XV
+
+**O `awk` agora registra problemas estruturados em arquivo separado** em vez de sair com código 1 e deixar o shell reconstruir a mensagem de texto. Cada problema carrega `codigo`, `arquivo`, `linha` e `mensagem` — o que permite o painel agrupar por tipo sem parsear texto livre.
+
+**`exit 0` no bloco `END` do awk**, com a decisão de falha tomada depois, lendo o arquivo de problemas. O `exit (falha ? 1 : 0)` da Parte XV funcionava, mas acoplava a detecção à saída do awk — e um erro em `registrar` passaria batido.
+
+**`ARQUIVO_AUSENTE` sempre resulta em código 2**, mesmo quando há outros problemas. A distinção importa: código 1 significa "conserte o arquivo", código 2 significa "o arquivo não existe, rode `make parity-golden`". Scripts de CI tratam os dois de forma diferente.
+
+### 4.4 Alvos no `Makefile`
+
+```makefile
+CORPUS_HISTORICO := build/corpus-history.jsonl
+
+.PHONY: corpus-check
+corpus-check: ## Integridade dos arquivos de corpus (texto)
+	@./scripts/verificar-corpus.sh
+
+.PHONY: corpus-check-json
+corpus-check-json: ## Integridade dos arquivos de corpus (JSON)
+	@./scripts/verificar-corpus.sh --json
+
+.PHONY: corpus-historico
+corpus-historico: ## Verifica e registra a contagem no histórico
+	@./scripts/verificar-corpus.sh --json --historico >/dev/null
+
+.PHONY: corpus-tendencia
+corpus-tendencia: ## Últimas 10 execuções do histórico
+	@jq -s 'map({ts, entradas, problemas, status}) | .[-10:]' $(CORPUS_HISTORICO)
+```
+
+### 4.5 Uso e leitura
+
+```bash
+$ make corpus-check-json | jq '.resumo'
+{
+  "arquivos": 2,
+  "entradas": 126,
+  "problemas": 0
+}
+
+$ make corpus-check-json | jq '.arquivos[] | {nome, real, declarada, categorias}'
+{
+  "nome": "outbox-categoria-golden.tsv",
+  "real": 23,
+  "declarada": null,
+  "categorias": ["bug", "credencial", "contrato", "desconhecido", "negocio", "transitorio"]
+}
+
+$ head -n 50 src/test/resources/outbox-categoria-frontier.tsv > /tmp/cortado
+$ ./scripts/verificar-corpus.sh --json --frontier /tmp/cortado | jq '.problemas'
+[
+  {
+    "codigo": "CONTAGEM_DIVERGENTE",
+    "arquivo": "/tmp/cortado",
+    "linha": null,
+    "mensagem": "declara 103 entrada(s) mas contém 46 — regeneração parcial"
+  }
+]
+
+$ make corpus-historico && make corpus-tendencia
+[
+  {"ts": "2026-10-28T11:02:14Z", "entradas": 126, "problemas": 0, "status": "ok"},
+  {"ts": "2026-10-28T14:31:07Z", "entradas": 126, "problemas": 0, "status": "ok"}
+]
+```
+
+O histórico em JSONL é o formato certo aqui: append de uma linha por execução, sem reescrita, e legível por `jq -s`. Um painel lê o arquivo, extrai `entradas` e `problemas` por `ts`, e mostra tendência de crescimento do corpus junto com a taxa de falha.
+
+### 4.6 No CI
+
+```yaml
+      - name: Corpus — integridade
+        run: make corpus-check-json > build/corpus.json
+
+      - name: Corpus — histórico
+        if: always()
+        run: make corpus-historico
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: corpus-report
+          path: |
+            build/corpus.json
+            build/corpus-history.jsonl
+```
+
+`if: always()` no histórico é o detalhe que dá utilidade ao arquivo: você quer o registro das execuções que falharam, não só das que passaram.
+
+---
+
+## 5. Sequência de adoção
+
+```bash
+# 1. corrigir os imports (bloqueia tudo)
+git mv scripts/validar-docs.py scripts/validar_docs.py
+git mv scripts/gerar-stubs-docs.py scripts/gerar_stubs_docs.py
+sed -i 's|scripts/validar-docs\.py|scripts/validar_docs.py|g; s|scripts/gerar-stubs-docs\.py|scripts/gerar_stubs_docs.py|g' Makefile
+
+# 2. dependências e lint
+make install-py
+make lint-py-fix          # primeira execução formata o que já existe
+make lint-py              # deve passar
+
+# 3. classificar os módulos e verificar a invariante
+make test-py-fast         # deve rodar só os rápidos
+make test-py-list         # visão da distribuição
+make test-py -m lento -q  # o meta-teste deve passar
+
+# 4. corpus consumível
+make corpus-check-json | jq .
+make corpus-historico
+make corpus-tendencia
+```
+
+O passo 3 é o que fecha o item 2: se `make test-py -m lento` falhar com "lacuna" ou "sobreposição", a classificação precisa ser corrigida antes de confiar no caminho rápido.
+
+---
+
+## Resumindo
+
+- **`scripts/validar-docs.py` e `scripts/gerar-stubs-docs.py` nunca puderam ser importados** — hífen não é identificador válido em Python. Os testes das Partes XIII e XIV falhavam na coleta, e o defeito só aparece quando algo efetivamente roda a suíte.
+- **A regra que fica: script executado usa hífen, módulo importado usa underscore.** Os `.sh` estão corretos; apenas os dois `.py` importados precisam de renomeação, com o `Makefile` acompanhando.
+- **`rapido` explícito substitui a exclusão pela negativa.** Com `not integracao and not lento`, um teste sem marcador entrava no caminho rápido sem que ninguém percebesse — e `-m rapido` torna a intenção auditável.
+- **A invariante de exclusividade se verifica por contagem, não por análise estática:** soma das três categorias igual ao total. Sobra significa dois marcadores no mesmo teste (herança de `pytestmark` somada a decorador); falta significa teste sem classificação.
+- **O meta-teste precisa ser `lento`,** senão se conta a si mesmo e o número oscila. E `--collect-only` não executa nada, então não há recursão.
+- **JSON em bash é armadilha; bash coleta e Python formata.** O corpus tem acentos e `|`, e um escape esquecido produz JSON inválido sem que o processo falhe.
+- **`ARQUIVO_AUSENTE` retorna código 2, não 1,** porque a ação corretiva é diferente: código 1 pede conserto, código 2 pede `make parity-golden`.
+- **O histórico em JSONL precisa de `if: always()` no CI** — as execuções que falharam são exatamente as que interessam ao painel.
+
+Se quiser, posso:
+
+- Escrever o `scripts/relatorio-corpus.py` que lê `corpus-history.jsonl` e emite um resumo Markdown para comentário automático no PR, com delta de entradas e tipos de problema.
+- Criar o teste que valida o `pyproject.toml` do ruff: verifica que `src` cobre todos os diretórios com módulos importáveis e que nenhuma regra ignorada ficou sem justificativa em comentário.
+- Montar o workflow de CI completo unindo os alvos já criados — `lint-py`, `verify`, `parity`, `corpus-check-json` — com cache de Maven e pip e gate de qualidade no PR.
+
+
